@@ -55,9 +55,8 @@ models:
     fusion: fusion-1                  # string ref to the fusion model above
 
   # =========================================================================
-  # Task-specialized virtual models — assembled from the model shoot-out
-  # (research-test/model-shootout/, 2026-06-27): 8 models x 3 probes
-  # (P1 coding, P2 research, P3 tool-calling). Quality scored /15.
+  # Task-specialized virtual models — assembled from an empirical model shoot-out
+  # (8 models x 3 probes: coding, research, tool-calling — 2026-06-27). Quality scored /15.
   # Panels MIX MODEL LINEAGES on purpose: 3 models from the same lab share
   # training blind spots, which defeats the point of a panel. glm/kimi/
   # deepseek/minimax/qwen are all Chinese labs; gemini=Google, gpt-oss=OpenAI

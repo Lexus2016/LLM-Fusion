@@ -3,3 +3,5 @@ dist
 .env
 *.log
 .env*
+research-test/
+docs/superpowers/specs/

@@ -64,8 +64,8 @@ models:
 
   # =========================================================================
   # Task-specialized presets — the recommended, ready-to-use models (this is
-  # what actually ships in fusion.yaml). Assembled from the model shoot-out:
-  # research-test/model-shootout/RESULTS.md. Panels deliberately MIX MODEL
+  # what actually ships in fusion.yaml). Assembled from an empirical model
+  # shoot-out. Panels deliberately MIX MODEL
   # LINEAGES — 3 models from the same lab share training blind spots, which
   # defeats the point of a panel; each panel adds a Western decorrelator.
   # =========================================================================

@@ -25,7 +25,7 @@ Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`, API key `local
 | `fusion-researcher` | research, analysis, reports |
 | `fusion-agents` | autonomous agent loops (smart routing; **default for long runs**) |
 
-The proxy emits **exactly one** `tool_calls` per step in every strategy, so an existing tool-loop runs unchanged — the panel/judge are server-side and invisible. Model lineups were chosen empirically: [`research-test/model-shootout/RESULTS.md`](./research-test/model-shootout/RESULTS.md).
+The proxy emits **exactly one** `tool_calls` per step in every strategy, so an existing tool-loop runs unchanged — the panel/judge are server-side and invisible. Model lineups were chosen empirically (an 8-model × 3-probe shoot-out across coding, research, and tool-calling).
 
 OpenCode shortcut: `./bin/fusion-opencode fusion-coder` (starts the proxy + wires the provider + opens the TUI).
 

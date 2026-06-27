@@ -26,7 +26,7 @@ New here? Read **[Which model do I use?](#which-model-do-i-use)** next.
 
 ## Which model do I use?
 
-Three **task-specialized** presets ship in `fusion.yaml`, each assembled from an empirical model shoot-out (8 models × 3 task probes — full data and scores in [`research-test/model-shootout/RESULTS.md`](./research-test/model-shootout/RESULTS.md)):
+Three **task-specialized** presets ship in `fusion.yaml`, each assembled from an empirical model shoot-out (8 models × 3 task probes — coding, research, and tool-calling):
 
 | Call this model | For | Strategy | How it is built |
 |---|---|---|---|
