@@ -5,3 +5,4 @@ dist
 .env*
 research-test/
 docs/superpowers/specs/
+AUDIT*
