@@ -1,0 +1,54 @@
+upstream:
+  base_url: https://ollama.com        # Ollama Cloud root
+  api_key_env: OLLAMA_API_KEY         # env var holding the Bearer key (never inline)
+  api_mode: auto                      # auto | openai | native   (default: auto)
+  max_concurrency: 4                  # global p-limit across all in-flight calls (default: 4)
+  request_timeout_s: 170              # per upstream call; MUST be < 182 (default: 170)
+
+server:
+  bind: 127.0.0.1                     # localhost only (default: 127.0.0.1)
+  port: 8080                          # (default: 8080)
+  auth_token_env: FUSION_PROXY_TOKEN  # optional; env var holding the shared client token.
+                                      # If unset, proxy runs unauthenticated and warns.
+
+defaults:                             # applied to every model unless overridden per-model
+  panel_member_timeout_s: 90          # per panel member (default: 90)
+  judge_timeout_s: 60                 # judge stage (default: 60)
+  min_panel_success: 1                # min successful panel answers, else 502 (default: 1)
+
+models:
+  # --- fusion strategy (Phase 3) ---
+  fusion-1:
+    strategy: fusion
+    panel: [glm-5.2, kimi-k2.7-code, deepseek-v4-pro]
+    judge: glm-5.2
+    synth: deepseek-v4-pro
+    tool_mode: deliberate             # deliberate | bypass   (default: deliberate)
+    fusion_planning_turn_only: false  # (default: false)
+
+  # --- single strategy (Phase 1) ---
+  fast-1:
+    strategy: single
+    target: deepseek-v4-pro
+
+  # --- failover strategy (Phase 2) ---
+  resilient-1:
+    strategy: failover
+    chain: [glm-5.2, kimi-k2.7-code, deepseek-v4-pro]
+
+  # --- smart strategy (Phase 4) ---
+  smart-1:
+    strategy: smart
+    router: glm-5.2                   # fast classifier model (one non-streamed JSON call per request)
+    default: simple                   # route used when the router is unsure / errors (simple | fusion; default: simple)
+    simple: { target: deepseek-v4-pro }   # inline single-strategy block, OR a string naming another model (e.g. simple: fast-1)
+    fusion:                           # inline fusion-strategy block, OR a string naming another model (e.g. fusion: fusion-1)
+      panel: [glm-5.2, kimi-k2.7-code, deepseek-v4-pro]
+      judge: glm-5.2
+      synth: deepseek-v4-pro
+
+overrides:                            # used ONLY when /api/show discovery misses
+  kimi-k2.7-code:                     # illustrative shape; Phase 0 confirmed kimi-k2.7-code is vision-capable via /api/show
+    tools: true
+    vision: true
+    context: 262144

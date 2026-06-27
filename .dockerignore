@@ -1,0 +1,12 @@
+# Build context exclusions — keep the image small and secrets out.
+node_modules
+.git
+.gitignore
+test
+docs
+*.log
+.env
+.env.*
+Dockerfile
+.dockerignore
+dist

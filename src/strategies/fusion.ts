@@ -1,0 +1,543 @@
+import { z } from "zod";
+import type {
+  ChatCompletionRequest,
+  ChatCompletionResult,
+  Strategy,
+  StrategyContext,
+  UpstreamClient,
+} from "../types";
+import type { FusionModelConfig } from "../config";
+import type { Resilience } from "../concurrency";
+import { createResilience } from "../concurrency";
+import {
+  AllMembersFailedError,
+  CapabilityError,
+  CircuitOpenError,
+  FusionError,
+  NativeStreamingNotImplementedError,
+  UpstreamTimeoutError,
+} from "../errors";
+import { openAiBodyToNativeChat, requestHasImages } from "../vision";
+
+/**
+ * `fusion` strategy — the core algorithm (spec §5.7 / §8.2):
+ *
+ *   panel (parallel, tools STRIPPED)  ->  judge (JSON analysis)  ->  synth (streams)
+ *
+ * Tool gate: in `deliberate` mode the panel never receives `tools`/`tool_choice`;
+ * if the request carried tools, their names/descriptions are injected as prose
+ * context so panel members deliberate about them without emitting a tool call.
+ * The synth stage is the ONLY stage that receives the real `tools` schema and
+ * the only one that may stream.
+ *
+ * Degradations:
+ *   - `tool_mode: bypass`            -> skip panel+judge, one synth call with tools.
+ *   - `fusion_planning_turn_only`    -> if the conversation already contains a
+ *                                       `role:"tool"` message, degrade to synth-only.
+ *   - judge failure / invalid JSON   -> synth proceeds from the raw panel answers.
+ *
+ * Vision gate: image requests are routed only through vision-capable panel
+ * members and a vision-capable synth; if none qualify -> HTTP 400.
+ */
+
+const STREAM_HEADERS_BASE: Record<string, string> = {
+  "cache-control": "no-cache",
+  connection: "keep-alive",
+};
+
+// --- Injectable per-stage timeout seam ------------------------------------
+
+/** A pending timeout: `expired` resolves when the deadline is reached. */
+export interface StageTimeout {
+  expired: Promise<void>;
+  cancel(): void;
+}
+
+/** Schedules a stage timeout. Default uses real timers; tests inject their own. */
+export type TimerFactory = (ms: number) => StageTimeout;
+
+const realTimer: TimerFactory = (ms) => {
+  let handle: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<void>((resolve) => {
+    handle = setTimeout(resolve, ms);
+  });
+  return {
+    expired,
+    cancel() {
+      if (handle !== undefined) clearTimeout(handle);
+    },
+  };
+};
+
+/**
+ * Race `work` against a stage timeout. On timeout the result is abandoned (the
+ * limiter slot frees when the underlying call eventually settles) and a typed
+ * `UpstreamTimeoutError` is thrown so the proxy is always first to fail.
+ */
+async function withTimeout<T>(
+  work: Promise<T>,
+  ms: number,
+  timer: TimerFactory,
+  label: string,
+): Promise<T> {
+  const t = timer(ms);
+  try {
+    return await Promise.race([
+      work,
+      t.expired.then((): never => {
+        throw new UpstreamTimeoutError(label);
+      }),
+    ]);
+  } finally {
+    t.cancel();
+  }
+}
+
+// --- Defensive parsing of upstream completion bodies ----------------------
+
+const CompletionSchema = z
+  .object({
+    choices: z
+      .array(
+        z
+          .object({
+            message: z
+              .object({ content: z.union([z.string(), z.null()]).optional() })
+              .passthrough(),
+          })
+          .passthrough(),
+      )
+      .optional(),
+    // Native /api/chat shape: { message: { content } }.
+    message: z.object({ content: z.union([z.string(), z.null()]).optional() }).passthrough().optional(),
+  })
+  .passthrough();
+
+/** Extract assistant text from an OpenAI- or native-shaped completion. */
+function extractAnswer(data: unknown): string | null {
+  const parsed = CompletionSchema.safeParse(data);
+  if (!parsed.success) return null;
+  const choice = parsed.data.choices?.[0];
+  const fromChoices = choice?.message.content;
+  if (typeof fromChoices === "string" && fromChoices.length > 0) return fromChoices;
+  const fromNative = parsed.data.message?.content;
+  if (typeof fromNative === "string" && fromNative.length > 0) return fromNative;
+  return null;
+}
+
+const JudgeAnalysisSchema = z
+  .object({
+    consensus: z.union([z.string(), z.array(z.string())]).optional(),
+    disagreements: z.union([z.string(), z.array(z.string())]).optional(),
+    unique_insights: z.union([z.string(), z.array(z.string())]).optional(),
+    blind_spots: z.union([z.string(), z.array(z.string())]).optional(),
+  })
+  .passthrough();
+
+export type JudgeAnalysis = z.infer<typeof JudgeAnalysisSchema>;
+
+interface PanelAnswer {
+  member: string;
+  content: string;
+}
+
+// --- Strategy factory ------------------------------------------------------
+
+export interface FusionDeps {
+  /** Per-stage timeout scheduler (panel members + judge). Default: real timers. */
+  timer?: TimerFactory;
+}
+
+export function createFusionStrategy(deps: FusionDeps = {}): Strategy {
+  const timer = deps.timer ?? realTimer;
+  return {
+    async execute(ctx: StrategyContext): Promise<Response> {
+      if (ctx.modelConfig.strategy !== "fusion") {
+        throw new FusionError(
+          "fusion strategy invoked with a non-fusion model config",
+          500,
+          "internal_error",
+        );
+      }
+      return runFusion(ctx, ctx.modelConfig, timer);
+    },
+  };
+}
+
+/** Default fusion strategy (real timers) wired by the router. */
+export const fusionStrategy: Strategy = createFusionStrategy();
+
+async function runFusion(
+  ctx: StrategyContext,
+  cfg: FusionModelConfig,
+  timer: TimerFactory,
+): Promise<Response> {
+  const { request, logger } = ctx;
+  const stream = request.stream === true;
+  const resilience =
+    ctx.resilience ?? createResilience({ maxConcurrency: ctx.config.upstream.max_concurrency });
+  const defaults = ctx.config.defaults;
+  const hasImages = requestHasImages(request);
+  const hasTools = Array.isArray(request.tools) && request.tools.length > 0;
+  const native = ctx.config.upstream.api_mode === "native" && hasImages;
+
+  // Vision gate (spec §5.11 / §10.1): only run discovery when images are present
+  // so the common text path adds no upstream calls.
+  let panelMembers = cfg.panel;
+  if (hasImages) {
+    panelMembers = await applyVisionGate(ctx, cfg);
+  }
+
+  // Degradations that skip panel+judge entirely.
+  const planningDegrade =
+    cfg.fusion_planning_turn_only && conversationHasToolMessage(request);
+  if (cfg.tool_mode === "bypass" || planningDegrade) {
+    logger.info(
+      { model: request.model, reason: cfg.tool_mode === "bypass" ? "bypass" : "planning_turn_only" },
+      "fusion: synth-only path",
+    );
+    return runSynth(ctx, resilience, cfg.synth, null, [], { stream, hasTools, native });
+  }
+
+  // PANEL — parallel, tools stripped.
+  const panelAnswers = await runPanel(ctx, resilience, panelMembers, timer, { hasTools, native });
+  if (panelAnswers.length < defaults.min_panel_success) {
+    throw new AllMembersFailedError(
+      `fusion panel produced ${panelAnswers.length} usable answer(s); need >= ${defaults.min_panel_success} for '${request.model}'`,
+    );
+  }
+  logger.info(
+    {
+      model: request.model,
+      panel: panelMembers,
+      panel_total: panelMembers.length,
+      panel_ok: panelAnswers.length,
+      judge: cfg.judge,
+      synth: cfg.synth,
+    },
+    "fusion: panel complete",
+  );
+
+  // JUDGE — one structured-JSON call; failure degrades to raw panel answers.
+  const analysis = await runJudge(ctx, resilience, cfg.judge, panelAnswers, timer, defaults);
+
+  // SYNTH — final answer, streams when requested, the only stage with real tools.
+  return runSynth(ctx, resilience, cfg.synth, analysis, panelAnswers, { stream, hasTools, native });
+}
+
+// --- Vision gate -----------------------------------------------------------
+
+async function applyVisionGate(ctx: StrategyContext, cfg: FusionModelConfig): Promise<string[]> {
+  const visionPanel: string[] = [];
+  for (const member of cfg.panel) {
+    const { capability } = await ctx.capabilities.discover(member);
+    if (capability.vision) visionPanel.push(member);
+  }
+  if (visionPanel.length === 0) {
+    throw new CapabilityError(
+      `fusion model '${ctx.request.model}' received image input but none of its panel members are vision-capable`,
+    );
+  }
+  const { capability: synthCap } = await ctx.capabilities.discover(cfg.synth);
+  if (!synthCap.vision) {
+    throw new CapabilityError(
+      `fusion model '${ctx.request.model}' received image input but its synth model '${cfg.synth}' is not vision-capable`,
+    );
+  }
+  return visionPanel;
+}
+
+// --- Panel stage -----------------------------------------------------------
+
+async function runPanel(
+  ctx: StrategyContext,
+  resilience: Resilience,
+  members: string[],
+  timer: TimerFactory,
+  opts: { hasTools: boolean; native: boolean },
+): Promise<PanelAnswer[]> {
+  const timeoutMs = ctx.config.defaults.panel_member_timeout_s * 1000;
+  const tasks = members.map((member) =>
+    callPanelMember(ctx, resilience, member, timer, timeoutMs, opts).catch((err: unknown) => {
+      ctx.logger.warn(
+        { member, reason: err instanceof Error ? err.message : String(err) },
+        "fusion: panel member failed, dropping",
+      );
+      return null;
+    }),
+  );
+  const settled = await Promise.all(tasks);
+  const answers: PanelAnswer[] = [];
+  for (const a of settled) if (a) answers.push(a);
+  return answers;
+}
+
+async function callPanelMember(
+  ctx: StrategyContext,
+  resilience: Resilience,
+  member: string,
+  timer: TimerFactory,
+  timeoutMs: number,
+  opts: { hasTools: boolean; native: boolean },
+): Promise<PanelAnswer | null> {
+  if (!resilience.breaker.canAttempt(member)) {
+    ctx.logger.warn({ member }, "fusion: skip panel member (circuit open)");
+    return null;
+  }
+  const body = buildPanelBody(ctx.request, member, opts);
+  let result: ChatCompletionResult;
+  try {
+    result = await withTimeout(
+      resilience.limiter(() => invokeUpstream(ctx.client, body, { stream: false, native: opts.native })),
+      timeoutMs,
+      timer,
+      `panel member '${member}' timed out after ${timeoutMs}ms`,
+    );
+  } catch (err) {
+    resilience.breaker.recordFailure(member);
+    throw err;
+  }
+  if (result.kind !== "json" || result.status >= 400) {
+    resilience.breaker.recordFailure(member);
+    return null;
+  }
+  resilience.breaker.recordSuccess(member);
+  const content = extractAnswer(result.data);
+  if (content === null) return null;
+  return { member, content };
+}
+
+function buildPanelBody(
+  request: ChatCompletionRequest,
+  member: string,
+  opts: { hasTools: boolean; native: boolean },
+): Record<string, unknown> {
+  // Strip tools/tool_choice and the stream flag; rewrite the model name.
+  const { tools, tool_choice: _toolChoice, stream: _stream, model: _model, messages, ...rest } =
+    request;
+  const msgs: unknown[] = Array.isArray(messages) ? [...messages] : [];
+  if (opts.hasTools) {
+    msgs.push({ role: "system", content: toolsPrompt(tools) });
+  }
+  const body: Record<string, unknown> = { ...rest, model: member, messages: msgs, stream: false };
+  return opts.native ? openAiBodyToNativeChat(body) : body;
+}
+
+// --- Judge stage -----------------------------------------------------------
+
+const JUDGE_SYSTEM_PROMPT =
+  "You are an impartial judge. You are given several independent expert answers to the same user request. " +
+  "Analyze them and respond with ONLY a JSON object with these keys: " +
+  '"consensus" (where the experts agree), "disagreements" (where they differ), ' +
+  '"unique_insights" (points raised by only one expert), and "blind_spots" (gaps none of them addressed). ' +
+  "Each value may be a string or an array of strings. Output JSON only — no prose, no code fences.";
+
+async function runJudge(
+  ctx: StrategyContext,
+  resilience: Resilience,
+  judge: string,
+  panelAnswers: PanelAnswer[],
+  timer: TimerFactory,
+  defaults: { judge_timeout_s: number },
+): Promise<JudgeAnalysis | null> {
+  if (!resilience.breaker.canAttempt(judge)) {
+    ctx.logger.warn({ judge }, "fusion: judge skipped (circuit open); using raw panel answers");
+    return null;
+  }
+  const body: Record<string, unknown> = {
+    model: judge,
+    temperature: 0,
+    response_format: { type: "json_object" },
+    stream: false,
+    messages: [
+      { role: "system", content: JUDGE_SYSTEM_PROMPT },
+      { role: "user", content: renderPanelForJudge(panelAnswers) },
+    ],
+  };
+  const timeoutMs = defaults.judge_timeout_s * 1000;
+  let result: ChatCompletionResult;
+  try {
+    result = await withTimeout(
+      resilience.limiter(() => ctx.client.chatCompletions(body, { stream: false })),
+      timeoutMs,
+      timer,
+      `judge '${judge}' timed out after ${timeoutMs}ms`,
+    );
+  } catch (err) {
+    resilience.breaker.recordFailure(judge);
+    ctx.logger.warn(
+      { judge, reason: err instanceof Error ? err.message : String(err) },
+      "fusion: judge call failed; falling back to raw panel answers",
+    );
+    return null;
+  }
+  if (result.kind !== "json" || result.status >= 400) {
+    resilience.breaker.recordFailure(judge);
+    ctx.logger.warn({ judge, status: result.status }, "fusion: judge non-OK; raw panel fallback");
+    return null;
+  }
+  resilience.breaker.recordSuccess(judge);
+  const content = extractAnswer(result.data);
+  const analysis = parseJudgeAnalysis(content);
+  if (analysis === null) {
+    ctx.logger.warn({ judge }, "fusion: judge returned unparseable/invalid JSON; raw panel fallback");
+  }
+  return analysis;
+}
+
+function parseJudgeAnalysis(content: string | null): JudgeAnalysis | null {
+  if (content === null) return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(content);
+  } catch {
+    return null;
+  }
+  const parsed = JudgeAnalysisSchema.safeParse(raw);
+  return parsed.success ? parsed.data : null;
+}
+
+// --- Synth stage -----------------------------------------------------------
+
+async function runSynth(
+  ctx: StrategyContext,
+  resilience: Resilience,
+  synth: string,
+  analysis: JudgeAnalysis | null,
+  panelAnswers: PanelAnswer[],
+  opts: { stream: boolean; hasTools: boolean; native: boolean },
+): Promise<Response> {
+  if (!resilience.breaker.canAttempt(synth)) {
+    throw new CircuitOpenError(`circuit breaker open for fusion synth model '${synth}'`);
+  }
+  const body = buildSynthBody(ctx.request, synth, analysis, panelAnswers, opts);
+  let result: ChatCompletionResult;
+  try {
+    result = await resilience.limiter(() =>
+      invokeUpstream(ctx.client, body, { stream: opts.stream, native: opts.native }),
+    );
+  } catch (err) {
+    resilience.breaker.recordFailure(synth);
+    throw err;
+  }
+  if (result.status < 400) resilience.breaker.recordSuccess(synth);
+  else resilience.breaker.recordFailure(synth);
+
+  if (result.kind === "stream") {
+    const headers: Record<string, string> = {
+      ...STREAM_HEADERS_BASE,
+      "content-type": result.contentType ?? "text/event-stream",
+    };
+    return new Response(result.body, { status: result.status, headers });
+  }
+  return new Response(JSON.stringify(result.data ?? null), {
+    status: result.status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function buildSynthBody(
+  request: ChatCompletionRequest,
+  synth: string,
+  analysis: JudgeAnalysis | null,
+  panelAnswers: PanelAnswer[],
+  opts: { stream: boolean; hasTools: boolean; native: boolean },
+): Record<string, unknown> {
+  // Synth keeps the real tools (if any) and the original messages; we append a
+  // synthesis-context system message only on the full fusion path.
+  const { stream: _stream, model: _model, messages, ...rest } = request;
+  const msgs: unknown[] = Array.isArray(messages) ? [...messages] : [];
+  const context = buildSynthContext(analysis, panelAnswers);
+  if (context !== null) {
+    msgs.push({ role: "system", content: context });
+  }
+  const body: Record<string, unknown> = { ...rest, model: synth, messages: msgs, stream: opts.stream };
+  // `rest` already carries `tools`/`tool_choice` verbatim when present — synth is
+  // the only stage that receives them, so no stripping here.
+  return opts.native ? openAiBodyToNativeChat(body) : body;
+}
+
+/**
+ * Build the synthesis context message. `null` on the synth-only path (no panel
+ * ran). Otherwise prefers the structured judge analysis, falling back to the raw
+ * panel answers when the judge failed.
+ */
+function buildSynthContext(analysis: JudgeAnalysis | null, panelAnswers: PanelAnswer[]): string | null {
+  if (analysis !== null) {
+    return (
+      "A panel of expert models answered the user's request, and a judge produced this structured analysis. " +
+      "Use it to synthesize the single best final answer.\n\nJUDGE ANALYSIS (JSON):\n" +
+      JSON.stringify(analysis)
+    );
+  }
+  if (panelAnswers.length > 0) {
+    return (
+      "A panel of expert models answered the user's request (the structured judge analysis was unavailable). " +
+      "Synthesize the single best final answer from these expert answers.\n\n" +
+      renderPanelForJudge(panelAnswers)
+    );
+  }
+  return null;
+}
+
+function renderPanelForJudge(panelAnswers: PanelAnswer[]): string {
+  return panelAnswers
+    .map((a, i) => `--- Expert ${i + 1} (${a.member}) ---\n${a.content}`)
+    .join("\n\n");
+}
+
+// --- Shared helpers --------------------------------------------------------
+
+/** Dispatch to the native or OpenAI-compat backend; native streaming is deferred. */
+function invokeUpstream(
+  client: UpstreamClient,
+  body: Record<string, unknown>,
+  opts: { stream: boolean; native: boolean },
+): Promise<ChatCompletionResult> {
+  if (opts.native) {
+    if (opts.stream) {
+      throw new NativeStreamingNotImplementedError(
+        "native /api/chat streaming is not yet wired; use api_mode openai/auto for streaming image requests",
+      );
+    }
+    return client.chatNative(body, { stream: false });
+  }
+  return client.chatCompletions(body, { stream: opts.stream });
+}
+
+/** Render the request's tool schema as prose for the (tool-stripped) panel. */
+function toolsPrompt(tools: unknown): string {
+  const lines: string[] = [];
+  if (Array.isArray(tools)) {
+    for (const tool of tools) {
+      const fn = ToolSchema.safeParse(tool);
+      if (fn.success) {
+        const desc = fn.data.function.description;
+        lines.push(`- ${fn.data.function.name}${desc ? `: ${desc}` : ""}`);
+      }
+    }
+  }
+  const listed = lines.length > 0 ? lines.join("\n") : "(no tool details available)";
+  return (
+    "Available tools:\n" +
+    listed +
+    "\n\nDeliberate in prose on the best approach and which tool(s) you would use and why. " +
+    "DO NOT emit a tool call — respond with reasoning only."
+  );
+}
+
+const ToolSchema = z
+  .object({
+    function: z.object({ name: z.string(), description: z.string().optional() }).passthrough(),
+  })
+  .passthrough();
+
+/** True when the conversation already contains a `role:"tool"` message. */
+function conversationHasToolMessage(request: ChatCompletionRequest): boolean {
+  const messages = request.messages;
+  if (!messages) return false;
+  for (const message of messages) {
+    if (message.role === "tool") return true;
+  }
+  return false;
+}

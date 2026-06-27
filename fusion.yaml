@@ -1,0 +1,37 @@
+# llm-fusion — active config (loaded by default; override the path with FUSION_CONFIG).
+# Minimal, working setup against Ollama Cloud using real library models.
+# See fusion.example.yaml for the fully annotated reference (every option + defaults).
+
+upstream:
+  base_url: https://ollama.com        # Ollama Cloud root
+  api_key_env: OLLAMA_API_KEY         # env var holding the Bearer key (never inline the key)
+  api_mode: openai                    # Phase 0 confirmed: /v1 chat + SSE + tool_calls all work (auto | openai | native)
+
+server:
+  bind: 127.0.0.1                     # localhost only. For Docker set 0.0.0.0 here
+                                      # (or run with FUSION_BIND=0.0.0.0) so the host can reach it.
+  port: 8080
+  # auth_token_env: FUSION_PROXY_TOKEN  # optional: when set, clients must send
+                                        # Authorization: Bearer <value-of-that-env-var>.
+                                        # Unset = unauthenticated (localhost single-user) + startup warning.
+
+models:
+  # single — 1:1 passthrough to one fast model.
+  fast-glm:
+    strategy: single
+    target: glm-5.2
+
+  # fusion — panel -> judge -> synth across three models (the deliberate path).
+  fusion-1:
+    strategy: fusion
+    panel: [glm-5.2, kimi-k2.7-code, deepseek-v4-pro]
+    judge: glm-5.2
+    synth: deepseek-v4-pro
+
+  # smart — an LLM router decides per request: cheap single vs deep fusion.
+  smart-1:
+    strategy: smart
+    router: glm-5.2                   # fast classifier (one non-streamed JSON call per request)
+    default: simple                   # route used when the router is unsure / errors
+    simple: fast-glm                  # string ref to the single model above
+    fusion: fusion-1                  # string ref to the fusion model above
