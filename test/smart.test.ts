@@ -264,6 +264,21 @@ describe("smart strategy", () => {
     expect(up.routerBodies()).toHaveLength(0);
   });
 
+  it("router-selected fusion forces the FULL panel mid-loop, even for a planning-turn-only fusion ref", async () => {
+    // Non-error tool result -> escalation does NOT fire, so this exercises the ROUTER
+    // path. The router chooses fusion; without the fix, fusion-pto's planning_turn_only
+    // would degrade this tool-continuation step back to synth-only, silently overriding
+    // the router's decision. With the fix, the full panel runs.
+    const up = makeUpstream(chatWith(routeFusion));
+    const res = await smartStrategy.execute(
+      ctx(up.client, reqWithToolResult("smart-ref-pto", "All 12 tests passed in 1.2s."), "smart-ref-pto"),
+    );
+    expect(res.status).toBe(200);
+    expect(up.routerBodies()).toHaveLength(1); // the router was consulted (not escalation)
+    const called = up.modelsCalled();
+    for (const m of PANEL) expect(called).toContain(m); // full panel ran, not synth-only
+  });
+
   it("does NOT escalate when a tool result merely mentions an error mid-line (file read)", async () => {
     const up = makeUpstream(chatWith(routeSimple));
     const fileRead =

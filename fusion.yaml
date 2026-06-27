@@ -96,6 +96,8 @@ models:
     strategy: smart
     router: glm-5.2                   # router shoot-out winner (fast + reliable JSON classifier)
     default: simple
-    escalate_on_tool_error: false     # a failing tool result -> straight to fusion (re-deliberate on recovery)
-    simple: { target: gemini-3-flash-preview }   # fast, cheap, strong all-rounder for easy/mechanical steps
-    fusion: fusion-coder              # hard steps -> the planning-strong coder panel (inherits its deliberate + planning-turn knobs)
+    escalate_on_tool_error: true      # a failing tool result (test failure / error / exception) -> straight to
+                                      # fusion: error-recovery is exactly where multiple viewpoints earn their cost
+    simple: { target: gemini-3-flash-preview }   # fast, cheap all-rounder for mechanical steps (read / grep / run)
+    fusion: fusion-coder              # substantive steps -> the coder panel. The router's decision to deliberate
+                                      # forces the FULL panel here (planning_turn_only is overridden mid-loop)

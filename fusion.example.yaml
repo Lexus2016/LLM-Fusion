@@ -92,9 +92,11 @@ models:
     strategy: smart
     router: glm-5.2                   # fast + reliable JSON classifier (router shoot-out winner)
     default: simple
-    escalate_on_tool_error: false     # a failing tool result -> straight to fusion (re-deliberate on recovery)
-    simple: { target: gemini-3-flash-preview }   # fast, cheap, strong all-rounder for the easy steps
-    fusion: fusion-coder              # hard steps -> the planning-strong coder panel (string ref to the model above)
+    escalate_on_tool_error: true      # a failing tool result (test failure / error) -> straight to fusion;
+                                      # error-recovery is exactly where multiple viewpoints earn their cost
+    simple: { target: gemini-3-flash-preview }   # fast, cheap all-rounder for mechanical steps (read / grep / run)
+    fusion: fusion-coder              # substantive steps -> the coder panel. When the router routes a step to
+                                      # fusion, the FULL panel runs even mid-loop (planning_turn_only is overridden)
 
 overrides:                            # used ONLY when /api/show discovery misses
   kimi-k2.7-code:                     # illustrative shape; Phase 0 confirmed kimi-k2.7-code is vision-capable via /api/show

@@ -63,6 +63,10 @@ const ROUTER_SYSTEM_PROMPT = [
   "",
   'Choose "simple" only when the request is genuinely routine: a single-step task, a factual lookup, a short edit, a trivial transformation, boilerplate, or casual conversation that one strong model answers well on its own.',
   "",
+  "If this is an agent mid-loop (the latest message is a tool result), classify the model's NEXT action:",
+  '- "fusion" when the next step will write, modify, or review code; fix a bug; design or refactor; analyze a failure; or make a correctness/architecture decision — the substantive work where several viewpoints raise quality.',
+  '- "simple" when the next step is mechanical: reading or opening a file, listing a directory, grep/search, running a command just to gather information, or acknowledging a result before moving on.',
+  "",
   "When in doubt between the two, prefer \"fusion\" — the cost of under-deliberating a hard task outweighs the cost of deliberating an easy one.",
   "Output the JSON object and nothing else.",
 ].join("\n");
@@ -127,7 +131,11 @@ export const smartStrategy: Strategy = {
       await assertSingleVisionCapable(ctx.capabilities, ctx.request, modelConfig.target, ctx.request.model);
       return singleStrategy.execute({ ...ctx, modelConfig });
     }
-    const modelConfig = resolveFusion(ctx, cfg);
+    // The router has decided this step is worth deliberation, so run the FULL panel
+    // even mid-loop: a referenced fusion model's `fusion_planning_turn_only` would
+    // otherwise degrade a tool-continuation step back to synth-only, silently
+    // overriding the router's choice (the whole reason it routed to fusion here).
+    const modelConfig = { ...resolveFusion(ctx, cfg), fusion_planning_turn_only: false };
     return fusionStrategy.execute({ ...ctx, modelConfig });
   },
 };
