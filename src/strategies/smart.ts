@@ -76,20 +76,19 @@ const RouteDecisionSchema = z
 type RouteDecision = z.infer<typeof RouteDecisionSchema>;
 
 /** OpenAI- or native-shaped completion envelope (only the content we read). */
+const RouterMessageSchema = z
+  .object({
+    content: z.union([z.string(), z.null()]).optional(),
+    // "thinking" router models may put the JSON decision here with empty content.
+    reasoning: z.union([z.string(), z.null()]).optional(),
+    reasoning_content: z.union([z.string(), z.null()]).optional(),
+  })
+  .passthrough();
+
 const RouterCompletionSchema = z
   .object({
-    choices: z
-      .array(
-        z
-          .object({
-            message: z
-              .object({ content: z.union([z.string(), z.null()]).optional() })
-              .passthrough(),
-          })
-          .passthrough(),
-      )
-      .optional(),
-    message: z.object({ content: z.union([z.string(), z.null()]).optional() }).passthrough().optional(),
+    choices: z.array(z.object({ message: RouterMessageSchema }).passthrough()).optional(),
+    message: RouterMessageSchema.optional(),
   })
   .passthrough();
 
@@ -282,15 +281,32 @@ function parseRouteDecision(content: string | null): RouteDecision | null {
   return parsed.success ? parsed.data : null;
 }
 
-/** Extract assistant text from an OpenAI- or native-shaped completion. */
+/** First candidate with non-whitespace text, else null. */
+function firstNonEmptyText(...values: Array<string | null | undefined>): string | null {
+  for (const v of values) {
+    if (typeof v === "string" && v.trim().length > 0) return v;
+  }
+  return null;
+}
+
+/**
+ * Extract the router's decision text from an OpenAI- or native-shaped completion.
+ * "Thinking" router models can return the JSON decision in `reasoning` /
+ * `reasoning_content` with an empty `content` (mirrors fusion.ts `effectiveText`);
+ * promote those too, otherwise a valid route is silently lost to the default.
+ */
 function extractContent(data: unknown): string | null {
   const parsed = RouterCompletionSchema.safeParse(data);
   if (!parsed.success) return null;
-  const fromChoices = parsed.data.choices?.[0]?.message.content;
-  if (typeof fromChoices === "string" && fromChoices.length > 0) return fromChoices;
-  const fromNative = parsed.data.message?.content;
-  if (typeof fromNative === "string" && fromNative.length > 0) return fromNative;
-  return null;
+  const choiceMsg = parsed.data.choices?.[0]?.message;
+  const fromChoices = choiceMsg
+    ? firstNonEmptyText(choiceMsg.content, choiceMsg.reasoning, choiceMsg.reasoning_content)
+    : null;
+  if (fromChoices !== null) return fromChoices;
+  const nativeMsg = parsed.data.message;
+  return nativeMsg
+    ? firstNonEmptyText(nativeMsg.content, nativeMsg.reasoning, nativeMsg.reasoning_content)
+    : null;
 }
 
 /** Render the incoming conversation into a compact transcript for the classifier. */

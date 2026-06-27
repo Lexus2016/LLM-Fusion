@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { UsageAccumulator } from "../src/usage";
+import { UsageAccumulator, tapStreamUsage } from "../src/usage";
 import type { ChatCompletionResult, Usage } from "../src/types";
 
 /**
@@ -55,5 +55,43 @@ describe("UsageAccumulator — multiple streamed calls", () => {
 
     expect(acc.snapshot().totalTokens).toBe(0); // pending streams not yet drained
     expect((await acc.finalize()).totalTokens).toBe(20);
+  });
+
+  it("finalize() is idempotent — a second call does not double-count pending streams (H-3)", async () => {
+    const acc = new UsageAccumulator();
+    acc.record("s1", streamResult({ promptTokens: 10, completionTokens: 5, totalTokens: 15 }));
+    acc.record("s2", streamResult({ promptTokens: 20, completionTokens: 7, totalTokens: 27 }));
+
+    const first = await acc.finalize();
+    const second = await acc.finalize();
+    expect(second.upstreamCalls).toBe(first.upstreamCalls);
+    expect(second.totalTokens).toBe(first.totalTokens);
+    expect(second.totalTokens).toBe(42); // folded exactly once — not 84
+  });
+});
+
+describe("tapStreamUsage — settles on a mid-stream error", () => {
+  it("resolves its usage promise when the body errors (does not hang finalize)", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"x"}}]}\n\n'));
+        controller.error(new Error("upstream dropped mid-stream"));
+      },
+    });
+    const { stream, usage } = tapStreamUsage(body);
+    if (!stream) throw new Error("expected a tapped stream");
+    const reader = stream.getReader();
+    try {
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    } catch {
+      /* expected: the tapped body errored */
+    }
+    // The usage promise must RESOLVE (zeros) rather than hang — finalize() and the
+    // streaming usage log depend on this settling even when no clean flush runs.
+    const u = await usage;
+    expect(u.totalTokens).toBe(0);
   });
 });

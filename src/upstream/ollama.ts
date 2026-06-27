@@ -44,24 +44,29 @@ export class OllamaClient implements UpstreamClient {
   }
 
   private async doFetch(url: string, init: RequestInit): Promise<Response> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    // Per-call timeout via an UNREF'd signal (AbortSignal.timeout does not keep
+    // the event loop alive — fixes the old ref'd setTimeout that blocked shutdown),
+    // combined with any caller-provided signal so a stage timeout or shutdown can
+    // cancel the in-flight request and free its concurrency slot promptly.
+    const timeout = AbortSignal.timeout(this.timeoutMs);
+    const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
     try {
-      return await this.fetchFn(url, { ...init, signal: controller.signal });
+      return await this.fetchFn(url, { ...init, signal });
     } catch (err) {
-      if (controller.signal.aborted) {
+      if (timeout.aborted) {
         throw new UpstreamTimeoutError(`upstream request to ${url} timed out after ${this.timeoutMs}ms`);
+      }
+      if (init.signal?.aborted) {
+        throw new UpstreamTimeoutError(`upstream request to ${url} was cancelled by the caller`);
       }
       const message = err instanceof Error ? err.message : "upstream request failed";
       throw new UpstreamNetworkError(`upstream request to ${url} failed: ${message}`);
-    } finally {
-      clearTimeout(timer);
     }
   }
 
   async chatCompletions(
     body: Record<string, unknown>,
-    opts: { stream: boolean },
+    opts: { stream: boolean; signal?: AbortSignal },
   ): Promise<ChatCompletionResult> {
     const url = `${this.baseUrl}/v1/chat/completions`;
     const payload = withIncludeUsage({ ...body, stream: opts.stream }, opts.stream);
@@ -69,6 +74,7 @@ export class OllamaClient implements UpstreamClient {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(payload),
+      signal: opts.signal,
     });
     // Stream only when the upstream actually succeeded; an error before the
     // first byte is surfaced as a JSON body with the upstream status.
@@ -104,7 +110,7 @@ export class OllamaClient implements UpstreamClient {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   async chatNative(
     body: Record<string, unknown>,
-    opts: { stream: boolean },
+    opts: { stream: boolean; signal?: AbortSignal },
   ): Promise<ChatCompletionResult> {
     if (opts.stream) {
       // Native NDJSON streaming is intentionally deferred — callers that hit
@@ -120,6 +126,7 @@ export class OllamaClient implements UpstreamClient {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(payload),
+      signal: opts.signal,
     });
     const data = await readBody(res);
     return { kind: "json", status: res.status, data, usage: usageFromBody(data) };

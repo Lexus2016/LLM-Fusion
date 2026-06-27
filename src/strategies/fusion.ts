@@ -76,8 +76,9 @@ const realTimer: TimerFactory = (ms) => {
 };
 
 /**
- * Race `work` against a stage timeout. On timeout the result is abandoned (the
- * limiter slot frees when the underlying call eventually settles) and a typed
+ * Race `work` against a stage timeout. On timeout `onTimeout` runs first — used
+ * to abort the in-flight upstream call so its concurrency-limiter slot frees
+ * promptly instead of lingering until the call settles on its own — and a typed
  * `UpstreamTimeoutError` is thrown so the proxy is always first to fail.
  */
 async function withTimeout<T>(
@@ -85,12 +86,14 @@ async function withTimeout<T>(
   ms: number,
   timer: TimerFactory,
   label: string,
+  onTimeout?: () => void,
 ): Promise<T> {
   const t = timer(ms);
   try {
     return await Promise.race([
       work,
       t.expired.then((): never => {
+        onTimeout?.();
         throw new UpstreamTimeoutError(label);
       }),
     ]);
@@ -434,12 +437,16 @@ async function callPanelMember(
   const body = buildPanelBody(ctx.request, member, opts);
   const startedAt = Date.now();
   let result: ChatCompletionResult;
+  const abort = new AbortController();
   try {
     result = await withTimeout(
-      resilience.limiter(() => invokeUpstream(ctx.client, body, { stream: false, native: opts.native })),
+      resilience.limiter(() =>
+        invokeUpstream(ctx.client, body, { stream: false, native: opts.native, signal: abort.signal }),
+      ),
       timeoutMs,
       timer,
       `panel member '${member}' timed out after ${timeoutMs}ms`,
+      () => abort.abort(),
     );
   } catch (err) {
     resilience.breaker.recordFailure(member);
@@ -537,12 +544,14 @@ async function runJudge(
   const timeoutMs = defaults.judge_timeout_s * 1000;
   const startedAt = Date.now();
   let result: ChatCompletionResult;
+  const abort = new AbortController();
   try {
     result = await withTimeout(
-      resilience.limiter(() => ctx.client.chatCompletions(body, { stream: false })),
+      resilience.limiter(() => ctx.client.chatCompletions(body, { stream: false, signal: abort.signal })),
       timeoutMs,
       timer,
       `judge '${judge}' timed out after ${timeoutMs}ms`,
+      () => abort.abort(),
     );
   } catch (err) {
     resilience.breaker.recordFailure(judge);
@@ -733,7 +742,7 @@ function renderPanelForJudge(panelAnswers: PanelAnswer[]): string {
 function invokeUpstream(
   client: UpstreamClient,
   body: Record<string, unknown>,
-  opts: { stream: boolean; native: boolean },
+  opts: { stream: boolean; native: boolean; signal?: AbortSignal },
 ): Promise<ChatCompletionResult> {
   if (opts.native) {
     if (opts.stream) {
@@ -741,9 +750,9 @@ function invokeUpstream(
         "native /api/chat streaming is not yet wired; use api_mode openai/auto for streaming image requests",
       );
     }
-    return client.chatNative(body, { stream: false });
+    return client.chatNative(body, { stream: false, signal: opts.signal });
   }
-  return client.chatCompletions(body, { stream: opts.stream });
+  return client.chatCompletions(body, { stream: opts.stream, signal: opts.signal });
 }
 
 /** Render the request's tool schema as prose for the (tool-stripped) panel. */

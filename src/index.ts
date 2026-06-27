@@ -15,8 +15,15 @@ async function main(): Promise<void> {
   // Must run before any env var is read (logger level, FUSION_CONFIG, the key).
   try {
     process.loadEnvFile();
-  } catch {
-    // No .env present; rely on the ambient environment.
+  } catch (err) {
+    // A missing .env is expected and silently ignored. Surface anything else
+    // (e.g. a permission error or unreadable file) so it is not lost — the pino
+    // logger does not exist yet (env must load first to pick up LOG_LEVEL /
+    // LOG_PRETTY), so emit a Node process warning rather than a structured log.
+    const code = err instanceof Error && "code" in err ? err.code : undefined;
+    if (code !== "ENOENT") {
+      process.emitWarning(`could not load .env file: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   const logger = createLogger();

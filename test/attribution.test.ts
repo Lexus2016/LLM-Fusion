@@ -30,7 +30,7 @@ function captureLogger(): Captured {
     { level: "warn", base: undefined },
     {
       write(s: string) {
-        lines.push(JSON.parse(s) as Record<string, unknown>);
+        lines.push(JSON.parse(s));
       },
     },
   );
@@ -158,7 +158,7 @@ describe("per-call error attribution", () => {
       const url =
         typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       if (url.endsWith("/api/show")) return jsonResponse({ capabilities: ["completion"], model_info: {} });
-      const body = JSON.parse(String(init?.body)) as { model: string };
+      const body: { model: string } = JSON.parse(String(init?.body));
       if (body.model === "m2") return new Promise<Response>(() => {}); // never resolves -> timeout
       return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
     };

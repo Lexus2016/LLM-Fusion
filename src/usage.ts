@@ -111,6 +111,8 @@ export class UsageAccumulator {
   private callCount = 0;
   private readonly records: CallRecord[] = [];
   private readonly pendingStreams: Array<{ model: string; usage: Promise<Usage> }> = [];
+  /** Memoized finalize() result, so repeated calls don't re-fold pending streams. */
+  private finalizing: Promise<RequestUsage> | undefined;
 
   /** Record one completed upstream call (its model + result). */
   record(model: string, result: ChatCompletionResult): void {
@@ -143,14 +145,26 @@ export class UsageAccumulator {
 
   /** Aggregate including every streamed call's tokens (awaits each drain). */
   async finalize(pricing?: PricingMap): Promise<RequestUsage> {
-    const records = [...this.records];
-    if (this.pendingStreams.length > 0) {
-      const drained = await Promise.all(
-        this.pendingStreams.map(async (p) => ({ model: p.model, usage: await p.usage })),
-      );
-      records.push(...drained);
+    // Memoized: callers may invoke finalize() more than once per request (e.g.
+    // once to inject the trailing usage chunk, once to log on stream completion).
+    // Without this the pending streams would be folded in — and double-counted —
+    // each time. The call count / records / pending list are snapshotted
+    // synchronously so a late record() cannot skew the aggregate (M-9).
+    if (this.finalizing === undefined) {
+      const callCount = this.callCount;
+      const records = [...this.records];
+      const pending = [...this.pendingStreams];
+      this.finalizing = (async () => {
+        if (pending.length > 0) {
+          const drained = await Promise.all(
+            pending.map(async (p) => ({ model: p.model, usage: await p.usage })),
+          );
+          records.push(...drained);
+        }
+        return aggregate(callCount, records, pricing);
+      })();
     }
-    return aggregate(this.callCount, records, pricing);
+    return this.finalizing;
   }
 }
 
@@ -212,7 +226,12 @@ export function tapStreamUsage(body: ReadableStream<Uint8Array> | null): {
     }
   };
 
-  const tap = new TransformStream<Uint8Array, Uint8Array>({
+  // The cancel hook is invoked by the runtime when the writable side is aborted
+  // (upstream error) — Node 24 supports it, but the lib's Transformer type does
+  // not yet declare it, so widen the type locally instead of casting.
+  const tapTransformer: Transformer<Uint8Array, Uint8Array> & {
+    cancel?(reason?: unknown): void;
+  } = {
     transform(chunk, controller) {
       buffer += decoder.decode(chunk, { stream: true });
       let nl: number;
@@ -227,7 +246,14 @@ export function tapStreamUsage(body: ReadableStream<Uint8Array> | null): {
       if (buffer.length > 0) scan(buffer);
       resolveUsage(captured ?? { ...ZERO_USAGE });
     },
-  });
+    cancel() {
+      // Upstream body errored (or the consumer cancelled) before a clean flush —
+      // settle the usage promise with whatever was captured so a downstream
+      // finalize() never hangs waiting on a stream that will not drain.
+      resolveUsage(captured ?? { ...ZERO_USAGE });
+    },
+  };
+  const tap = new TransformStream<Uint8Array, Uint8Array>(tapTransformer);
 
   return { stream: body.pipeThrough(tap), usage };
 }
@@ -250,7 +276,6 @@ export function makeUsageInjectionTransform(
   accumulator: UsageAccumulator,
   meta: StreamUsageMeta,
   pricing: PricingMap | undefined,
-  onFinal: (usage: RequestUsage) => void,
 ): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -290,7 +315,6 @@ export function makeUsageInjectionTransform(
       };
       controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-      onFinal(usage);
     },
   });
 }

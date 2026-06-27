@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { pino } from "pino";
 import { createApp } from "../src/server";
 import { OllamaClient } from "../src/upstream/ollama";
 import { CapabilityService } from "../src/capabilities";
@@ -170,5 +171,49 @@ describe("server", () => {
     const text = await res.text();
     expect(text).toContain('"content":"x"');
     expect(text).toContain("[DONE]");
+  });
+
+  it("logs `request usage` even when the upstream stream errors mid-stream (H-2)", async () => {
+    const lines: Array<Record<string, unknown>> = [];
+    const capLogger = pino({ level: "info", base: undefined }, { write(s: string) { lines.push(JSON.parse(s)); } });
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"x"}}]}\n\n'));
+                controller.error(new Error("upstream dropped mid-stream"));
+              },
+            }),
+            { status: 200, headers: { "content-type": "text/event-stream" } },
+          ),
+      },
+    ];
+    const client = new OllamaClient({ baseUrl: "https://mock.test", apiKey: "k", fetchFn: mockFetch(routes) });
+    const capabilities = new CapabilityService({ client, getOverrides: () => config.overrides, logger: capLogger });
+    const app = createApp({ getConfig: () => config, client, capabilities, getAuthToken: () => undefined, logger: capLogger });
+
+    const res = await app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "fast-glm", stream: true, messages: [] }),
+    });
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    const body = res.body;
+    if (body) {
+      const reader = body.getReader();
+      try {
+        for (;;) {
+          const { done } = await reader.read();
+          if (done) break;
+        }
+      } catch {
+        /* expected: the upstream stream errored mid-way */
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10)); // let the pipeTo rejection settle the log
+    expect(lines.find((l) => l.msg === "request usage")).toBeDefined();
   });
 });

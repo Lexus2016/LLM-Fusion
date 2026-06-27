@@ -48,6 +48,26 @@ describe("single strategy", () => {
     expect(body.choices[0].message.content).toBe("hi");
   });
 
+  it("honors a caller-provided AbortSignal and surfaces it as a typed timeout (M-1)", async () => {
+    // A fetch that settles only when its signal aborts proves the caller's signal
+    // reaches the request — so a fusion stage timeout can cancel the in-flight call
+    // and free its concurrency slot instead of letting it linger.
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: (_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError")),
+          );
+        }),
+    });
+    const ac = new AbortController();
+    const pending = client.chatCompletions({ model: "m" }, { stream: false, signal: ac.signal });
+    ac.abort();
+    await expect(pending).rejects.toThrow(/cancelled by the caller/);
+  });
+
   it("rewrites the virtual model name to the resolved upstream target", async () => {
     let sentModel: unknown;
     const client = new OllamaClient({

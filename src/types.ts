@@ -79,7 +79,10 @@ export interface UpstreamClient {
    * OpenAI-compat path: `POST {baseUrl}/v1/chat/completions`.
    * Non-stream -> parsed JSON; stream -> raw body stream.
    */
-  chatCompletions(body: Record<string, unknown>, opts: { stream: boolean }): Promise<ChatCompletionResult>;
+  chatCompletions(
+    body: Record<string, unknown>,
+    opts: { stream: boolean; signal?: AbortSignal },
+  ): Promise<ChatCompletionResult>;
   /** Native discovery path: `POST {baseUrl}/api/show {model}` -> raw JSON. */
   show(model: string): Promise<unknown>;
   /**
@@ -87,7 +90,10 @@ export interface UpstreamClient {
    * `api_mode === "native"`. The non-stream path is implemented; native
    * streaming is deferred (throws `NativeStreamingNotImplementedError`).
    */
-  chatNative(body: Record<string, unknown>, opts: { stream: boolean }): Promise<ChatCompletionResult>;
+  chatNative(
+    body: Record<string, unknown>,
+    opts: { stream: boolean; signal?: AbortSignal },
+  ): Promise<ChatCompletionResult>;
 }
 
 // --- OpenAI-compatible request shapes -------------------------------------

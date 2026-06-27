@@ -256,6 +256,41 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(userContents(judgeBody!).join("\n")).not.toContain("ans-m2");
   });
 
+  it("aborts the in-flight upstream call when a panel member times out (frees the slot, H-1)", async () => {
+    const fastTimer: TimerFactory = () => {
+      let h: ReturnType<typeof setTimeout>;
+      const expired = new Promise<void>((resolve) => {
+        h = setTimeout(resolve, 5);
+      });
+      return { expired, cancel: () => clearTimeout(h) };
+    };
+    let m2Aborted = false;
+    const fetchFn: FetchFn = async (input, init) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith("/api/show")) return jsonResponse({ capabilities: ["completion"], model_info: {} });
+      const body = RecordedBodySchema.parse(JSON.parse(String(init?.body)));
+      if (body.model === "m2") {
+        // Hang until the caller's (combined) signal aborts — proves the stage
+        // timeout actually cancels the in-flight request instead of letting it
+        // linger and hold its concurrency-limiter slot.
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            m2Aborted = true;
+            reject(new DOMException("aborted", "AbortError"));
+          });
+        });
+      }
+      return defaultChat()(body);
+    };
+    const client = new OllamaClient({ baseUrl: "https://mock.test", apiKey: "k", fetchFn });
+    const strategy = createFusionStrategy({ timer: fastTimer });
+    const res = await strategy.execute(ctx(client, req()));
+    expect(res.status).toBe(200); // survivors carried the request
+    await new Promise((resolve) => setTimeout(resolve, 0)); // let the abort listener settle
+    expect(m2Aborted).toBe(true); // the slow member's call was cancelled, not abandoned
+  });
+
   it("returns 502 when every panel member fails", async () => {
     const up = makeUpstream((body) => {
       if (body.model.startsWith("m")) return jsonResponse({ error: "down" }, 500);

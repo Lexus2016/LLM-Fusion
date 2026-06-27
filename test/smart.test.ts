@@ -205,6 +205,24 @@ describe("smart strategy", () => {
     expect(up.modelsCalled()).toContain("deepseek"); // routed simple, fusion did not run
   });
 
+  it("honors a router decision returned in `reasoning` with empty content (M-8 regression)", async () => {
+    // A "thinking" router model may put its JSON route in `reasoning` and leave
+    // `content` empty; the router must still pick that route, not the default.
+    const routeFusionViaReasoning = (): Response =>
+      jsonResponse({
+        choices: [
+          { message: { content: "", reasoning: JSON.stringify({ route: "fusion", reason: "hard" }) } },
+        ],
+      });
+    const up = makeUpstream(chatWith(routeFusionViaReasoning));
+    const res = await smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+    expect(res.status).toBe(200);
+    expect(up.routerBodies()).toHaveLength(1);
+    const called = up.modelsCalled();
+    for (const m of PANEL) expect(called).toContain(m); // fusion ran => reasoning was promoted
+    expect(called).not.toContain("deepseek"); // did NOT silently fall back to the simple default
+  });
+
   it("escalate_on_tool_error=false defers to the router even on a failing tool result", async () => {
     const up = makeUpstream(chatWith(routeSimple));
     const res = await smartStrategy.execute(

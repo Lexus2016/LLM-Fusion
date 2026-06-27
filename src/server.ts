@@ -214,14 +214,31 @@ async function decorateUsage(res: Response, usage: UsageAccumulator, meta: Usage
   if (contentType.includes("text/event-stream")) {
     const headers = new Headers(res.headers);
     headers.set("x-fusion-usage", usageHeaderValue(usage.snapshot(meta.pricing)));
-    const transform = makeUsageInjectionTransform(
-      usage,
-      { reqId: meta.reqId, model: meta.model, created: Math.floor(Date.now() / 1000) },
-      meta.pricing,
-      (final) => logUsage(meta, final),
-    );
-    const body = res.body ? res.body.pipeThrough(transform) : res.body;
-    return new Response(body, { status: res.status, headers });
+    const transform = makeUsageInjectionTransform(usage, {
+      reqId: meta.reqId,
+      model: meta.model,
+      created: Math.floor(Date.now() / 1000),
+    }, meta.pricing);
+    // The usage log must fire exactly once, on a clean close OR a mid-stream
+    // upstream error. finalize() is now hang-safe even on error (tapStreamUsage
+    // settles its usage promise via cancel()), so both pipe outcomes use it;
+    // snapshot() is a defensive fallback. The pre-fix flush-only path dropped the
+    // log entirely when the upstream stream errored.
+    let logged = false;
+    const finishLog = (): void => {
+      if (logged) return;
+      logged = true;
+      void usage
+        .finalize(meta.pricing)
+        .then((u) => logUsage(meta, u))
+        .catch(() => logUsage(meta, usage.snapshot(meta.pricing)));
+    };
+    if (res.body) {
+      void res.body.pipeTo(transform.writable).then(finishLog, finishLog);
+      return new Response(transform.readable, { status: res.status, headers });
+    }
+    finishLog();
+    return new Response(null, { status: res.status, headers });
   }
 
   const aggregate = await usage.finalize(meta.pricing);
