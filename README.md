@@ -121,7 +121,7 @@ A typical coding task of **15–25 steps** therefore issues roughly **75–125 u
 - small default panel (3),
 - global `max_concurrency` cap (4),
 - tight judge/panel timeouts (60 s / 90 s, both under the ~182 s upstream ceiling),
-- `fusion_planning_turn_only` knob (run fusion only on the planning turn, degrade to synth-only — 5 calls → 1 — once the conversation already has tool messages).
+- `fusion_planning_turn_only` knob (run the full panel on every planning turn — any request whose latest message is a fresh user instruction — and degrade to synth-only — 5 calls → 1 — only on mid-loop tool-result continuations; a new task deep in a long session still gets the panel).
 
 That is how llm-fusion keeps long agent loops affordable without sacrificing deliberation where it matters.
 

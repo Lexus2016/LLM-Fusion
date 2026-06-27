@@ -73,7 +73,9 @@ models:
     judge: glm-5.2                    # most reliable structured-JSON (router shoot-out) -> fewer judge-parse failures
     synth: kimi-k2.7-code             # coding specialist; produced the most complete, compilable implementation
     tool_mode: deliberate
-    fusion_planning_turn_only: true   # full panel on the planning turn; synth-only once mid-loop (cost knob)
+    fusion_planning_turn_only: true   # full panel on EVERY fresh user instruction (a new task /
+                                      # refinement / module — even days into one chat); synth-only
+                                      # only on mid-loop tool-result continuations (cost knob)
 
   # fusion-researcher — research, analysis, reports. Fusion for breadth.
   #   P2: kimi 15 (flawless, BEST WRITER) | glm-5.2 14 (fast, best framing) |
@@ -94,6 +96,6 @@ models:
     strategy: smart
     router: glm-5.2                   # router shoot-out winner (fast + reliable JSON classifier)
     default: simple
-    escalate_on_tool_error: true      # a failing tool result -> straight to fusion (re-deliberate on recovery)
+    escalate_on_tool_error: false     # a failing tool result -> straight to fusion (re-deliberate on recovery)
     simple: { target: gemini-3-flash-preview }   # fast, cheap, strong all-rounder for easy/mechanical steps
     fusion: fusion-coder              # hard steps -> the planning-strong coder panel (inherits its deliberate + planning-turn knobs)

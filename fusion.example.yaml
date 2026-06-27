@@ -32,11 +32,13 @@ models:
     tool_mode: deliberate
 
     # fusion_planning_turn_only — cost knob for fusion running inside an agent loop:
-    #   false (default): the full panel -> judge -> synth runs on EVERY step (5 calls/step).
-    #   true: full fusion runs ONLY on the first "planning" turn (while the conversation has
-    #     no tool-result messages yet). Once tool results appear (the agent is mid-loop),
-    #     it degrades to synth-only (5 calls -> 1), since in-loop steps ("read this tool
-    #     output, pick the next call") are mostly mechanical and gain little from a panel.
+    #   false (default): the full panel -> judge -> synth runs on EVERY request (5 calls),
+    #     including the mechanical tool-continuation steps.
+    #   true: full fusion runs on every PLANNING turn — any request whose LATEST message is a
+    #     fresh user/system instruction — and degrades to synth-only (5 calls -> 1) ONLY on
+    #     mid-loop continuations (latest message is a tool result: "read this output, pick the
+    #     next call"). A brand-new task/refinement deep in a multi-day session still gets the
+    #     full panel; only the mechanical in-between steps run cheap.
     fusion_planning_turn_only: false
 
   # --- single strategy (Phase 1) ---
@@ -76,7 +78,7 @@ models:
     judge: glm-5.2                    # most reliable structured-JSON of the field -> fewer judge-parse failures
     synth: kimi-k2.7-code             # most complete, compilable code generator in the shoot-out
     tool_mode: deliberate
-    fusion_planning_turn_only: true   # full panel on the planning turn, synth-only mid-loop (cost knob)
+    fusion_planning_turn_only: true  # full panel on the planning turn, synth-only mid-loop (cost knob)
 
   fusion-researcher:                  # research / analysis / reports — fusion for breadth
     strategy: fusion
@@ -90,7 +92,7 @@ models:
     strategy: smart
     router: glm-5.2                   # fast + reliable JSON classifier (router shoot-out winner)
     default: simple
-    escalate_on_tool_error: true      # a failing tool result -> straight to fusion (re-deliberate on recovery)
+    escalate_on_tool_error: false     # a failing tool result -> straight to fusion (re-deliberate on recovery)
     simple: { target: gemini-3-flash-preview }   # fast, cheap, strong all-rounder for the easy steps
     fusion: fusion-coder              # hard steps -> the planning-strong coder panel (string ref to the model above)
 

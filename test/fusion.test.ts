@@ -389,8 +389,8 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(synthBody?.tools).toEqual(TOOLS);
   });
 
-  it("fusion_planning_turn_only: synth-only when a prior tool message exists; full fusion otherwise", async () => {
-    // Mid agent-loop (a role:"tool" message present) -> synth only.
+  it("fusion_planning_turn_only: synth-only on a tool-result continuation; full panel on every fresh user turn", async () => {
+    // Mid agent-loop: the LATEST message is a tool result -> synth only.
     const upDegraded = makeUpstream(defaultChat());
     const midLoop = req({
       model: "fusion-planning",
@@ -403,14 +403,32 @@ describe("fusion strategy — panel/judge/synth", () => {
     await fusionStrategy.execute(ctx(upDegraded.client, midLoop, "fusion-planning"));
     expect(upDegraded.modelsCalled()).toEqual(["s"]);
 
-    // First/planning turn (no tool message) -> full fusion.
+    // First/planning turn (no tool history) -> full panel.
     const upFull = makeUpstream(defaultChat());
     const planningTurn = req({ model: "fusion-planning", messages: [{ role: "user", content: "do it" }] });
     await fusionStrategy.execute(ctx(upFull.client, planningTurn, "fusion-planning"));
-    const called = upFull.modelsCalled();
-    expect(called).toContain("m1");
-    expect(called).toContain("j");
-    expect(called).toContain("s");
+    expect(upFull.modelsCalled()).toContain("m1");
+    expect(upFull.modelsCalled()).toContain("j");
+    expect(upFull.modelsCalled()).toContain("s");
+
+    // THE FIX: a NEW user instruction deep in a session that ALREADY has older tool
+    // messages in history (latest message is the fresh user turn, not a tool result)
+    // -> full panel again. The old "any tool message anywhere" check failed this.
+    const upNewTurn = makeUpstream(defaultChat());
+    const newInstruction = req({
+      model: "fusion-planning",
+      messages: [
+        { role: "user", content: "build X" },
+        { role: "assistant", content: null },
+        { role: "tool", content: "old tool result from earlier work" },
+        { role: "assistant", content: "done with X" },
+        { role: "user", content: "now finish the webpage" }, // fresh instruction = latest message
+      ],
+    });
+    await fusionStrategy.execute(ctx(upNewTurn.client, newInstruction, "fusion-planning"));
+    expect(upNewTurn.modelsCalled()).toContain("m1");
+    expect(upNewTurn.modelsCalled()).toContain("j");
+    expect(upNewTurn.modelsCalled()).toContain("s");
   });
 });
 

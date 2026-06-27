@@ -40,8 +40,11 @@ import {
  *
  * Degradations:
  *   - `tool_mode: bypass`            -> skip panel+judge, one synth call with tools.
- *   - `fusion_planning_turn_only`    -> if the conversation already contains a
- *                                       `role:"tool"` message, degrade to synth-only.
+ *   - `fusion_planning_turn_only`    -> degrade to synth-only ONLY when the latest
+ *                                       message is a `role:"tool"` result (a mechanical
+ *                                       mid-loop continuation). Every fresh user/system
+ *                                       instruction — even deep in a long session — runs
+ *                                       the full panel.
  *   - judge failure / invalid JSON   -> synth proceeds from the raw panel answers.
  *
  * Vision gate: image requests are routed only through vision-capable panel
@@ -341,7 +344,7 @@ async function runFusion(
 
   // Degradations that skip panel+judge entirely.
   const planningDegrade =
-    cfg.fusion_planning_turn_only && conversationHasToolMessage(request);
+    cfg.fusion_planning_turn_only && latestMessageIsToolResult(request);
   if (cfg.tool_mode === "bypass" || planningDegrade) {
     logger.info(
       { model: request.model, reason: cfg.tool_mode === "bypass" ? "bypass" : "planning_turn_only" },
@@ -818,11 +821,19 @@ const ToolSchema = z
   .passthrough();
 
 /** True when the conversation already contains a `role:"tool"` message. */
-function conversationHasToolMessage(request: ChatCompletionRequest): boolean {
+/**
+ * True when the LATEST message is a tool result — i.e. the agent is mid-loop,
+ * mechanically continuing ("read this tool output, pick the next call"). A fresh
+ * user/system instruction as the latest message is a PLANNING turn, not this —
+ * even deep in a long session that already contains older tool messages, so a new
+ * task / refinement / "now build module X" still earns the full panel.
+ *
+ * (The previous check — "any tool message ANYWHERE in history" — stayed true
+ * forever after the first tool call, so the panel never ran again for the rest of
+ * a multi-day session, collapsing fusion to a single model.)
+ */
+function latestMessageIsToolResult(request: ChatCompletionRequest): boolean {
   const messages = request.messages;
-  if (!messages) return false;
-  for (const message of messages) {
-    if (message.role === "tool") return true;
-  }
-  return false;
+  if (!messages || messages.length === 0) return false;
+  return messages[messages.length - 1]?.role === "tool";
 }
