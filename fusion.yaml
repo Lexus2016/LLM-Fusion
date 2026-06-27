@@ -98,6 +98,11 @@ models:
     default: simple
     escalate_on_tool_error: true      # a failing tool result (test failure / error / exception) -> straight to
                                       # fusion: error-recovery is exactly where multiple viewpoints earn their cost
-    simple: { target: gemini-3-flash-preview }   # fast, cheap all-rounder for mechanical steps (read / grep / run)
+    simple: { target: kimi-k2.7-code }   # mechanical steps (read / grep / run). MUST be a model that accepts
+                                         # tool-call history produced by OTHER models in the loop: gemini-3-flash-preview
+                                         # rejects it with 400 "Function call is missing a thought_signature in
+                                         # functionCall parts" — a Gemini-only requirement. The loop's tool_calls come
+                                         # from the kimi synth (not Gemini), so a Gemini passthrough breaks the session.
+                                         # kimi accepts its own tool history cleanly (it is also the fusion synth).
     fusion: fusion-coder              # substantive steps -> the coder panel. The router's decision to deliberate
                                       # forces the FULL panel here (planning_turn_only is overridden mid-loop)
