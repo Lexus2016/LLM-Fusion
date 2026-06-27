@@ -1,4 +1,5 @@
 import type { ChatCompletionResult, FetchFn, UpstreamClient } from "../types";
+import { tapStreamUsage, usageFromBody } from "../usage";
 import {
   NativeStreamingNotImplementedError,
   UpstreamNetworkError,
@@ -63,7 +64,7 @@ export class OllamaClient implements UpstreamClient {
     opts: { stream: boolean },
   ): Promise<ChatCompletionResult> {
     const url = `${this.baseUrl}/v1/chat/completions`;
-    const payload = { ...body, stream: opts.stream };
+    const payload = withIncludeUsage({ ...body, stream: opts.stream }, opts.stream);
     const res = await this.doFetch(url, {
       method: "POST",
       headers: this.headers(),
@@ -72,15 +73,17 @@ export class OllamaClient implements UpstreamClient {
     // Stream only when the upstream actually succeeded; an error before the
     // first byte is surfaced as a JSON body with the upstream status.
     if (opts.stream && res.ok) {
+      const { stream, usage } = tapStreamUsage(res.body);
       return {
         kind: "stream",
         status: res.status,
-        body: res.body,
+        body: stream,
         contentType: res.headers.get("content-type"),
+        usage,
       };
     }
     const data = await readBody(res);
-    return { kind: "json", status: res.status, data };
+    return { kind: "json", status: res.status, data, usage: usageFromBody(data) };
   }
 
   async show(model: string): Promise<unknown> {
@@ -119,8 +122,23 @@ export class OllamaClient implements UpstreamClient {
       body: JSON.stringify(payload),
     });
     const data = await readBody(res);
-    return { kind: "json", status: res.status, data };
+    return { kind: "json", status: res.status, data, usage: usageFromBody(data) };
   }
+}
+
+/**
+ * Add `stream_options:{include_usage:true}` for streaming requests so Ollama
+ * emits a final SSE chunk carrying `usage`. Merges with any caller-supplied
+ * `stream_options`. A no-op for non-stream requests.
+ */
+function withIncludeUsage(
+  payload: Record<string, unknown>,
+  stream: boolean,
+): Record<string, unknown> {
+  if (!stream) return payload;
+  const existing = payload.stream_options;
+  const base = typeof existing === "object" && existing !== null ? existing : {};
+  return { ...payload, stream_options: { ...base, include_usage: true } };
 }
 
 /** Read a response body as JSON when possible, falling back to text or null. */

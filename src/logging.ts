@@ -23,6 +23,14 @@ const REDACT_PATHS = [
   "authToken",
   "*.token",
   "*.authToken",
+  // Hyphenated header variants (bracket notation — fast-redact rejects bare
+  // hyphens). Defense-in-depth: the net should not have holes if future code
+  // logs an object carrying these keys.
+  '["x-api-key"]',
+  '*["x-api-key"]',
+  'headers["x-api-key"]',
+  '["api-key"]',
+  '*["api-key"]',
 ];
 
 export interface LoggerOptions {

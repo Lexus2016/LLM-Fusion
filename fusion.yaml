@@ -6,6 +6,8 @@ upstream:
   base_url: https://ollama.com        # Ollama Cloud root
   api_key_env: OLLAMA_API_KEY         # env var holding the Bearer key (never inline the key)
   api_mode: openai                    # Phase 0 confirmed: /v1 chat + SSE + tool_calls all work (auto | openai | native)
+  max_concurrency: 4                  # global p-limit across all in-flight calls (default: 4)
+  request_timeout_s: 120              # per upstream call; MUST be < 182 (default: 170)
 
 server:
   bind: 127.0.0.1                     # localhost only. For Docker set 0.0.0.0 here
@@ -15,23 +17,84 @@ server:
                                         # Authorization: Bearer <value-of-that-env-var>.
                                         # Unset = unauthenticated (localhost single-user) + startup warning.
 
+defaults:                             # applied to every model unless overridden per-model
+  panel_member_timeout_s: 90          # per panel member (default: 90)
+  judge_timeout_s: 120                # judge stage (default: 60)
+  min_panel_success: 1                # min successful panel answers, else 502 (default: 1)
+
 models:
   # single — 1:1 passthrough to one fast model.
   fast-glm:
     strategy: single
     target: glm-5.2
 
+  # single — 1:1 passthrough to one fast model.
+  fast-kimi:
+    strategy: single
+    target: kimi-k2.7-code
+
+  # single — 1:1 passthrough to one fast model.
+  fast-deepseek:
+    strategy: single
+    target: deepseek-v4-pro
+
   # fusion — panel -> judge -> synth across three models (the deliberate path).
   fusion-1:
     strategy: fusion
-    panel: [glm-5.2, kimi-k2.7-code, deepseek-v4-pro]
+    panel: [glm-5.2, kimi-k2.7-code, deepseek-v4-flash]
     judge: glm-5.2
-    synth: deepseek-v4-pro
+    synth: kimi-k2.7-code
 
   # smart — an LLM router decides per request: cheap single vs deep fusion.
   smart-1:
     strategy: smart
-    router: glm-5.2                   # fast classifier (one non-streamed JSON call per request)
+    router: glm-5.2                   # fast classifier: empirically fastest (~1.3s) + only reliable-JSON small/mid model
+                                      # (router shoot-out 2026-06-27). nemotron-3-ultra was ~2.4x slower + timed out under load.
     default: simple                   # route used when the router is unsure / errors
-    simple: fast-glm                  # string ref to the single model above
+    simple: fast-kimi                 # string ref to the single model above
     fusion: fusion-1                  # string ref to the fusion model above
+
+  # =========================================================================
+  # Task-specialized virtual models — assembled from the model shoot-out
+  # (research-test/model-shootout/, 2026-06-27): 8 models x 3 probes
+  # (P1 coding, P2 research, P3 tool-calling). Quality scored /15.
+  # Panels MIX MODEL LINEAGES on purpose: 3 models from the same lab share
+  # training blind spots, which defeats the point of a panel. glm/kimi/
+  # deepseek/minimax/qwen are all Chinese labs; gemini=Google, gpt-oss=OpenAI
+  # are added as Western decorrelators.
+  # =========================================================================
+
+  # fusion-coder — programming, planning, audit. Fusion = multiple viewpoints
+  #   (coding/architecture decisions genuinely benefit from diverse takes).
+  #   P1: glm-5.2 14 (best JS-concurrency reasoning) | kimi 13 (most complete
+  #   impl) | gemini-3-flash 12 (fast, Western lineage decorrelates the panel).
+  fusion-coder:
+    strategy: fusion
+    panel: [glm-5.2, kimi-k2.7-code, gemini-3-flash-preview]
+    judge: glm-5.2                    # most reliable structured-JSON (router shoot-out) -> fewer judge-parse failures
+    synth: kimi-k2.7-code             # coding specialist; produced the most complete, compilable implementation
+    tool_mode: deliberate
+    fusion_planning_turn_only: true   # full panel on the planning turn; synth-only once mid-loop (cost knob)
+
+  # fusion-researcher — research, analysis, reports. Fusion for breadth.
+  #   P2: kimi 15 (flawless, BEST WRITER) | glm-5.2 14 (fast, best framing) |
+  #   gpt-oss:120b 13 (most exhaustive coverage + Western lineage).
+  fusion-researcher:
+    strategy: fusion
+    panel: [kimi-k2.7-code, glm-5.2, gpt-oss:120b]
+    judge: glm-5.2
+    synth: kimi-k2.7-code             # scored 15/15; cleanest report-ready prose
+    tool_mode: deliberate
+    fusion_planning_turn_only: false  # research isn't a mechanical loop — full deliberation each step is the value
+
+  # fusion-agents — autonomous agent loops. Smart routing: keep the cheap 80%
+  #   cheap, escalate the hard 20%. P3 tool-calling was reliable on ALL models
+  #   (<2s, correct first action) -> agent choice = planning quality + cost,
+  #   NOT tool-calling.
+  fusion-agents:
+    strategy: smart
+    router: glm-5.2                   # router shoot-out winner (fast + reliable JSON classifier)
+    default: simple
+    escalate_on_tool_error: true      # a failing tool result -> straight to fusion (re-deliberate on recovery)
+    simple: { target: gemini-3-flash-preview }   # fast, cheap, strong all-rounder for easy/mechanical steps
+    fusion: fusion-coder              # hard steps -> the planning-strong coder panel (inherits its deliberate + planning-turn knobs)

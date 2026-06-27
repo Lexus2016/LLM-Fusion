@@ -47,7 +47,14 @@ export class CapabilityService implements CapabilityProvider {
     } catch (err) {
       result = this.degrade(model, err);
     }
-    this.cache.set(model, result);
+    // Only cache AUTHORITATIVE results. A `default` result is a guess produced by
+    // a (possibly transient) discovery failure with no override; caching it would
+    // permanently misreport capabilities until config reload, so we leave it
+    // uncached and let the next call retry discovery — self-healing once the
+    // upstream recovers. `discovered` and operator `override` results are stable.
+    if (result.source !== "default") {
+      this.cache.set(model, result);
+    }
     return result;
   }
 

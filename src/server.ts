@@ -1,13 +1,21 @@
 import { Hono } from "hono";
 import type { Logger } from "pino";
 import { randomUUID } from "node:crypto";
+import { z } from "zod";
 import type { Config } from "./config";
-import type { CapabilityProvider, UpstreamClient } from "./types";
+import type { CapabilityProvider, RequestUsage, UpstreamClient } from "./types";
 import type { Resilience } from "./concurrency";
 import { createResilience } from "./concurrency";
 import { ChatCompletionRequestSchema } from "./types";
+import {
+  makeUsageInjectionTransform,
+  toOpenAiUsage,
+  UsageAccumulator,
+  usageHeaderValue,
+  type PricingMap,
+} from "./usage";
 import { createAuthMiddleware } from "./auth";
-import { dispatch, representativeMember } from "./router";
+import { dispatch, entryMembers, representativeMember } from "./router";
 import { BadRequestError, FusionError, toErrorResponse } from "./errors";
 
 /**
@@ -68,20 +76,51 @@ export function createApp(deps: AppDeps): Hono {
 
   app.get("/v1/models", async (c) => {
     const config = deps.getConfig();
-    const data: ModelListItem[] = [];
-    for (const [name, entry] of Object.entries(config.models)) {
-      const item: ModelListItem = { id: name, object: "model" };
-      const member = representativeMember(entry);
-      if (member) {
-        const { capability, source } = await deps.capabilities.discover(member);
-        // Only surface fields we actually know — never guess (spec §9.1).
-        if (source !== "default") {
-          item.supports_vision = capability.vision;
-          if (capability.context !== null) item.context_window = capability.context;
+    // Discover capabilities in PARALLEL, bounded by the shared upstream limiter
+    // (respects max_concurrency, competes fairly with in-flight chat calls).
+    // Promise.all preserves the configured model order.
+    const entries = Object.entries(config.models);
+    const data: ModelListItem[] = await Promise.all(
+      entries.map(async ([name, entry]): Promise<ModelListItem> => {
+        const item: ModelListItem = { id: name, object: "model" };
+        const members = [...new Set(entryMembers(config.models, entry))];
+        if (members.length === 0) return item;
+        const discovered = await Promise.all(
+          members.map(async (member) => ({
+            member,
+            ...(await resilience.limiter(() => deps.capabilities.discover(member))),
+          })),
+        );
+
+        // supports_vision: surfaced from the representative member (unchanged) —
+        // never guessed (spec §9.1).
+        const repr = representativeMember(entry);
+        const reprResult = discovered.find((d) => d.member === repr);
+        if (reprResult && reprResult.source !== "default") {
+          item.supports_vision = reprResult.capability.vision;
         }
-      }
-      data.push(item);
-    }
+
+        // context_window: the MIN across EVERY member the virtual model can route
+        // to. A fusion request fans the prompt out to every panel member (plus
+        // judge + synth), so the usable window is the SMALLEST member's, never the
+        // largest — advertising more would let a prompt overflow a panel model.
+        // Surfaced only when EVERY member's context is known: one unknown member
+        // could be smaller, so we omit rather than over-advertise (spec §9.1).
+        const contexts: number[] = [];
+        let allKnown = true;
+        for (const d of discovered) {
+          if (d.source === "default" || d.capability.context === null) {
+            allKnown = false;
+            break;
+          }
+          contexts.push(d.capability.context);
+        }
+        if (allKnown && contexts.length > 0) {
+          item.context_window = Math.min(...contexts);
+        }
+        return item;
+      }),
+    );
     return c.json({ object: "list", data });
   });
 
@@ -110,20 +149,31 @@ export function createApp(deps: AppDeps): Hono {
 
     const model = parsed.data.model;
     const stream = parsed.data.stream === true;
+    const config = deps.getConfig();
+    const usage = new UsageAccumulator();
     try {
       const res = await dispatch({
         request: parsed.data,
-        config: deps.getConfig(),
+        config,
         client: deps.client,
         capabilities: deps.capabilities,
         logger: reqLogger,
         resilience,
+        usage,
+      });
+      const strategy = config.models[model]?.strategy ?? "unknown";
+      const decorated = await decorateUsage(res, usage, {
+        reqId,
+        model,
+        strategy,
+        pricing: config.pricing,
+        logger: reqLogger,
       });
       reqLogger.info(
-        { model, status: res.status, ms: Date.now() - startedAt, stream },
+        { model, status: decorated.status, ms: Date.now() - startedAt, stream },
         "request complete",
       );
-      return res;
+      return decorated;
     } catch (err) {
       const status = err instanceof FusionError ? err.httpStatus : 500;
       const ms = Date.now() - startedAt;
@@ -137,6 +187,92 @@ export function createApp(deps: AppDeps): Hono {
   });
 
   return app;
+}
+
+interface UsageMeta {
+  reqId: string;
+  model: string;
+  strategy: string;
+  pricing: PricingMap | undefined;
+  logger: Logger;
+}
+
+/**
+ * Attach the aggregated request usage to the client response (spec §3 / §12):
+ *  - non-stream JSON success -> set the body's `usage` field to the aggregate;
+ *  - stream -> emit a final `usage` chunk before `[DONE]` (composed after the
+ *    fusion reasoning->content transform);
+ *  - always -> set the `x-fusion-usage` header and log one `request usage` line.
+ *
+ * For streams the header carries the totals known at send time (the streamed
+ * call's tokens land in the trailing chunk); the log fires once the stream
+ * drains. Error/non-JSON bodies are passed through untouched.
+ */
+async function decorateUsage(res: Response, usage: UsageAccumulator, meta: UsageMeta): Promise<Response> {
+  const contentType = res.headers.get("content-type") ?? "";
+
+  if (contentType.includes("text/event-stream")) {
+    const headers = new Headers(res.headers);
+    headers.set("x-fusion-usage", usageHeaderValue(usage.snapshot(meta.pricing)));
+    const transform = makeUsageInjectionTransform(
+      usage,
+      { reqId: meta.reqId, model: meta.model, created: Math.floor(Date.now() / 1000) },
+      meta.pricing,
+      (final) => logUsage(meta, final),
+    );
+    const body = res.body ? res.body.pipeThrough(transform) : res.body;
+    return new Response(body, { status: res.status, headers });
+  }
+
+  const aggregate = await usage.finalize(meta.pricing);
+  const headers = new Headers(res.headers);
+  headers.set("x-fusion-usage", usageHeaderValue(aggregate));
+  logUsage(meta, aggregate);
+
+  // Only inject `usage` into a successful JSON object body.
+  if (contentType.includes("application/json") && res.status < 400) {
+    const text = await res.text();
+    return new Response(injectUsageIntoJson(text, aggregate), { status: res.status, headers });
+  }
+  return new Response(res.body, { status: res.status, headers });
+}
+
+/** Set the top-level `usage` field on a JSON object body; pass through otherwise. */
+function injectUsageIntoJson(text: string, aggregate: RequestUsage): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return text;
+  }
+  if (Array.isArray(parsed)) return text;
+  const obj = z.record(z.string(), z.unknown()).safeParse(parsed);
+  if (!obj.success) return text;
+  return JSON.stringify({
+    ...obj.data,
+    usage: toOpenAiUsage({
+      promptTokens: aggregate.promptTokens,
+      completionTokens: aggregate.completionTokens,
+      totalTokens: aggregate.totalTokens,
+    }),
+  });
+}
+
+/** One structured info line per request — counts only, never prompt content. */
+function logUsage(meta: UsageMeta, usage: RequestUsage): void {
+  meta.logger.info(
+    {
+      req_id: meta.reqId,
+      model: meta.model,
+      strategy: meta.strategy,
+      upstream_calls: usage.upstreamCalls,
+      prompt_tokens: usage.promptTokens,
+      completion_tokens: usage.completionTokens,
+      total_tokens: usage.totalTokens,
+      cost_usd: usage.costUsd,
+    },
+    "request usage",
+  );
 }
 
 function firstMember(config: Config): string | undefined {

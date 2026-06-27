@@ -18,6 +18,12 @@ import {
   UpstreamTimeoutError,
 } from "../errors";
 import { openAiBodyToNativeChat, requestHasImages } from "../vision";
+import {
+  failureKindForError,
+  failureKindForStatus,
+  isAvailabilityFailureStatus,
+  logUpstreamFailure,
+} from "../attribution";
 
 /**
  * `fusion` strategy — the core algorithm (spec §5.7 / §8.2):
@@ -95,34 +101,172 @@ async function withTimeout<T>(
 
 // --- Defensive parsing of upstream completion bodies ----------------------
 
-const CompletionSchema = z
+/**
+ * A non-streamed assistant message, including the `reasoning` /
+ * `reasoning_content` fields some Ollama Cloud "thinking" models populate
+ * instead of `content`.
+ */
+const ReasoningMessageSchema = z
   .object({
-    choices: z
-      .array(
-        z
-          .object({
-            message: z
-              .object({ content: z.union([z.string(), z.null()]).optional() })
-              .passthrough(),
-          })
-          .passthrough(),
-      )
-      .optional(),
-    // Native /api/chat shape: { message: { content } }.
-    message: z.object({ content: z.union([z.string(), z.null()]).optional() }).passthrough().optional(),
+    content: z.union([z.string(), z.null()]).optional(),
+    reasoning: z.union([z.string(), z.null()]).optional(),
+    reasoning_content: z.union([z.string(), z.null()]).optional(),
+    tool_calls: z.unknown().optional(),
   })
   .passthrough();
+
+type ReasoningMessage = z.infer<typeof ReasoningMessageSchema>;
+
+const CompletionSchema = z
+  .object({
+    choices: z.array(z.object({ message: ReasoningMessageSchema }).passthrough()).optional(),
+    // Native /api/chat shape: { message: { content } }.
+    message: ReasoningMessageSchema.optional(),
+  })
+  .passthrough();
+
+/** First non-empty string among the candidates, else "". */
+function firstNonEmpty(...values: Array<string | null | undefined>): string {
+  for (const v of values) {
+    if (typeof v === "string" && v.length > 0) return v;
+  }
+  return "";
+}
+
+/** The reasoning text of a message: `reasoning`, then `reasoning_content`, else "". */
+function reasoningText(message: ReasoningMessage): string {
+  return firstNonEmpty(message.reasoning, message.reasoning_content);
+}
+
+/**
+ * Effective assistant text for a message: `content` when it has non-whitespace
+ * text, otherwise the model's `reasoning` / `reasoning_content`. Some "thinking"
+ * models return their final answer in `reasoning` with an empty `content`; the
+ * judge (and any text consumer) needs that real text ALWAYS — independent of the
+ * `promote_reasoning_to_content` flag.
+ */
+function effectiveText(message: ReasoningMessage | undefined): string {
+  if (!message) return "";
+  const content = typeof message.content === "string" ? message.content : "";
+  if (content.trim().length > 0) return content;
+  return reasoningText(message);
+}
 
 /** Extract assistant text from an OpenAI- or native-shaped completion. */
 function extractAnswer(data: unknown): string | null {
   const parsed = CompletionSchema.safeParse(data);
   if (!parsed.success) return null;
-  const choice = parsed.data.choices?.[0];
-  const fromChoices = choice?.message.content;
-  if (typeof fromChoices === "string" && fromChoices.length > 0) return fromChoices;
-  const fromNative = parsed.data.message?.content;
-  if (typeof fromNative === "string" && fromNative.length > 0) return fromNative;
+  const fromChoices = effectiveText(parsed.data.choices?.[0]?.message);
+  if (fromChoices.length > 0) return fromChoices;
+  const fromNative = effectiveText(parsed.data.message);
+  if (fromNative.length > 0) return fromNative;
   return null;
+}
+
+/**
+ * Non-stream synth normalization: when a message has empty/whitespace `content`,
+ * no tool calls, and non-empty reasoning, promote the reasoning into `content`
+ * so content-only clients render the answer. Returns the (possibly rewritten)
+ * data; all unrelated fields are preserved.
+ */
+function promoteReasoningNonStream(data: unknown): unknown {
+  const parsed = CompletionSchema.safeParse(data);
+  if (!parsed.success) return data;
+  const messages: ReasoningMessage[] = [];
+  for (const choice of parsed.data.choices ?? []) messages.push(choice.message);
+  if (parsed.data.message) messages.push(parsed.data.message);
+  let mutated = false;
+  for (const message of messages) {
+    const content = typeof message.content === "string" ? message.content : "";
+    if (content.trim().length > 0) continue; // real content already present
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) continue; // tool path
+    const reasoning = reasoningText(message);
+    if (reasoning.length === 0) continue;
+    message.content = reasoning;
+    mutated = true;
+  }
+  return mutated ? parsed.data : data;
+}
+
+// --- Streaming reasoning->content normalization ---------------------------
+
+const StreamDeltaSchema = z
+  .object({
+    content: z.union([z.string(), z.null()]).optional(),
+    reasoning: z.union([z.string(), z.null()]).optional(),
+    reasoning_content: z.union([z.string(), z.null()]).optional(),
+    tool_calls: z.unknown().optional(),
+  })
+  .passthrough();
+
+const StreamChunkSchema = z
+  .object({
+    choices: z.array(z.object({ delta: StreamDeltaSchema.optional() }).passthrough()).optional(),
+  })
+  .passthrough();
+
+/**
+ * SSE transform that re-emits `delta.reasoning` / `delta.reasoning_content`
+ * fragments as `delta.content`, but ONLY until a real `delta.content` fragment
+ * appears; once real content arrives, every later event passes through verbatim
+ * (no duplication). `tool_calls` deltas and `finish_reason` are never touched.
+ * Only a partial trailing line is buffered — never the whole response.
+ */
+function makeReasoningPromotionTransform(): TransformStream<Uint8Array, Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = "";
+  let realContentSeen = false;
+
+  const handleLine = (line: string): string => {
+    if (realContentSeen) return line; // real content already streamed — pass through
+    if (!line.startsWith("data:")) return line; // blank separators, comments, etc.
+    const payload = line.slice("data:".length).trim();
+    if (payload.length === 0 || payload === "[DONE]") return line;
+    let chunk: unknown;
+    try {
+      chunk = JSON.parse(payload);
+    } catch {
+      return line;
+    }
+    const parsed = StreamChunkSchema.safeParse(chunk);
+    if (!parsed.success || !parsed.data.choices) return line;
+    let modified = false;
+    for (const choice of parsed.data.choices) {
+      const delta = choice.delta;
+      if (!delta) continue;
+      const content = typeof delta.content === "string" ? delta.content : "";
+      if (content.length > 0) {
+        realContentSeen = true; // real content — leave this and every later event alone
+        continue;
+      }
+      const reasoning = firstNonEmpty(delta.reasoning, delta.reasoning_content);
+      if (reasoning.length === 0) continue; // nothing to promote (incl. tool_calls-only deltas)
+      delta.content = reasoning;
+      delete delta.reasoning;
+      delete delta.reasoning_content;
+      modified = true;
+    }
+    return modified ? `data: ${JSON.stringify(parsed.data)}` : line;
+  };
+
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+      let out = "";
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        out += handleLine(line) + "\n";
+      }
+      if (out.length > 0) controller.enqueue(encoder.encode(out));
+    },
+    flush(controller) {
+      buffer += decoder.decode();
+      if (buffer.length > 0) controller.enqueue(encoder.encode(handleLine(buffer)));
+    },
+  });
 }
 
 const JudgeAnalysisSchema = z
@@ -180,6 +324,8 @@ async function runFusion(
   const hasImages = requestHasImages(request);
   const hasTools = Array.isArray(request.tools) && request.tools.length > 0;
   const native = ctx.config.upstream.api_mode === "native" && hasImages;
+  // Effective reasoning->content promotion: per-model override wins over the default.
+  const promote = cfg.promote_reasoning_to_content ?? defaults.promote_reasoning_to_content;
 
   // Vision gate (spec §5.11 / §10.1): only run discovery when images are present
   // so the common text path adds no upstream calls.
@@ -196,7 +342,7 @@ async function runFusion(
       { model: request.model, reason: cfg.tool_mode === "bypass" ? "bypass" : "planning_turn_only" },
       "fusion: synth-only path",
     );
-    return runSynth(ctx, resilience, cfg.synth, null, [], { stream, hasTools, native });
+    return runSynth(ctx, resilience, cfg.synth, null, [], { stream, hasTools, native, promote });
   }
 
   // PANEL — parallel, tools stripped.
@@ -222,7 +368,7 @@ async function runFusion(
   const analysis = await runJudge(ctx, resilience, cfg.judge, panelAnswers, timer, defaults);
 
   // SYNTH — final answer, streams when requested, the only stage with real tools.
-  return runSynth(ctx, resilience, cfg.synth, analysis, panelAnswers, { stream, hasTools, native });
+  return runSynth(ctx, resilience, cfg.synth, analysis, panelAnswers, { stream, hasTools, native, promote });
 }
 
 // --- Vision gate -----------------------------------------------------------
@@ -281,10 +427,12 @@ async function callPanelMember(
   opts: { hasTools: boolean; native: boolean },
 ): Promise<PanelAnswer | null> {
   if (!resilience.breaker.canAttempt(member)) {
+    logUpstreamFailure(ctx.logger, { stage: "panel", model: member, kind: "circuit_open", latencyMs: 0 });
     ctx.logger.warn({ member }, "fusion: skip panel member (circuit open)");
     return null;
   }
   const body = buildPanelBody(ctx.request, member, opts);
+  const startedAt = Date.now();
   let result: ChatCompletionResult;
   try {
     result = await withTimeout(
@@ -295,10 +443,41 @@ async function callPanelMember(
     );
   } catch (err) {
     resilience.breaker.recordFailure(member);
+    ctx.usage?.recordError(member);
+    logUpstreamFailure(ctx.logger, {
+      stage: "panel",
+      model: member,
+      kind: failureKindForError(err),
+      latencyMs: Date.now() - startedAt,
+      reason: err instanceof Error ? err.message : String(err),
+    });
     throw err;
   }
-  if (result.kind !== "json" || result.status >= 400) {
+  ctx.usage?.record(member, result);
+  if (result.kind !== "json") {
     resilience.breaker.recordFailure(member);
+    logUpstreamFailure(ctx.logger, {
+      stage: "panel",
+      model: member,
+      kind: "error",
+      latencyMs: Date.now() - startedAt,
+      reason: "unexpected non-json panel result",
+    });
+    return null;
+  }
+  if (result.status >= 400) {
+    // Drop the answer either way; only availability failures (429/5xx) trip the
+    // breaker and get attributed — a 4xx is a request-shape issue, not a sick model.
+    if (isAvailabilityFailureStatus(result.status)) {
+      resilience.breaker.recordFailure(member);
+      logUpstreamFailure(ctx.logger, {
+        stage: "panel",
+        model: member,
+        kind: failureKindForStatus(result.status),
+        status: result.status,
+        latencyMs: Date.now() - startedAt,
+      });
+    }
     return null;
   }
   resilience.breaker.recordSuccess(member);
@@ -341,6 +520,7 @@ async function runJudge(
   defaults: { judge_timeout_s: number },
 ): Promise<JudgeAnalysis | null> {
   if (!resilience.breaker.canAttempt(judge)) {
+    logUpstreamFailure(ctx.logger, { stage: "judge", model: judge, kind: "circuit_open", latencyMs: 0 });
     ctx.logger.warn({ judge }, "fusion: judge skipped (circuit open); using raw panel answers");
     return null;
   }
@@ -355,6 +535,7 @@ async function runJudge(
     ],
   };
   const timeoutMs = defaults.judge_timeout_s * 1000;
+  const startedAt = Date.now();
   let result: ChatCompletionResult;
   try {
     result = await withTimeout(
@@ -365,15 +546,38 @@ async function runJudge(
     );
   } catch (err) {
     resilience.breaker.recordFailure(judge);
+    ctx.usage?.recordError(judge);
+    logUpstreamFailure(ctx.logger, {
+      stage: "judge",
+      model: judge,
+      kind: failureKindForError(err),
+      latencyMs: Date.now() - startedAt,
+      reason: err instanceof Error ? err.message : String(err),
+    });
     ctx.logger.warn(
       { judge, reason: err instanceof Error ? err.message : String(err) },
       "fusion: judge call failed; falling back to raw panel answers",
     );
     return null;
   }
+  ctx.usage?.record(judge, result);
   if (result.kind !== "json" || result.status >= 400) {
-    resilience.breaker.recordFailure(judge);
-    ctx.logger.warn({ judge, status: result.status }, "fusion: judge non-OK; raw panel fallback");
+    // Availability failures (non-json / 429 / 5xx) trip the breaker + get
+    // attributed; a 4xx still degrades to raw panel answers without it.
+    if (result.kind !== "json" || isAvailabilityFailureStatus(result.status)) {
+      resilience.breaker.recordFailure(judge);
+      logUpstreamFailure(ctx.logger, {
+        stage: "judge",
+        model: judge,
+        kind: result.kind !== "json" ? "error" : failureKindForStatus(result.status),
+        ...(result.kind === "json" ? { status: result.status } : {}),
+        latencyMs: Date.now() - startedAt,
+      });
+    }
+    ctx.logger.warn(
+      { judge, status: result.kind === "json" ? result.status : undefined },
+      "fusion: judge non-OK; raw panel fallback",
+    );
     return null;
   }
   resilience.breaker.recordSuccess(judge);
@@ -405,12 +609,14 @@ async function runSynth(
   synth: string,
   analysis: JudgeAnalysis | null,
   panelAnswers: PanelAnswer[],
-  opts: { stream: boolean; hasTools: boolean; native: boolean },
+  opts: { stream: boolean; hasTools: boolean; native: boolean; promote: boolean },
 ): Promise<Response> {
   if (!resilience.breaker.canAttempt(synth)) {
+    logUpstreamFailure(ctx.logger, { stage: "synth", model: synth, kind: "circuit_open", latencyMs: 0 });
     throw new CircuitOpenError(`circuit breaker open for fusion synth model '${synth}'`);
   }
   const body = buildSynthBody(ctx.request, synth, analysis, panelAnswers, opts);
+  const startedAt = Date.now();
   let result: ChatCompletionResult;
   try {
     result = await resilience.limiter(() =>
@@ -418,19 +624,46 @@ async function runSynth(
     );
   } catch (err) {
     resilience.breaker.recordFailure(synth);
+    ctx.usage?.recordError(synth);
+    logUpstreamFailure(ctx.logger, {
+      stage: "synth",
+      model: synth,
+      kind: failureKindForError(err),
+      latencyMs: Date.now() - startedAt,
+      reason: err instanceof Error ? err.message : String(err),
+    });
     throw err;
   }
+  ctx.usage?.record(synth, result);
   if (result.status < 400) resilience.breaker.recordSuccess(synth);
-  else resilience.breaker.recordFailure(synth);
+  // 4xx (non-429) passes through to the client without tripping the breaker.
+  else if (isAvailabilityFailureStatus(result.status)) {
+    resilience.breaker.recordFailure(synth);
+    logUpstreamFailure(ctx.logger, {
+      stage: "synth",
+      model: synth,
+      kind: failureKindForStatus(result.status),
+      status: result.status,
+      latencyMs: Date.now() - startedAt,
+    });
+  }
 
   if (result.kind === "stream") {
     const headers: Record<string, string> = {
       ...STREAM_HEADERS_BASE,
       "content-type": result.contentType ?? "text/event-stream",
     };
-    return new Response(result.body, { status: result.status, headers });
+    // Streaming reasoning->content promotion (the body is a successful upstream
+    // stream; ollama only returns `kind:"stream"` when res.ok).
+    const streamBody =
+      opts.promote && result.body !== null
+        ? result.body.pipeThrough(makeReasoningPromotionTransform())
+        : result.body;
+    return new Response(streamBody, { status: result.status, headers });
   }
-  return new Response(JSON.stringify(result.data ?? null), {
+  const data =
+    opts.promote && result.status < 400 ? promoteReasoningNonStream(result.data) : result.data;
+  return new Response(JSON.stringify(data ?? null), {
     status: result.status,
     headers: { "content-type": "application/json" },
   });
@@ -459,25 +692,33 @@ function buildSynthBody(
 
 /**
  * Build the synthesis context message. `null` on the synth-only path (no panel
- * ran). Otherwise prefers the structured judge analysis, falling back to the raw
- * panel answers when the judge failed.
+ * ran). Otherwise the synth ALWAYS receives the raw panel answers, so it never
+ * loses the experts' actual artifacts (code, formulas, exact text); the
+ * structured judge analysis, when available, is layered on top as adjudication
+ * guidance rather than replacing the answers. When the judge failed, the synth
+ * is told to reconcile conflicts itself.
  */
 function buildSynthContext(analysis: JudgeAnalysis | null, panelAnswers: PanelAnswer[]): string | null {
+  if (panelAnswers.length === 0) return null;
+  const experts = renderPanelForJudge(panelAnswers);
   if (analysis !== null) {
     return (
-      "A panel of expert models answered the user's request, and a judge produced this structured analysis. " +
-      "Use it to synthesize the single best final answer.\n\nJUDGE ANALYSIS (JSON):\n" +
-      JSON.stringify(analysis)
+      "A panel of expert models answered the user's request, and an impartial judge produced a structured " +
+      "analysis of their answers. Write the single best final answer: take the actual content (code, formulas, " +
+      "exact text) from the expert answers, and use the judge analysis to resolve disagreements, cover blind " +
+      "spots, and weight the consensus. Do not drop detail that only one expert provided unless it is wrong.\n\n" +
+      "JUDGE ANALYSIS (JSON):\n" +
+      JSON.stringify(analysis) +
+      "\n\nEXPERT ANSWERS:\n" +
+      experts
     );
   }
-  if (panelAnswers.length > 0) {
-    return (
-      "A panel of expert models answered the user's request (the structured judge analysis was unavailable). " +
-      "Synthesize the single best final answer from these expert answers.\n\n" +
-      renderPanelForJudge(panelAnswers)
-    );
-  }
-  return null;
+  return (
+    "A panel of expert models answered the user's request (a structured judge analysis was unavailable). " +
+    "Synthesize the single best final answer from these expert answers; where they disagree, reconcile the " +
+    "conflict explicitly and prefer the better-supported answer over the more verbose one.\n\nEXPERT ANSWERS:\n" +
+    experts
+  );
 }
 
 function renderPanelForJudge(panelAnswers: PanelAnswer[]): string {

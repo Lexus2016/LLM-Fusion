@@ -37,6 +37,9 @@ const FusionModelSchema = z
     synth: z.string().min(1),
     tool_mode: z.enum(["deliberate", "bypass"]).default("deliberate"),
     fusion_planning_turn_only: z.boolean().default(false),
+    // Per-model override of `defaults.promote_reasoning_to_content`. When unset
+    // the global default applies.
+    promote_reasoning_to_content: z.boolean().optional(),
   })
   .strict();
 
@@ -49,6 +52,7 @@ const FusionBlockSchema = z
     panel: z.array(z.string().min(1)).min(1),
     judge: z.string().min(1),
     synth: z.string().min(1),
+    promote_reasoning_to_content: z.boolean().optional(),
   })
   .strict();
 
@@ -57,6 +61,12 @@ const SmartModelSchema = z
     strategy: z.literal("smart"),
     router: z.string().min(1),
     default: z.enum(["simple", "fusion"]).default("simple"),
+    // Agent-loop escalation: when the latest tool result in the conversation
+    // looks like a failure (error, exception, non-zero exit, test failure), the
+    // model is recovering from an error — the step that benefits most from
+    // deliberation — so smart routes straight to `fusion`, skipping the router
+    // round-trip. Set `false` to always defer to the router instead.
+    escalate_on_tool_error: z.boolean().default(true),
     // Either an inline strategy block OR a string naming another configured model.
     simple: z.union([SimpleBlockSchema, z.string().min(1)]),
     fusion: z.union([FusionBlockSchema, z.string().min(1)]),
@@ -75,6 +85,19 @@ const OverrideSchema = z
     tools: z.boolean().optional(),
     vision: z.boolean().optional(),
     context: z.number().int().nullable().optional(),
+  })
+  .strict();
+
+/**
+ * Optional per-model price, USD per 1M tokens. When a model involved in a
+ * request has an entry, the proxy computes `cost_usd` for the request; absent
+ * pricing leaves cost null. Keyed by the REAL upstream model id (the same id
+ * used in panel/judge/synth/target/chain), not the virtual model name.
+ */
+const PricingEntrySchema = z
+  .object({
+    input_per_mtok: z.number().nonnegative(),
+    output_per_mtok: z.number().nonnegative(),
   })
   .strict();
 
@@ -102,6 +125,11 @@ const DefaultsSchema = z
     panel_member_timeout_s: z.number().int().positive().default(90),
     judge_timeout_s: z.number().int().positive().default(60),
     min_panel_success: z.number().int().min(1).default(1),
+    // When true (default), reasoning-only upstream replies (final text in the
+    // `reasoning`/`reasoning_content` field with empty `content`) are normalized
+    // so clients that render only `message.content` still see the answer. A
+    // fusion model may override this per-model.
+    promote_reasoning_to_content: z.boolean().default(true),
   })
   .strict();
 
@@ -112,6 +140,8 @@ export const ConfigSchema = z
     defaults: DefaultsSchema.default({}),
     models: z.record(z.string(), ModelSchema),
     overrides: z.record(z.string(), OverrideSchema).default({}),
+    // Optional cost accounting. Absent/empty -> cost_usd stays null.
+    pricing: z.record(z.string(), PricingEntrySchema).optional(),
   })
   .strict()
   .superRefine((cfg, ctx) => {
@@ -170,6 +200,7 @@ export type FailoverModelConfig = z.infer<typeof FailoverModelSchema>;
 export type FusionModelConfig = z.infer<typeof FusionModelSchema>;
 export type SmartModelConfig = z.infer<typeof SmartModelSchema>;
 export type OverrideConfig = z.infer<typeof OverrideSchema>;
+export type PricingConfig = z.infer<typeof PricingEntrySchema>;
 export type SimpleBlockConfig = z.infer<typeof SimpleBlockSchema>;
 export type FusionBlockConfig = z.infer<typeof FusionBlockSchema>;
 export type SimpleModelReference = SimpleBlockConfig | string;

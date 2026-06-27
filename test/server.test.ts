@@ -62,6 +62,62 @@ describe("server", () => {
     expect(ids).toContain("fusion-1");
   });
 
+  it("GET /v1/models reports a fusion model's context_window as the MIN across all members", async () => {
+    // A fusion request fans out to every panel member, so the merged virtual
+    // model's usable window is the SMALLEST member's — never the largest.
+    const ctxByModel: Record<string, number> = { big: 1_000_000, mid: 500_000, small: 250_000 };
+    const fusionConfig = parseConfig({
+      upstream: { base_url: "https://mock.test", api_key_env: "X" },
+      models: { merged: { strategy: "fusion", panel: ["big", "mid", "small"], judge: "big", synth: "big" } },
+    });
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/api/show"),
+        respond: (_u, init) => {
+          const model = JSON.parse(String(init?.body)).model;
+          return jsonResponse({
+            capabilities: ["completion"],
+            model_info: { "general.context_length": ctxByModel[model] ?? 0 },
+          });
+        },
+      },
+    ];
+    const client = new OllamaClient({ baseUrl: "https://mock.test", apiKey: "k", fetchFn: mockFetch(routes) });
+    const capabilities = new CapabilityService({ client, getOverrides: () => fusionConfig.overrides, logger });
+    const app = createApp({ getConfig: () => fusionConfig, client, capabilities, getAuthToken: () => undefined, logger });
+
+    const res = await app.request("/v1/models");
+    const body = JSON.parse(await res.text());
+    const merged = body.data.find((m: { id: string }) => m.id === "merged");
+    expect(merged.context_window).toBe(250_000); // min(1M, 500k, 250k), NOT 1M
+  });
+
+  it("GET /v1/models omits context_window when any member's context is unknown", async () => {
+    const fusionConfig = parseConfig({
+      upstream: { base_url: "https://mock.test", api_key_env: "X" },
+      models: { merged: { strategy: "fusion", panel: ["known", "unknown"], judge: "known", synth: "known" } },
+    });
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/api/show"),
+        respond: (_u, init) => {
+          const model = JSON.parse(String(init?.body)).model;
+          // "unknown" returns no context_length -> its window is unknown.
+          const model_info = model === "known" ? { "general.context_length": 250_000 } : {};
+          return jsonResponse({ capabilities: ["completion"], model_info });
+        },
+      },
+    ];
+    const client = new OllamaClient({ baseUrl: "https://mock.test", apiKey: "k", fetchFn: mockFetch(routes) });
+    const capabilities = new CapabilityService({ client, getOverrides: () => fusionConfig.overrides, logger });
+    const app = createApp({ getConfig: () => fusionConfig, client, capabilities, getAuthToken: () => undefined, logger });
+
+    const res = await app.request("/v1/models");
+    const body = JSON.parse(await res.text());
+    const merged = body.data.find((m: { id: string }) => m.id === "merged");
+    expect(merged.context_window).toBeUndefined(); // never over-advertise an unknown bound
+  });
+
   it("POST /v1/chat/completions on a single model returns the mocked completion", async () => {
     const res = await postChat(makeApp(), { model: "fast-glm", messages: [{ role: "user", content: "hi" }] });
     expect(res.status).toBe(200);

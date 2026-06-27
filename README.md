@@ -1,6 +1,45 @@
 # llm-fusion — Fusion Proxy
 
-An OpenAI-compatible HTTP proxy in front of [Ollama Cloud](https://ollama.com) that turns one virtual model name into a **multi-model deliberation pipeline**. Point any OpenAI-compatible client (OpenCode, Continue, your own scripts) at it, ask for the model `fusion-1`, and behind the scenes a panel of models answers, a judge cross-checks them, and a synthesizer writes the final answer — or, with `smart`, an LLM router decides per request whether that heavy treatment is even warranted. It is a small, single-process Node 24 + TypeScript + [Hono](https://hono.dev) service: no database, no build step (runs `.ts` directly via `tsx`), config in one YAML file.
+An OpenAI-compatible HTTP proxy in front of [Ollama Cloud](https://ollama.com) that turns one virtual model name into a **multi-model deliberation pipeline**. Point any OpenAI-compatible client (OpenCode, Continue, your own scripts) at it, ask for the model `fusion-coder`, and behind the scenes a panel of models answers, a judge cross-checks them, and a synthesizer writes the final answer — or, with `smart`, an LLM router decides per request whether that heavy treatment is even warranted. It is a small, single-process Node 24 + TypeScript + [Hono](https://hono.dev) service: no database, no build step (runs `.ts` directly via `tsx`), config in one YAML file.
+
+Three **task-specialized** presets ship ready to use — `fusion-coder`, `fusion-researcher`, `fusion-agents` — each assembled from an empirical model shoot-out (jump to [Which model do I use?](#which-model-do-i-use)).
+
+---
+
+## Quickstart
+
+```bash
+npm install                                        # Node ≥ 24
+printf 'OLLAMA_API_KEY=ollama-your-key\n' > .env    # your Ollama Cloud key
+npm start                                          # proxy on http://127.0.0.1:8080
+```
+
+Then point any OpenAI-compatible client at `http://127.0.0.1:8080/v1` and ask for a model by name — or launch OpenCode in a single command:
+
+```bash
+./bin/fusion-opencode fusion-coder                 # starts the proxy if needed, wires OpenCode, opens the TUI
+```
+
+New here? Read **[Which model do I use?](#which-model-do-i-use)** next.
+
+---
+
+## Which model do I use?
+
+Three **task-specialized** presets ship in `fusion.yaml`, each assembled from an empirical model shoot-out (8 models × 3 task probes — full data and scores in [`research-test/model-shootout/RESULTS.md`](./research-test/model-shootout/RESULTS.md)):
+
+| Call this model | For | Strategy | How it is built |
+|---|---|---|---|
+| **`fusion-coder`** | programming, planning, code audit | `fusion` | panel `glm-5.2` + `kimi-k2.7-code` + `gemini-3-flash-preview` → judge `glm-5.2` → synth `kimi-k2.7-code` |
+| **`fusion-researcher`** | research, analysis, reports | `fusion` | panel `kimi-k2.7-code` + `glm-5.2` + `gpt-oss:120b` → judge `glm-5.2` → synth `kimi-k2.7-code` |
+| **`fusion-agents`** | autonomous agent loops | `smart` | router `glm-5.2`; easy steps → `gemini-3-flash-preview`, hard / error-recovery steps → the `fusion-coder` panel |
+
+Two rules came straight out of the data:
+
+- **Coding uses fusion, not a single model.** Architecture and planning genuinely benefit from multiple viewpoints. (A code *audit* — pure enumeration — is the one coding-shaped task a single model wins, and it is not representative of programming.)
+- **Panels mix model lineages on purpose.** `glm`/`kimi`/`deepseek`/`minimax`/`qwen` are all Chinese labs and share blind spots; every panel adds a Western decorrelator (`gemini` = Google, `gpt-oss` = OpenAI) so panel errors are less correlated — that is the whole point of a panel.
+
+The original generic presets (`fusion-1`, `smart-1`, `fast-glm` / `fast-kimi` / `fast-deepseek`) still ship for ad-hoc use.
 
 ---
 
@@ -82,7 +121,7 @@ models:
     fusion: fusion-1               # string ref to the fusion model above
 ```
 
-That is the shipped `fusion.yaml`. Everything not specified falls back to documented defaults. For the **fully annotated reference** — every key, every default, `failover`, `tool_mode`, `fusion_planning_turn_only`, `overrides`, inline smart sub-blocks — see [`fusion.example.yaml`](./fusion.example.yaml).
+Those are the core primitives. The **shipped `fusion.yaml`** also defines the three task-specialized presets from [Which model do I use?](#which-model-do-i-use) — `fusion-coder`, `fusion-researcher`, `fusion-agents`. Everything not specified falls back to documented defaults. For the **fully annotated reference** — every key, every default, `failover`, `tool_mode`, `fusion_planning_turn_only`, `overrides`, inline smart sub-blocks — see [`fusion.example.yaml`](./fusion.example.yaml).
 
 Strategy cheat-sheet for the `models:` map:
 
@@ -155,9 +194,11 @@ Point OpenCode at the proxy with a provider block in `opencode.json`:
       "name": "Fusion Proxy",
       "options": { "baseURL": "http://127.0.0.1:8080/v1" },
       "models": {
+        "fusion-coder": { "name": "Fusion Coder" },
+        "fusion-researcher": { "name": "Fusion Researcher" },
+        "fusion-agents": { "name": "Fusion Agents" },
         "fusion-1": { "name": "Fusion 1" },
-        "smart-1": { "name": "Smart 1" },
-        "fast-glm": { "name": "Fast GLM" }
+        "smart-1": { "name": "Smart 1" }
       }
     }
   }
@@ -166,7 +207,59 @@ Point OpenCode at the proxy with a provider block in `opencode.json`:
 
 The model ids must match the virtual names in your `fusion.yaml`. If you set `FUSION_PROXY_TOKEN` (client auth), add the token for provider id `fusion` via `opencode auth login` (or your `auth.json`) so OpenCode sends it as the Bearer token.
 
-For an agent loop, `smart-1` is usually the right default — it keeps routine steps cheap and reserves fusion for the hard ones.
+For an autonomous agent loop, **`fusion-agents`** is the right default — it keeps routine steps cheap (router → a fast single model) and reserves the fusion panel for the hard or error-recovery steps. For a coding/planning agent use **`fusion-coder`**; for research, **`fusion-researcher`**.
+
+### Running OpenCode with a Fusion model
+
+With the proxy running (`npm start`) and the provider block above in your `opencode.json`
+(project-local, or global `~/.config/opencode/opencode.json`), pick the model with `-m fusion/<name>`:
+
+```bash
+opencode -m fusion/fusion-coder                         # interactive TUI, coding / planning
+opencode -m fusion/fusion-agents                        # interactive TUI, autonomous routing
+opencode run -m fusion/fusion-researcher "Summarize X"  # headless, one prompt
+opencode run -m fusion/fusion-agents "Fix the bug in Y" # headless
+```
+
+### One-command launcher (`fusion-opencode`)
+
+`ollama` itself can't be extended, but this repo ships its own launcher so you don't have to
+start the proxy or edit configs by hand. It (1) starts the proxy if it isn't already up,
+(2) writes the `fusion` provider into your global OpenCode config — idempotent, it only touches
+the `fusion` key — then (3) launches OpenCode with the model you name:
+
+```bash
+./bin/fusion-opencode fusion-coder             # TUI for programming / planning
+./bin/fusion-opencode fusion-researcher        # TUI for research / reports
+./bin/fusion-opencode fusion-agents            # TUI for autonomous agent loops
+./bin/fusion-opencode fusion-agents run "Fix the failing test in src/foo.ts"   # headless one-shot
+```
+
+Put it on your `PATH` to call `fusion-opencode <model>` from any directory:
+
+```bash
+npm link            # or: ln -s "$PWD/bin/fusion-opencode" ~/.local/bin/fusion-opencode
+fusion-opencode fusion-coder
+```
+
+Honors `FUSION_PROXY_URL` (default `http://127.0.0.1:8080`) and, if your proxy requires client
+auth, `FUSION_PROXY_TOKEN` (used as the apiKey OpenCode sends).
+
+### For AI agents (any OpenAI-compatible client)
+
+The proxy is a drop-in OpenAI Chat Completions endpoint, so any agent framework that speaks OpenAI works — not just OpenCode (Continue, Cline, Aider with an OpenAI base URL, your own loop). Wire it with:
+
+- **Base URL:** `http://127.0.0.1:8080/v1`
+- **API key:** any non-empty string while the proxy is unauthenticated (e.g. `local-no-auth`); the real `FUSION_PROXY_TOKEN` value if you enabled client auth.
+- **Model:** pick by task — `fusion-coder`, `fusion-researcher`, or `fusion-agents` (see [Which model do I use?](#which-model-do-i-use)).
+
+The proxy emits **exactly one** `tool_calls` per step regardless of strategy, so an existing agent tool-loop runs unchanged — fusion's panel and judge happen entirely server-side and are invisible to the agent. For long autonomous runs prefer `fusion-agents`: it is `smart`, so it spends the full panel only where it pays off, falls back to a single fast model otherwise, and re-deliberates automatically when a tool result comes back as an error (`escalate_on_tool_error`). A minimal raw call:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"fusion-agents","messages":[{"role":"user","content":"List the open TODOs in this repo"}]}'
+```
 
 ---
 

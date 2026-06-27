@@ -38,6 +38,28 @@ const config = parseConfig({
       simple: { target: "deepseek" },
       fusion: { panel: ["p1", "p2", "p3"], judge: "jdg", synth: "syn" },
     },
+    "smart-no-escalate": {
+      strategy: "smart",
+      router: "rt",
+      default: "simple",
+      escalate_on_tool_error: false,
+      simple: { target: "deepseek" },
+      fusion: { panel: ["p1", "p2", "p3"], judge: "jdg", synth: "syn" },
+    },
+    "fusion-pto": {
+      strategy: "fusion",
+      panel: ["p1", "p2", "p3"],
+      judge: "jdg",
+      synth: "syn",
+      fusion_planning_turn_only: true,
+    },
+    "smart-ref-pto": {
+      strategy: "smart",
+      router: "rt",
+      default: "simple",
+      simple: { target: "deepseek" },
+      fusion: "fusion-pto",
+    },
   },
 });
 
@@ -132,6 +154,18 @@ function req(model: string, extra: Record<string, unknown> = {}): ChatCompletion
   return { model, messages: [{ role: "user", content: "hello" }], ...extra };
 }
 
+/** A mid-agent-loop request whose latest tool result carries `toolContent`. */
+function reqWithToolResult(model: string, toolContent: string): ChatCompletionRequest {
+  return {
+    model,
+    messages: [
+      { role: "user", content: "run the tests" },
+      { role: "assistant", content: "calling bash" },
+      { role: "tool", content: toolContent },
+    ],
+  };
+}
+
 describe("smart strategy", () => {
   it("route=simple runs only the simple path; router called once, non-streamed", async () => {
     const up = makeUpstream(chatWith(routeSimple));
@@ -145,6 +179,94 @@ describe("smart strategy", () => {
     const routerBodies = up.routerBodies();
     expect(routerBodies).toHaveLength(1); // exactly one router call
     expect(routerBodies[0]?.stream).not.toBe(true); // never streamed
+  });
+
+  it("escalates to fusion on a failing tool result WITHOUT calling the router", async () => {
+    const up = makeUpstream(chatWith(routeSimple)); // router WOULD say "simple"
+    const res = await smartStrategy.execute(
+      ctx(up.client, reqWithToolResult("smart-inline", "AssertionError: expected 200, got 500"), "smart-inline"),
+    );
+    expect(res.status).toBe(200);
+    const called = up.modelsCalled();
+    // Fusion ran (panel + judge + synth) despite the router preferring "simple"...
+    for (const m of [...PANEL, "jdg", "syn"]) expect(called).toContain(m);
+    // ...and the router was never consulted — deterministic escalation, 0 round-trips.
+    expect(up.routerBodies()).toHaveLength(0);
+    expect(called).not.toContain("deepseek");
+  });
+
+  it("does NOT escalate on a successful tool result; the router decides", async () => {
+    const up = makeUpstream(chatWith(routeSimple));
+    const res = await smartStrategy.execute(
+      ctx(up.client, reqWithToolResult("smart-inline", "All 12 tests passed in 1.2s"), "smart-inline"),
+    );
+    expect(res.status).toBe(200);
+    expect(up.routerBodies()).toHaveLength(1); // router consulted as normal
+    expect(up.modelsCalled()).toContain("deepseek"); // routed simple, fusion did not run
+  });
+
+  it("escalate_on_tool_error=false defers to the router even on a failing tool result", async () => {
+    const up = makeUpstream(chatWith(routeSimple));
+    const res = await smartStrategy.execute(
+      ctx(
+        up.client,
+        reqWithToolResult("smart-no-escalate", "Traceback (most recent call last): ZeroDivisionError"),
+        "smart-no-escalate",
+      ),
+    );
+    expect(res.status).toBe(200);
+    expect(up.routerBodies()).toHaveLength(1); // knob off -> router still runs
+    expect(up.modelsCalled()).toContain("deepseek"); // routed simple by the router
+  });
+
+  it("escalation runs FULL fusion even when the referenced fusion model is planning-turn-only", async () => {
+    const up = makeUpstream(chatWith(routeSimple));
+    const res = await smartStrategy.execute(
+      ctx(up.client, reqWithToolResult("smart-ref-pto", "Error: connection refused"), "smart-ref-pto"),
+    );
+    expect(res.status).toBe(200);
+    const called = up.modelsCalled();
+    // The panel must run — escalation overrides planning_turn_only's mid-loop degrade.
+    for (const m of PANEL) expect(called).toContain(m);
+    expect(up.routerBodies()).toHaveLength(0);
+  });
+
+  it("does NOT escalate when a tool result merely mentions an error mid-line (file read)", async () => {
+    const up = makeUpstream(chatWith(routeSimple));
+    const fileRead =
+      "src/math.py:\n    def divide(a, b):\n        # raises ValueError: when b is 0\n        return a / b";
+    const res = await smartStrategy.execute(
+      ctx(up.client, reqWithToolResult("smart-inline", fileRead), "smart-inline"),
+    );
+    expect(res.status).toBe(200);
+    // A successful file read whose CONTENT names an exception is not a failure.
+    expect(up.routerBodies()).toHaveLength(1); // router decided; no escalation
+    expect(up.modelsCalled()).toContain("deepseek");
+  });
+
+  it("does NOT escalate on clean tool output that contains the word 'errors'", async () => {
+    const up = makeUpstream(chatWith(routeSimple));
+    const res = await smartStrategy.execute(
+      ctx(up.client, reqWithToolResult("smart-inline", "Lint complete: 0 errors, 0 warnings"), "smart-inline"),
+    );
+    expect(res.status).toBe(200);
+    expect(up.routerBodies()).toHaveLength(1);
+    expect(up.modelsCalled()).toContain("deepseek");
+  });
+
+  it("escalates on an npm ERR! failure and on a multi-line traceback", async () => {
+    for (const failure of [
+      "npm ERR! code ELIFECYCLE\nnpm ERR! errno 1",
+      "Traceback (most recent call last):\n  File \"app.py\", line 7, in <module>\n    main()\nZeroDivisionError: division by zero",
+    ]) {
+      const up = makeUpstream(chatWith(routeSimple));
+      const res = await smartStrategy.execute(
+        ctx(up.client, reqWithToolResult("smart-inline", failure), "smart-inline"),
+      );
+      expect(res.status).toBe(200);
+      expect(up.routerBodies()).toHaveLength(0); // escalated, router skipped
+      for (const m of PANEL) expect(up.modelsCalled()).toContain(m);
+    }
   });
 
   it("route=simple with an image to a non-vision target -> 400 capability gate (no upstream simple call)", async () => {

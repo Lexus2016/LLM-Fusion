@@ -1,5 +1,11 @@
 import type { ChatCompletionResult, Strategy } from "../types";
 import { CircuitOpenError, FusionError } from "../errors";
+import {
+  failureKindForError,
+  failureKindForStatus,
+  isAvailabilityFailureStatus,
+  logUpstreamFailure,
+} from "../attribution";
 
 /**
  * `single` strategy — 1:1 passthrough to a single target model. Supports both
@@ -32,9 +38,11 @@ export const singleStrategy: Strategy = {
     const resilience = ctx.resilience;
 
     if (resilience && !resilience.breaker.canAttempt(target)) {
+      logUpstreamFailure(ctx.logger, { stage: "single", model: target, kind: "circuit_open", latencyMs: 0 });
       throw new CircuitOpenError(`circuit breaker open for '${target}'`);
     }
 
+    const startedAt = Date.now();
     let result: ChatCompletionResult;
     try {
       result = resilience
@@ -42,12 +50,32 @@ export const singleStrategy: Strategy = {
         : await ctx.client.chatCompletions(body, { stream });
     } catch (err) {
       resilience?.breaker.recordFailure(target);
+      ctx.usage?.recordError(target);
+      logUpstreamFailure(ctx.logger, {
+        stage: "single",
+        model: target,
+        kind: failureKindForError(err),
+        latencyMs: Date.now() - startedAt,
+        reason: err instanceof Error ? err.message : String(err),
+      });
       throw err;
     }
+    ctx.usage?.record(target, result);
 
     if (resilience) {
       if (result.status < 400) resilience.breaker.recordSuccess(target);
-      else resilience.breaker.recordFailure(target);
+      // Only availability failures (429/5xx) count against the model's health; a
+      // 4xx client/request error is passed through without tripping the breaker.
+      else if (isAvailabilityFailureStatus(result.status)) resilience.breaker.recordFailure(target);
+    }
+    if (result.status >= 400 && isAvailabilityFailureStatus(result.status)) {
+      logUpstreamFailure(ctx.logger, {
+        stage: "single",
+        model: target,
+        kind: failureKindForStatus(result.status),
+        status: result.status,
+        latencyMs: Date.now() - startedAt,
+      });
     }
 
     if (result.kind === "stream") {

@@ -77,4 +77,32 @@ describe("capabilities", () => {
     expect(r.source).toBe("default");
     expect(r.capability).toEqual({ vision: false, tools: true, context: null });
   });
+
+  it("does NOT cache a degraded `default` result; retries discovery and caches the later success (C-3)", async () => {
+    let calls = 0;
+    const svc = new CapabilityService({
+      client: {
+        show: async () => {
+          calls += 1;
+          if (calls === 1) throw new Error("transient blip"); // first call fails -> default
+          return { capabilities: ["vision"], model_info: { "glm.context_length": 4096 } };
+        },
+      },
+      getOverrides: () => ({}),
+      logger,
+    });
+
+    const a = await svc.discover("glm-5.2");
+    expect(a.source).toBe("default"); // failure -> conservative default, NOT cached
+    expect(a.capability.vision).toBe(false);
+
+    const b = await svc.discover("glm-5.2"); // retries: transient failure gone
+    expect(b.source).toBe("discovered");
+    expect(b.capability.vision).toBe(true);
+    expect(b.capability.context).toBe(4096);
+
+    const c = await svc.discover("glm-5.2"); // discovered result IS cached
+    expect(c.source).toBe("discovered");
+    expect(calls).toBe(2); // one failed + one success; the third call hit the cache
+  });
 });

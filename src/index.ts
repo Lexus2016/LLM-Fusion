@@ -68,8 +68,10 @@ async function main(): Promise<void> {
 
   // `server.bind` is the default; FUSION_BIND overrides it without editing the
   // mounted config (handy in Docker, where the in-image config binds 127.0.0.1
-  // but the container must listen on 0.0.0.0 to be reachable from the host).
-  const bind = process.env.FUSION_BIND ?? manager.config.server.bind;
+  // but the container must listen on 0.0.0.0 to be reachable from the host). An
+  // empty FUSION_BIND ("") must NOT override to "" (which some servers treat as
+  // "all interfaces") — `||` falls through to the configured bind, unlike `??`.
+  const bind = process.env.FUSION_BIND || manager.config.server.bind;
   const { port } = manager.config.server;
 
   // Startup banner: what is listening, which virtual models are loaded and with

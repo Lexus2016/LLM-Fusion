@@ -5,6 +5,8 @@ import { parseConfig } from "../src/config";
 import { createLogger } from "../src/logging";
 import { CapabilityService } from "../src/capabilities";
 import { mockFetch, jsonResponse, sseResponse } from "./helpers";
+import { createResilience } from "../src/concurrency";
+import type { Resilience } from "../src/concurrency";
 import type { ChatCompletionRequest, StrategyContext, UpstreamClient } from "../src/types";
 
 const logger = createLogger({ level: "silent" });
@@ -89,5 +91,55 @@ describe("single strategy", () => {
     expect(text).toContain('"content":"a"');
     expect(text).toContain('"content":"b"');
     expect(text).toContain("[DONE]");
+  });
+});
+
+describe("single strategy — circuit breaker availability semantics", () => {
+  function statusClient(status: number): UpstreamClient {
+    return new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        { match: (u) => u.endsWith("/v1/chat/completions"), respond: () => jsonResponse({ error: "x" }, status) },
+      ]),
+    });
+  }
+
+  function ctxRes(client: UpstreamClient, resilience: Resilience): StrategyContext {
+    const capabilities = new CapabilityService({ client, getOverrides: () => config.overrides, logger });
+    const entry = config.models["fast-glm"];
+    if (!entry) throw new Error("missing fast-glm");
+    return { request: { model: "fast-glm", messages: [] }, config, client, capabilities, logger, modelConfig: entry, resilience };
+  }
+
+  function res(failureThreshold: number): Resilience {
+    return createResilience({ maxConcurrency: 4, now: () => 1_000_000, sleep: async () => {}, failureThreshold });
+  }
+
+  it("does NOT trip the breaker on repeated 4xx client errors", async () => {
+    const resilience = res(2); // 2 availability failures would open it
+    const client = statusClient(400);
+    for (let i = 0; i < 5; i += 1) {
+      const out = await singleStrategy.execute(ctxRes(client, resilience));
+      expect(out.status).toBe(400); // passed through to the client
+    }
+    expect(resilience.breaker.getState("glm-5.2")).toBe("closed");
+  });
+
+  it("trips the breaker on repeated 5xx availability failures", async () => {
+    const resilience = res(2);
+    const client = statusClient(503);
+    await singleStrategy.execute(ctxRes(client, resilience));
+    expect(resilience.breaker.getState("glm-5.2")).toBe("closed"); // 1 < threshold
+    await singleStrategy.execute(ctxRes(client, resilience));
+    expect(resilience.breaker.getState("glm-5.2")).toBe("open"); // 2 >= threshold
+  });
+
+  it("trips the breaker on repeated 429 rate-limits", async () => {
+    const resilience = res(2);
+    const client = statusClient(429);
+    await singleStrategy.execute(ctxRes(client, resilience));
+    await singleStrategy.execute(ctxRes(client, resilience));
+    expect(resilience.breaker.getState("glm-5.2")).toBe("open");
   });
 });

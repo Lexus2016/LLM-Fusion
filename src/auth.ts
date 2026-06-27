@@ -1,4 +1,19 @@
 import type { MiddlewareHandler } from "hono";
+import { timingSafeEqual } from "node:crypto";
+
+/**
+ * Constant-time client-token comparison. The length guard returns early on a
+ * size mismatch (token length may leak, the secret bytes do not) so
+ * `timingSafeEqual` — which throws on unequal-length buffers — is only reached
+ * with equal lengths. This removes the byte-by-byte timing side-channel of a
+ * plain `===`/`!==` string compare.
+ */
+function tokensMatch(provided: string, token: string): boolean {
+  const a = Buffer.from(provided);
+  const b = Buffer.from(token);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
 
 /**
  * Optional client-token auth.
@@ -21,7 +36,7 @@ export function createAuthMiddleware(getToken: () => string | undefined): Middle
     const header = c.req.header("authorization") ?? "";
     const match = /^Bearer\s+(.+)$/i.exec(header);
     const provided = match?.[1];
-    if (!provided || provided !== token) {
+    if (!provided || !tokensMatch(provided, token)) {
       return c.json(
         { error: { message: "invalid or missing client token", type: "authentication_error", code: null } },
         401,

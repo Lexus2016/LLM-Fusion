@@ -10,6 +10,12 @@ import type { FusionModelConfig, SingleModelConfig, SmartModelConfig } from "../
 import type { Resilience } from "../concurrency";
 import { createResilience } from "../concurrency";
 import { FusionError } from "../errors";
+import {
+  failureKindForError,
+  failureKindForStatus,
+  isAvailabilityFailureStatus,
+  logUpstreamFailure,
+} from "../attribution";
 import { singleStrategy } from "./single";
 import { fusionStrategy } from "./fusion";
 import { assertSingleVisionCapable } from "../vision";
@@ -41,10 +47,22 @@ import { assertSingleVisionCapable } from "../vision";
 
 const ROUTER_SYSTEM_PROMPT = [
   "You are a routing classifier for an LLM proxy.",
-  "Decide whether the user's request needs multi-model deliberation or whether a single capable model suffices.",
+  "Decide whether the user's request needs multi-model deliberation (\"fusion\") or whether a single capable model suffices (\"simple\").",
   'Reply with ONLY a JSON object of the form {"route": "simple" | "fusion", "reason": "<short reason>"}.',
-  'Choose "fusion" for hard, ambiguous, high-stakes, multi-step, or reasoning-heavy tasks that benefit from several models cross-checking each other.',
-  'Choose "simple" for straightforward requests a single strong model answers well (lookups, short edits, simple Q&A, casual conversation).',
+  "",
+  'Choose "fusion" when the request is any of:',
+  "- complex, multi-faceted, or multi-step (several sub-problems, trade-offs, or moving parts);",
+  "- ambiguous or underspecified (the best answer depends on assumptions worth cross-checking);",
+  "- high-stakes or hard to reverse (correctness, safety, money, data loss, or production impact);",
+  "- architecture, system design, or API/schema design;",
+  "- security, threat modeling, or anything where a subtle mistake is costly;",
+  "- debugging, root-cause analysis, or reasoning about why something fails;",
+  "- research, comparison, or synthesis across multiple sources or options;",
+  "- anything that benefits from several models cross-checking each other to catch blind spots.",
+  "",
+  'Choose "simple" only when the request is genuinely routine: a single-step task, a factual lookup, a short edit, a trivial transformation, boilerplate, or casual conversation that one strong model answers well on its own.',
+  "",
+  "When in doubt between the two, prefer \"fusion\" — the cost of under-deliberating a hard task outweighs the cost of deliberating an easy one.",
   "Output the JSON object and nothing else.",
 ].join("\n");
 
@@ -81,6 +99,24 @@ export const smartStrategy: Strategy = {
       throw new FusionError("smart strategy invoked with a non-smart model config", 500, "internal_error");
     }
     const cfg = ctx.modelConfig;
+
+    // Agent-loop escalation (see SmartModelSchema.escalate_on_tool_error): when
+    // the latest tool result looks like a failure the model is recovering from an
+    // error — exactly the step that benefits from deliberation — so route straight
+    // to fusion, skipping the router round-trip. OpenRouter Fusion structurally
+    // cannot do this: it is invoked out-of-loop and never sees the tool result.
+    if (cfg.escalate_on_tool_error && latestToolResultIsError(ctx.request)) {
+      ctx.logger.info(
+        { model: ctx.request.model, route: "fusion", reason: "tool_error_escalation" },
+        "smart: latest tool result looks like a failure; escalating to fusion",
+      );
+      // Force full deliberation: planning-turn-only would otherwise degrade this
+      // mid-loop step (a tool message is present) back to synth-only, defeating
+      // the escalation. The escalation IS the decision to deliberate mid-loop.
+      const modelConfig = { ...resolveFusion(ctx, cfg), fusion_planning_turn_only: false };
+      return fusionStrategy.execute({ ...ctx, modelConfig });
+    }
+
     const route = await classify(ctx, cfg);
 
     if (route === "simple") {
@@ -108,6 +144,7 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
     ctx.resilience ?? createResilience({ maxConcurrency: ctx.config.upstream.max_concurrency });
 
   if (!resilience.breaker.canAttempt(router)) {
+    logUpstreamFailure(ctx.logger, { stage: "router", model: router, kind: "circuit_open", latencyMs: 0 });
     ctx.logger.warn(
       { router, model: ctx.request.model, route: fallback },
       "smart: router circuit open; using default route",
@@ -126,11 +163,20 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
     ],
   };
 
+  const startedAt = Date.now();
   let result: ChatCompletionResult;
   try {
     result = await resilience.limiter(() => ctx.client.chatCompletions(body, { stream: false }));
   } catch (err) {
     resilience.breaker.recordFailure(router);
+    ctx.usage?.recordError(router);
+    logUpstreamFailure(ctx.logger, {
+      stage: "router",
+      model: router,
+      kind: failureKindForError(err),
+      latencyMs: Date.now() - startedAt,
+      reason: err instanceof Error ? err.message : String(err),
+    });
     ctx.logger.warn(
       {
         router,
@@ -142,11 +188,23 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
     );
     return fallback;
   }
+  ctx.usage?.record(router, result);
 
   if (result.kind !== "json" || result.status >= 400) {
-    resilience.breaker.recordFailure(router);
+    // Only availability failures (non-json / 429 / 5xx) count against the router
+    // model's health; a 4xx still degrades the route but leaves the breaker.
+    if (result.kind !== "json" || isAvailabilityFailureStatus(result.status)) {
+      resilience.breaker.recordFailure(router);
+      logUpstreamFailure(ctx.logger, {
+        stage: "router",
+        model: router,
+        kind: result.kind !== "json" ? "error" : failureKindForStatus(result.status),
+        ...(result.kind === "json" ? { status: result.status } : {}),
+        latencyMs: Date.now() - startedAt,
+      });
+    }
     ctx.logger.warn(
-      { router, model: ctx.request.model, route: fallback, status: result.status },
+      { router, model: ctx.request.model, route: fallback, status: result.kind === "json" ? result.status : undefined },
       "smart: router returned a non-OK response; using default route",
     );
     return fallback;
@@ -197,6 +255,7 @@ function resolveFusion(ctx: StrategyContext, cfg: SmartModelConfig): FusionModel
       synth: ref.synth,
       tool_mode: "deliberate",
       fusion_planning_turn_only: false,
+      promote_reasoning_to_content: ref.promote_reasoning_to_content,
     };
   }
   const target = ctx.config.models[ref];
@@ -252,4 +311,59 @@ function renderRequestForRouter(request: ChatCompletionRequest): string {
     lines.push(`${role}: ${text}`);
   }
   return `Classify the route for the following request:\n\n${lines.join("\n")}`;
+}
+
+// --- Agent-loop escalation -------------------------------------------------
+
+/**
+ * High-precision signals that a tool result represents a failure. Matched
+ * against only the LATEST `role:"tool"` message (the output the model is about
+ * to reason over). The error/exception/traceback/fatal/panic forms are
+ * LINE-ANCHORED (`^\s*` + multiline): a real failure dump opens a line with the
+ * signal, whereas a benign file read that merely mentions an exception mid-line
+ * (e.g. `# raises ValueError: ...`) must NOT escalate a 5x-cost deliberation.
+ */
+const TOOL_ERROR_PATTERNS: RegExp[] = [
+  /^\s*traceback \(most recent call last\)/im,
+  /^\s*[\w.]*(error|exception):/im, // line opens with TypeError:, Exception:, django.db.IntegrityError:
+  /^\s*(fatal|panic):/im, // git "fatal:", go "panic:"
+  /\bexit (code|status) [1-9]/i,
+  /\b(command|module) not found\b/i,
+  /\bno such file or directory\b/i,
+  /\bpermission denied\b/i,
+  /\bnpm err!/i,
+  /\bsegmentation fault\b/i,
+  /\b\d+ (tests? )?fail(ed|ures?)\b/i, // "3 failed", "1 failure", "2 tests failed"
+  /\bFAILED\b/, // test-runner summary token (case-sensitive)
+];
+
+/** Text of a (possibly multimodal) message content; "" when there is none. */
+const TextPartSchema = z.object({ text: z.string() }).passthrough();
+function messageContentText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        const parsed = TextPartSchema.safeParse(part);
+        return parsed.success ? parsed.data.text : "";
+      })
+      .join(" ");
+  }
+  return "";
+}
+
+/**
+ * Does the most recent tool result in the conversation look like a failure?
+ * A false positive only costs one extra deliberated step; a false negative
+ * leaves error recovery to a single model, so the patterns lean toward recall.
+ */
+function latestToolResultIsError(request: ChatCompletionRequest): boolean {
+  const messages: ChatMessage[] = Array.isArray(request.messages) ? request.messages : [];
+  let latest: string | null = null;
+  for (const m of messages) {
+    if (m.role !== "tool") continue;
+    latest = messageContentText(m.content);
+  }
+  if (latest === null || latest.trim().length === 0) return false;
+  return TOOL_ERROR_PATTERNS.some((re) => re.test(latest));
 }

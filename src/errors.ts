@@ -104,6 +104,9 @@ export function toErrorResponse(err: unknown): Response {
   if (err instanceof FusionError) {
     return jsonError(err.httpStatus, err.message, err.errorType);
   }
-  const message = err instanceof Error ? err.message : "internal server error";
-  return jsonError(500, message, "internal_error");
+  // Non-FusionError (an unexpected bug): never leak its raw message to the
+  // client — it can carry internal paths, identifiers, or library detail. The
+  // real error is logged server-side (server.ts request-failed line); the client
+  // gets a generic message.
+  return jsonError(500, "internal server error", "internal_error");
 }

@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# fusion-opencode — launch OpenCode wired to the llm-fusion Fusion Proxy with a chosen model.
+#
+# Usage:
+#   fusion-opencode <model> [opencode args...]
+#   fusion-opencode fusion-1                  # interactive TUI with Fusion 1
+#   fusion-opencode smart-1                    # interactive TUI with Smart routing
+#   fusion-opencode smart-1 run "Fix bug X"    # headless one-shot
+#
+# What it does:
+#   1. starts the proxy (npm start) if it is not already answering on /health;
+#   2. ensures the `fusion` provider exists in your global OpenCode config
+#      (idempotent merge — only the `fusion` key is written, everything else is kept);
+#   3. launches OpenCode with `-m fusion/<model>`.
+#
+# Env:
+#   FUSION_PROXY_URL    override proxy URL (default http://127.0.0.1:8080)
+#   FUSION_PROXY_TOKEN  if your proxy requires a client token, it is used as the apiKey
+set -euo pipefail
+
+MODEL="${1:-fusion-1}"
+[ "$#" -gt 0 ] && shift
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROXY_URL="${FUSION_PROXY_URL:-http://127.0.0.1:8080}"
+
+# 1. ensure the proxy is up ---------------------------------------------------
+if ! curl -fsS "$PROXY_URL/health" >/dev/null 2>&1; then
+  echo "[fusion-opencode] proxy not up — starting it from $REPO ..." >&2
+  ( cd "$REPO" && nohup npm start >"${TMPDIR:-/tmp}/llm-fusion-proxy.log" 2>&1 & )
+  for _ in $(seq 1 60); do
+    curl -fsS "$PROXY_URL/health" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  if ! curl -fsS "$PROXY_URL/health" >/dev/null 2>&1; then
+    echo "[fusion-opencode] proxy failed to start — see ${TMPDIR:-/tmp}/llm-fusion-proxy.log" >&2
+    exit 1
+  fi
+  echo "[fusion-opencode] proxy is up at $PROXY_URL" >&2
+fi
+
+# 2. ensure the fusion provider is in the global OpenCode config (idempotent) --
+OC_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json"
+mkdir -p "$(dirname "$OC_CFG")"
+FUSION_PROXY_URL="$PROXY_URL" python3 - "$OC_CFG" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+proxy = os.environ.get("FUSION_PROXY_URL", "http://127.0.0.1:8080")
+api_key = os.environ.get("FUSION_PROXY_TOKEN") or "local-no-auth"
+cfg = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+cfg.setdefault("$schema", "https://opencode.ai/config.json")
+cfg.setdefault("provider", {})["fusion"] = {
+    "npm": "@ai-sdk/openai-compatible",
+    "name": "Fusion Proxy",
+    "options": {"baseURL": proxy.rstrip("/") + "/v1", "apiKey": api_key},
+    "models": {
+        "fusion-coder": {"name": "Fusion Coder"},
+        "fusion-researcher": {"name": "Fusion Researcher"},
+        "fusion-agents": {"name": "Fusion Agents"},
+        "fusion-1": {"name": "Fusion 1"},
+        "smart-1": {"name": "Smart 1"},
+        "fast-glm": {"name": "Fast GLM"},
+    },
+}
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+print(f"[fusion-opencode] ensured `fusion` provider in {path}", file=sys.stderr)
+PY
+
+# 3. launch OpenCode with the chosen model ------------------------------------
+echo "[fusion-opencode] launching: opencode -m fusion/${MODEL} $*" >&2
+exec opencode -m "fusion/${MODEL}" "$@"

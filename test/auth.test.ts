@@ -46,6 +46,13 @@ describe("auth", () => {
     expect(res.status).toBe(401);
   });
 
+  it("rejects an equal-length wrong bearer (constant-time path, no throw)", async () => {
+    // "secres" and "secret" are the same byte length: exercises the
+    // timingSafeEqual branch that throws on unequal-length buffers.
+    const res = await post(app("secret"), { authorization: "Bearer secres" });
+    expect(res.status).toBe(401);
+  });
+
   it("accepts the correct bearer", async () => {
     const res = await post(app("secret"), { authorization: "Bearer secret" });
     expect(res.status).toBe(200);

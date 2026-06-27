@@ -225,6 +225,61 @@ describe("failover strategy", () => {
     expect(counts["m1"]).toBe(1);
     expect(counts["m2"] ?? 0).toBe(0); // member NOT switched after first byte
   });
+
+  // L-5: an SSE keep-alive comment (`:` line) or blank line is NOT a content
+  // commitment. Failover may still advance until a real `data:` line arrives.
+  function sseChunks(chunks: string[], endWithError?: string): Response {
+    const encoder = new TextEncoder();
+    let i = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks[i];
+        if (chunk !== undefined) {
+          controller.enqueue(encoder.encode(chunk));
+          i += 1;
+          return;
+        }
+        if (endWithError !== undefined) controller.error(new Error(endWithError));
+        else controller.close();
+      },
+    });
+    return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+
+  it("streaming: a leading keep-alive comment is not a commitment; a pre-content error advances", async () => {
+    const { fetchFn, counts } = chatMock((model) =>
+      model === "m1"
+        ? sseChunks([": keep-alive\n\n"], "stalled before content") // comment, then error
+        : sseResponse([{ choices: [{ delta: { content: "y" } }] }]),
+    );
+    const { resilience } = makeResilience({ maxServerRetries: 0 });
+    const res = await failoverStrategy.execute(
+      ctxWith(clientWith(fetchFn), { model: "ha", stream: true, messages: [] }, resilience),
+    );
+    const text = await readAll(res);
+    expect(text).toContain('"content":"y"'); // served by m2
+    expect(counts["m1"]).toBe(1);
+    expect(counts["m2"]).toBe(1); // advanced past the keep-alive-only m1
+  });
+
+  it("streaming: keep-alive comment then real content commits to the SAME member (comment preserved)", async () => {
+    const contentChunk = `data: ${JSON.stringify({ choices: [{ delta: { content: "x" } }] })}\n\n`;
+    const { fetchFn, counts } = chatMock((model) =>
+      model === "m1"
+        ? sseChunks([": keep-alive\n\n", contentChunk, "data: [DONE]\n\n"])
+        : sseResponse([{ choices: [{ delta: { content: "z" } }] }]),
+    );
+    const { resilience } = makeResilience({ maxServerRetries: 0 });
+    const res = await failoverStrategy.execute(
+      ctxWith(clientWith(fetchFn), { model: "ha", stream: true, messages: [] }, resilience),
+    );
+    const text = await readAll(res);
+    expect(text).toContain(": keep-alive"); // the keep-alive bytes are preserved
+    expect(text).toContain('"content":"x"'); // m1's real content
+    expect(text).toContain("[DONE]");
+    expect(counts["m1"]).toBe(1);
+    expect(counts["m2"] ?? 0).toBe(0); // committed to m1, never advanced
+  });
 });
 
 describe("failover wired through the server", () => {

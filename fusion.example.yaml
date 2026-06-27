@@ -23,8 +23,21 @@ models:
     panel: [glm-5.2, kimi-k2.7-code, deepseek-v4-pro]
     judge: glm-5.2
     synth: deepseek-v4-pro
-    tool_mode: deliberate             # deliberate | bypass   (default: deliberate)
-    fusion_planning_turn_only: false  # (default: false)
+    # tool_mode — how requests that carry tools/function-calls are handled (fusion only):
+    #   deliberate (default): panel members deliberate in PROSE with the tools STRIPPED;
+    #     only the synth model is given the real tool schema and emits one canonical
+    #     tool_call. Keeps fusion's cross-check even on agentic/tool steps.
+    #   bypass: skip panel+judge, send straight to synth with the tools (1 call instead
+    #     of 5) — faster/cheaper, but no deliberation on tool decisions.
+    tool_mode: deliberate
+
+    # fusion_planning_turn_only — cost knob for fusion running inside an agent loop:
+    #   false (default): the full panel -> judge -> synth runs on EVERY step (5 calls/step).
+    #   true: full fusion runs ONLY on the first "planning" turn (while the conversation has
+    #     no tool-result messages yet). Once tool results appear (the agent is mid-loop),
+    #     it degrades to synth-only (5 calls -> 1), since in-loop steps ("read this tool
+    #     output, pick the next call") are mostly mechanical and gain little from a panel.
+    fusion_planning_turn_only: false
 
   # --- single strategy (Phase 1) ---
   fast-1:
@@ -41,14 +54,65 @@ models:
     strategy: smart
     router: glm-5.2                   # fast classifier model (one non-streamed JSON call per request)
     default: simple                   # route used when the router is unsure / errors (simple | fusion; default: simple)
+    escalate_on_tool_error: true      # agent-loop: a failing latest tool result (error / exception / non-zero exit / test failure)
+                                      #   skips the router and goes straight to fusion — re-deliberate on recovery (default: true)
     simple: { target: deepseek-v4-pro }   # inline single-strategy block, OR a string naming another model (e.g. simple: fast-1)
     fusion:                           # inline fusion-strategy block, OR a string naming another model (e.g. fusion: fusion-1)
       panel: [glm-5.2, kimi-k2.7-code, deepseek-v4-pro]
       judge: glm-5.2
       synth: deepseek-v4-pro
 
+  # =========================================================================
+  # Task-specialized presets — the recommended, ready-to-use models (this is
+  # what actually ships in fusion.yaml). Assembled from the model shoot-out:
+  # research-test/model-shootout/RESULTS.md. Panels deliberately MIX MODEL
+  # LINEAGES — 3 models from the same lab share training blind spots, which
+  # defeats the point of a panel; each panel adds a Western decorrelator.
+  # =========================================================================
+
+  fusion-coder:                       # programming / planning / audit — fusion (multiple viewpoints)
+    strategy: fusion
+    panel: [glm-5.2, kimi-k2.7-code, gemini-3-flash-preview]  # GLM + Moonshot + Google (Western decorrelator)
+    judge: glm-5.2                    # most reliable structured-JSON of the field -> fewer judge-parse failures
+    synth: kimi-k2.7-code             # most complete, compilable code generator in the shoot-out
+    tool_mode: deliberate
+    fusion_planning_turn_only: true   # full panel on the planning turn, synth-only mid-loop (cost knob)
+
+  fusion-researcher:                  # research / analysis / reports — fusion for breadth
+    strategy: fusion
+    panel: [kimi-k2.7-code, glm-5.2, gpt-oss:120b]            # Moonshot + GLM + OpenAI-OSS (Western decorrelator)
+    judge: glm-5.2
+    synth: kimi-k2.7-code             # scored 15/15 on research; cleanest report-ready prose
+    tool_mode: deliberate
+    fusion_planning_turn_only: false  # research is not a mechanical loop — deliberate every step
+
+  fusion-agents:                      # autonomous agent loops — smart routing (cheap by default)
+    strategy: smart
+    router: glm-5.2                   # fast + reliable JSON classifier (router shoot-out winner)
+    default: simple
+    escalate_on_tool_error: true      # a failing tool result -> straight to fusion (re-deliberate on recovery)
+    simple: { target: gemini-3-flash-preview }   # fast, cheap, strong all-rounder for the easy steps
+    fusion: fusion-coder              # hard steps -> the planning-strong coder panel (string ref to the model above)
+
 overrides:                            # used ONLY when /api/show discovery misses
   kimi-k2.7-code:                     # illustrative shape; Phase 0 confirmed kimi-k2.7-code is vision-capable via /api/show
     tools: true
     vision: true
     context: 262144
+
+pricing:                              # OPTIONAL cost accounting (USD per 1M tokens).
+                                      # Keyed by the REAL upstream model id (target/chain/panel/judge/synth/router),
+                                      # not the virtual model name. Omit entirely to leave cost_usd null (default).
+                                      # When present, the proxy logs cost_usd per request and sums per-call cost
+                                      # by each call's own model (so fusion mixes prices correctly).
+  glm-5.2:
+    input_per_mtok: 0.50              # USD charged per 1,000,000 prompt (input) tokens
+    output_per_mtok: 1.50             # USD charged per 1,000,000 completion (output) tokens
+  deepseek-v4-pro:
+    input_per_mtok: 0.80
+    output_per_mtok: 2.40
+  # The task-specialized presets above also use these models — add their real
+  # per-1M-token Ollama Cloud prices to get cost_usd on those requests:
+  # kimi-k2.7-code:          { input_per_mtok: 0.00, output_per_mtok: 0.00 }
+  # gemini-3-flash-preview:  { input_per_mtok: 0.00, output_per_mtok: 0.00 }
+  # "gpt-oss:120b":          { input_per_mtok: 0.00, output_per_mtok: 0.00 }   # quote keys containing ':'

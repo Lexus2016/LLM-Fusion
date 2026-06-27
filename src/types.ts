@@ -2,6 +2,26 @@ import { z } from "zod";
 import type { Logger } from "pino";
 import type { Config, ModelConfig } from "./config";
 import type { Resilience } from "./concurrency";
+import type { UsageAccumulator } from "./usage";
+
+// --- Usage accounting -----------------------------------------------------
+
+/** Normalized token usage for a SINGLE upstream call (zeros when absent). */
+export interface Usage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+/** Aggregated usage across ALL upstream calls one client request triggered. */
+export interface RequestUsage {
+  upstreamCalls: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  /** USD cost when pricing is configured for the involved model(s); null otherwise. */
+  costUsd: number | null;
+}
 
 /**
  * Shared types: OpenAI-compatible request/response/stream shapes, the upstream
@@ -38,14 +58,20 @@ export interface CapabilityProvider {
 
 export type FetchFn = typeof globalThis.fetch;
 
-/** Result of an upstream chat-completions call. */
+/** Result of an upstream chat-completions call, carrying its measured `Usage`. */
 export type ChatCompletionResult =
-  | { kind: "json"; status: number; data: unknown }
+  | { kind: "json"; status: number; data: unknown; usage: Usage }
   | {
       kind: "stream";
       status: number;
       body: ReadableStream<Uint8Array> | null;
       contentType: string | null;
+      /**
+       * Resolves with the usage parsed from the final SSE chunk once the stream
+       * drains (zeros if the upstream omitted it). The proxy sends
+       * `stream_options:{include_usage:true}` upstream to elicit that chunk.
+       */
+      usage: Promise<Usage>;
     };
 
 export interface UpstreamClient {
@@ -138,6 +164,12 @@ export interface RequestContext {
    * context; the server always supplies it.
    */
   resilience?: Resilience;
+  /**
+   * Per-request usage accumulator. Strategies record each upstream call into it;
+   * the server reads it to log + return the aggregate. Optional so bare unit
+   * contexts work without accounting; the server always supplies one.
+   */
+  usage?: UsageAccumulator;
 }
 
 export interface StrategyContext extends RequestContext {

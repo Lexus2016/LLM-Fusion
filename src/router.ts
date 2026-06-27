@@ -1,4 +1,4 @@
-import type { ModelConfig } from "./config";
+import type { ModelConfig, SimpleBlockConfig, FusionBlockConfig } from "./config";
 import type { RequestContext, StrategyContext } from "./types";
 import { FusionError, NotFoundError } from "./errors";
 import { singleStrategy } from "./strategies/single";
@@ -31,6 +31,7 @@ export async function dispatch(ctx: RequestContext): Promise<Response> {
     capabilities: ctx.capabilities,
     logger: ctx.logger,
     resilience: ctx.resilience,
+    usage: ctx.usage,
     modelConfig: entry,
   };
 
@@ -83,4 +84,55 @@ export function representativeMember(entry: ModelConfig): string | undefined {
       return exhaustive;
     }
   }
+}
+
+/**
+ * EVERY real upstream model a virtual model can route to. Used by `/v1/models`
+ * to report `context_window` as the MIN across members: a `fusion` request fans
+ * the prompt out to every panel member (plus judge + synth), so the usable
+ * context window of the merged virtual model is bounded by the SMALLEST member's,
+ * never the largest — advertising more would let a prompt overflow a panel model.
+ *
+ * `smart` aggregates its router plus the members of both its `simple` and
+ * `fusion` slots (inline blocks, or referenced single/fusion models resolved via
+ * `models`), since a request may route to either branch.
+ */
+export function entryMembers(
+  models: Record<string, ModelConfig>,
+  entry: ModelConfig,
+): string[] {
+  switch (entry.strategy) {
+    case "single":
+      return [entry.target];
+    case "failover":
+      return [...entry.chain];
+    case "fusion":
+      return [...entry.panel, entry.judge, entry.synth];
+    case "smart":
+      return [
+        entry.router,
+        ...smartSlotMembers(models, entry.simple),
+        ...smartSlotMembers(models, entry.fusion),
+      ];
+    default: {
+      const exhaustive: never = entry;
+      return exhaustive;
+    }
+  }
+}
+
+/** Real members of a `smart` slot — an inline block, or a resolved single/fusion ref. */
+function smartSlotMembers(
+  models: Record<string, ModelConfig>,
+  slot: SimpleBlockConfig | FusionBlockConfig | string,
+): string[] {
+  if (typeof slot === "string") {
+    const ref = models[slot];
+    if (!ref) return [];
+    if (ref.strategy === "single") return [ref.target];
+    if (ref.strategy === "fusion") return [...ref.panel, ref.judge, ref.synth];
+    return []; // failover/smart refs are rejected at config validation
+  }
+  if ("target" in slot) return [slot.target];
+  return [...slot.panel, slot.judge, slot.synth];
 }

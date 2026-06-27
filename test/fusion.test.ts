@@ -30,6 +30,13 @@ const config = parseConfig({
       fusion_planning_turn_only: true,
     },
     "fusion-vision": { strategy: "fusion", panel: ["vm1", "vm2"], judge: "j", synth: "vs" },
+    "fusion-no-promote": {
+      strategy: "fusion",
+      panel: ["m1", "m2", "m3"],
+      judge: "j",
+      synth: "s",
+      promote_reasoning_to_content: false,
+    },
   },
 });
 
@@ -124,6 +131,40 @@ function userContents(body: RecordedBody): string[] {
   for (const m of body.messages) {
     const parsed = MsgSchema.safeParse(m);
     if (parsed.success && parsed.data.role === "user") out.push(parsed.data.content);
+  }
+  return out;
+}
+
+/** Non-empty `delta.content` fragments, in order, from a client SSE transcript. */
+function streamedContents(text: string): string[] {
+  const ChunkSchema = z
+    .object({
+      choices: z
+        .array(
+          z
+            .object({ delta: z.object({ content: z.string().optional() }).passthrough().optional() })
+            .passthrough(),
+        )
+        .optional(),
+    })
+    .passthrough();
+  const out: string[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice("data:".length).trim();
+    if (payload.length === 0 || payload === "[DONE]") continue;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    const parsed = ChunkSchema.safeParse(raw);
+    if (!parsed.success) continue;
+    for (const choice of parsed.data.choices ?? []) {
+      const content = choice.delta?.content;
+      if (typeof content === "string" && content.length > 0) out.push(content);
+    }
   }
   return out;
 }
@@ -225,7 +266,7 @@ describe("fusion strategy — panel/judge/synth", () => {
     });
   });
 
-  it("passes valid judge JSON to synth as structured analysis", async () => {
+  it("gives synth the judge analysis AND the raw panel answers (no artifact loss on judge success)", async () => {
     const up = makeUpstream(defaultChat(true));
     const res = await fusionStrategy.execute(ctx(up.client, req()));
     expect(res.status).toBe(200);
@@ -233,6 +274,10 @@ describe("fusion strategy — panel/judge/synth", () => {
     const ctxText = systemContents(synthBody!).join("\n");
     expect(ctxText).toContain("JUDGE ANALYSIS");
     expect(ctxText).toContain("they agree");
+    // Judge SUCCESS must NOT discard the experts' actual content (code, formulas,
+    // exact text). The synth synthesizes from the artifacts, guided by the analysis.
+    expect(ctxText).toContain("ans-m1");
+    expect(ctxText).toContain("ans-m2");
   });
 
   it("falls back to raw panel answers when the judge returns invalid JSON", async () => {
@@ -336,5 +381,158 @@ describe("fusion strategy — vision gate", () => {
     expect(res.status).toBe(200);
     expect(up.modelsCalled()).toContain("vs"); // synth ran
     expect(up.modelsCalled()).toContain("vm1"); // vision panel ran
+  });
+});
+
+describe("fusion strategy — reasoning→content normalization", () => {
+  const validJudge = jsonResponse({
+    choices: [{ message: { content: JSON.stringify({ consensus: "ok" }) } }],
+  });
+
+  it("panel member answering in `reasoning` (empty content) still reaches the judge", async () => {
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return validJudge;
+      if (body.model === "s") return jsonResponse({ choices: [{ message: { content: "final" } }] });
+      if (body.model === "m2") {
+        // Thinking model: final answer lands in `reasoning`, content is empty.
+        return jsonResponse({ choices: [{ message: { content: "", reasoning: "REASONED-ANSWER-m2" } }] });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    expect(res.status).toBe(200);
+    const judgeBody = up.recorded.find((b) => b.model === "j");
+    expect(judgeBody).toBeDefined();
+    const judgeInput = userContents(judgeBody!).join("\n");
+    expect(judgeInput).toContain("REASONED-ANSWER-m2"); // reasoning text fed to the judge
+    expect(judgeInput).toContain("ans-m1"); // ordinary content member still present
+  });
+
+  it("synth non-stream: promotes reasoning into content when content empty and no tool calls (flag on)", async () => {
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return validJudge;
+      if (body.model === "s") {
+        return jsonResponse({ choices: [{ message: { content: "", reasoning: "SYNTH-REASONING" } }] });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    expect(res.status).toBe(200);
+    const payload = JSON.parse(await res.text());
+    expect(payload.choices[0].message.content).toBe("SYNTH-REASONING");
+  });
+
+  it("synth non-stream: leaves empty content untouched when promotion disabled per-model (flag off)", async () => {
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return validJudge;
+      if (body.model === "s") {
+        return jsonResponse({ choices: [{ message: { content: "", reasoning: "SYNTH-REASONING" } }] });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(
+      ctx(up.client, req({ model: "fusion-no-promote" }), "fusion-no-promote"),
+    );
+    expect(res.status).toBe(200);
+    const payload = JSON.parse(await res.text());
+    expect(payload.choices[0].message.content).toBe(""); // not promoted
+  });
+
+  it("synth non-stream: does NOT promote when tool_calls are present (flag on)", async () => {
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return validJudge;
+      if (body.model === "s") {
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                content: "",
+                reasoning: "should-not-surface",
+                tool_calls: [{ id: "c1", function: { name: "read_file", arguments: "{}" } }],
+              },
+            },
+          ],
+        });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ tools: TOOLS })));
+    expect(res.status).toBe(200);
+    const payload = JSON.parse(await res.text());
+    expect(payload.choices[0].message.content).toBe(""); // tool path: content stays empty
+    expect(payload.choices[0].message.tool_calls).toHaveLength(1);
+  });
+
+  it("synth stream: re-emits reasoning deltas as content until real content appears (flag on)", async () => {
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return validJudge;
+      if (body.model === "s") {
+        return sseResponse([
+          { choices: [{ delta: { reasoning: "thinking-1 " } }] },
+          { choices: [{ delta: { reasoning_content: "thinking-2 " } }] },
+          { choices: [{ delta: { content: "REAL-ANSWER" } }] },
+          // A reasoning fragment AFTER real content must NOT be promoted (latch).
+          { choices: [{ delta: { reasoning: "late-thought" } }] },
+          { choices: [{ delta: {}, finish_reason: "stop" }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true })));
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    const text = await res.text();
+    // Reasoning before real content surfaces as content; once real content lands,
+    // promotion stops — "late-thought" is NOT promoted into content.
+    expect(streamedContents(text)).toEqual(["thinking-1 ", "thinking-2 ", "REAL-ANSWER"]);
+    // The late reasoning passes through verbatim (proves the latch turned off).
+    expect(text).toContain("late-thought");
+    expect(text).toContain("[DONE]");
+  });
+
+  it("synth stream: a normal content stream passes through unchanged, not duplicated (flag on)", async () => {
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return validJudge;
+      if (body.model === "s") {
+        return sseResponse([
+          { choices: [{ delta: { content: "Hello " } }] },
+          { choices: [{ delta: { content: "world" } }] },
+          { choices: [{ delta: {}, finish_reason: "stop" }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true })));
+    const text = await res.text();
+    expect(streamedContents(text)).toEqual(["Hello ", "world"]);
+    // Each fragment appears exactly once — the transform added nothing.
+    expect(text.split("Hello ").length - 1).toBe(1);
+    expect(text.split("world").length - 1).toBe(1);
+  });
+
+  it("synth stream: a tool-call stream is left untouched (flag on)", async () => {
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return validJudge;
+      if (body.model === "s") {
+        return sseResponse([
+          {
+            choices: [
+              {
+                delta: {
+                  tool_calls: [{ index: 0, id: "call_1", function: { name: "read_file", arguments: "{}" } }],
+                },
+              },
+            ],
+          },
+          { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    expect(text).toContain("tool_calls"); // tool_calls deltas preserved
+    expect(text).toContain("read_file");
+    expect(text).toContain("finish_reason"); // finish_reason path preserved
+    expect(streamedContents(text)).toEqual([]); // nothing promoted into content
   });
 });
