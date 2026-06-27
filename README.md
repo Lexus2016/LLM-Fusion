@@ -1,8 +1,12 @@
 # llm-fusion — Fusion Proxy
 
-An OpenAI-compatible HTTP proxy in front of [Ollama Cloud](https://ollama.com) that turns one virtual model name into a **multi-model deliberation pipeline**. Point any OpenAI-compatible client (OpenCode, Continue, your own scripts) at it, ask for the model `fusion-coder`, and behind the scenes a panel of models answers, a judge cross-checks them, and a synthesizer writes the final answer — or, with `smart`, an LLM router decides per request whether that heavy treatment is even warranted. It is a small, single-process Node 24 + TypeScript + [Hono](https://hono.dev) service: no database, no build step (runs `.ts` directly via `tsx`), config in one YAML file.
+> **Self-hosted, OpenAI-compatible deliberation proxy for Ollama Cloud.**  
+> One virtual model name runs a panel of models, a judge, and a synthesizer — or a smart router that decides per request whether that heavy treatment is even worth it.
 
-Three **task-specialized** presets ship ready to use — `fusion-coder`, `fusion-researcher`, `fusion-agents` — each assembled from an empirical model shoot-out (jump to [Which model do I use?](#which-model-do-i-use)).
+If you know **OpenRouter Fusion**, you already get the idea: *many models think, one answers*.  
+**llm-fusion is the same pattern, rebuilt for developers who want control, transparency, and agent-loop safety.** It runs locally, routes to Ollama Cloud, and adds the `smart` strategy that OpenRouter leaves to the caller.
+
+No database. No build step. Node 24 + TypeScript + Hono, runs `.ts` directly via `tsx`. One YAML config.
 
 ---
 
@@ -14,13 +18,46 @@ printf 'OLLAMA_API_KEY=ollama-your-key\n' > .env    # your Ollama Cloud key
 npm start                                          # proxy on http://127.0.0.1:8080
 ```
 
-Then point any OpenAI-compatible client at `http://127.0.0.1:8080/v1` and ask for a model by name — or launch OpenCode in a single command:
+Then point any OpenAI-compatible client at `http://127.0.0.1:8080/v1` and ask for a model by name — or launch OpenCode in one command:
 
 ```bash
-./bin/fusion-opencode fusion-coder                 # starts the proxy if needed, wires OpenCode, opens the TUI
+./bin/fusion-opencode fusion-coder                # starts proxy if needed, wires OpenCode, opens TUI
 ```
 
 New here? Read **[Which model do I use?](#which-model-do-i-use)** next.
+
+---
+
+## Why llm-fusion instead of OpenRouter Fusion?
+
+Both run a prompt through a panel of models plus a judge/synth step to produce a stronger answer. The difference is **where, when, and how** that pipeline runs.
+
+| | **llm-fusion** | **OpenRouter Fusion** |
+|---|---|---|
+| **Hosting & control** | Runs on your machine / Docker. Single-tenant, inspectable, one config file. | Fully managed SaaS on OpenRouter. |
+| **Bill** | Pay Ollama Cloud directly. | Pay OpenRouter; usage is bundled. |
+| **Provider scope** | Ollama Cloud only (one bill, one upstream). | Any provider on OpenRouter (broader model catalog). |
+| **Automatic routing** | Built-in `smart` strategy: a fast LLM router picks `single` (cheap) vs `fusion` (deep) **per request**. | Fusion always runs the full panel; routing is manual or a separate router. |
+| **Agent-loop safety** | Emits **exactly one `tool_calls`** per step; panel never touches real tools in `deliberate` mode. | Plugin returns analysis; the calling model decides final tool use. |
+| **Cost knob for long runs** | `fusion_planning_turn_only`: full panel on the planning turn, then synth-only (5 calls → 1) for mechanical mid-loop steps. | No per-request auto-downgrade inside a loop. |
+| **Web grounding** | Not built in (panel/judge see only your prompt/context). | Built-in `web_search` + `web_fetch` for panel and judge. |
+| **Resilience** | `failover` chains + graceful degradation + `max_concurrency` cap. | Managed reliability + recursion protection. |
+| **Config style** | Single hot-reloaded YAML with empirically tuned presets. | Plugin JSON / server tool / model slug; presets + web UI. |
+
+**Use llm-fusion when:**
+
+- You run an autonomous agent for **hundreds of steps** and need deterministic, exactly-once side effects.
+- You want routine steps to cost **1 upstream call**, with fusion reserved for hard or error-recovery steps.
+- You prefer a **local, transparent process** with one config file and no extra vendor lock-in.
+- Your models and budget live on **Ollama Cloud**.
+
+**Use OpenRouter Fusion when:**
+
+- You need **web-grounded research** across frontier models from many providers.
+- You want a **managed service** with a web playground and global infrastructure.
+- You are doing one-off deep research, not long agent loops.
+
+**Bottom line:** OpenRouter Fusion optimizes for single-answer ceiling on research tasks. **llm-fusion optimizes for running inside an agent loop** — controlling cost, preventing duplicate tool calls, and keeping the heavy deliberation where it actually pays off.
 
 ---
 
@@ -36,7 +73,7 @@ Three **task-specialized** presets ship in `fusion.yaml`, each assembled from an
 
 Two rules came straight out of the data:
 
-- **Coding uses fusion, not a single model.** Architecture and planning genuinely benefit from multiple viewpoints. (A code *audit* — pure enumeration — is the one coding-shaped task a single model wins, and it is not representative of programming.)
+- **Coding uses fusion, not a single model.** Architecture and planning genuinely benefit from multiple viewpoints. (A pure code *audit* — just enumerating issues — is the one coding-shaped task a single model wins, and it is not representative of programming.)
 - **Panels mix model lineages on purpose.** `glm`/`kimi`/`deepseek`/`minimax`/`qwen` are all Chinese labs and share blind spots; every panel adds a Western decorrelator (`gemini` = Google, `gpt-oss` = OpenAI) so panel errors are less correlated — that is the whole point of a panel.
 
 The original generic presets (`fusion-1`, `smart-1`, `fast-glm` / `fast-kimi` / `fast-deepseek`) still ship for ad-hoc use.
@@ -68,18 +105,25 @@ A request to `POST /v1/chat/completions` carries a **virtual model name**. The p
 
 ## The honest cost note (read this)
 
-Fusion runs on **every** step. An agent loop (read → think → edit → run tests → re-read …) multiplies upstream **model API calls**:
+Full fusion runs on **every** step. An agent loop (read → think → edit → run tests → re-read …) multiplies upstream **model API calls**:
 
 ```
 upstream_calls_per_step = N_panel + 1 (judge) + 1 (synth) = 3 + 1 + 1 = 5
 ```
 
-A typical coding task of **15–25 steps** therefore issues roughly **75–125 upstream model calls**.
+A typical coding task of **15–25 steps** therefore issues roughly **75–125 upstream model calls** if fusion is always on.
 
 - **Tool executions do NOT multiply** — the tools run once per step (only the synth emits the canonical `tool_calls`). Your agent's actions are unaffected.
 - **Model API calls DO multiply** — by the panel + judge + synth factor. That is the cost, and it is accepted for v1.
 
-**Mitigation (shipped, not deferred): the `smart` strategy.** Point your agent at a `smart` model and routine steps (`read_file`, `grep`, …) take the cheap `single` path (1 call), while genuinely hard steps still get full fusion. Other levers baked in: a small default panel (3), a global `max_concurrency` cap (4), tight judge/panel timeouts (60 s / 90 s, both under the ~182 s upstream ceiling), and the `fusion_planning_turn_only` knob (run fusion only on the planning turn, degrade to synth-only — 5 calls → 1 — once the conversation already has tool messages).
+**Mitigation (shipped, not deferred): the `smart` strategy.** Point your agent at `fusion-agents` and routine steps (`read_file`, `grep`, …) take the cheap `single` path (1 call), while genuinely hard steps still get full fusion. Other levers baked in:
+
+- small default panel (3),
+- global `max_concurrency` cap (4),
+- tight judge/panel timeouts (60 s / 90 s, both under the ~182 s upstream ceiling),
+- `fusion_planning_turn_only` knob (run fusion only on the planning turn, degrade to synth-only — 5 calls → 1 — once the conversation already has tool messages).
+
+That is how llm-fusion keeps long agent loops affordable without sacrificing deliberation where it matters.
 
 ---
 
@@ -313,3 +357,4 @@ The unit/integration suite uses a mock upstream (intercepted `fetch`); it covers
 - **No round-robin, no semantic cache, no context-size routing** yet — these are Phase 6 / future.
 - **Loopback only.** Binds `127.0.0.1` by default, no TLS, single-tenant (optional shared client token, not per-user auth). Not built for multi-tenant exposure.
 - **Failover + streaming**: the chain can advance only *before* the first token; a mid-stream upstream failure surfaces as a stream error (cannot silently re-roll a partially sent response).
+- **Web grounding is not built in.** If your task needs live web search inside the panel/judge, OpenRouter Fusion has that today; llm-fusion relies on the context you provide.
