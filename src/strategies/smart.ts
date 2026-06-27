@@ -322,22 +322,103 @@ function extractContent(data: unknown): string | null {
     : null;
 }
 
-/** Render the incoming conversation into a compact transcript for the classifier. */
+/**
+ * Per-message content caps for the router transcript. The router classifies the
+ * NEXT action from message ROLES and recent gist — it does not need a giant file
+ * dump verbatim. Head+tail keeps both the opening (what kind of content this is)
+ * and the closing (where a trailing "=== 3 failed ===" / error summary lives).
+ */
+const ROUTER_MSG_HEAD = 1200;
+const ROUTER_MSG_TAIL = 600;
+/**
+ * How many of the most-recent messages the router sees. The next-action signal
+ * lives in the latest tool result + the assistant turn that produced it; older
+ * history is represented by the first user instruction (the overall intent).
+ */
+const ROUTER_RECENT_WINDOW = 6;
+
+/** A message's text, truncated head+tail with an omission marker when oversized. */
+function capMessageText(text: string): string {
+  const max = ROUTER_MSG_HEAD + ROUTER_MSG_TAIL;
+  if (text.length <= max) return text;
+  const omitted = text.length - max;
+  return `${text.slice(0, ROUTER_MSG_HEAD)}\n…[${omitted} chars omitted]…\n${text.slice(-ROUTER_MSG_TAIL)}`;
+}
+
+/** One `role: <capped text>` transcript line for a message. */
+function routerMessageLine(m: ChatMessage): string {
+  const role = typeof m.role === "string" ? m.role : "user";
+  const content = m.content;
+  let text: string;
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    text = "[multimodal content]";
+  } else {
+    text = "";
+  }
+  return `${role}: ${capMessageText(text)}`;
+}
+
+/**
+ * Render a COMPACT routing view of the conversation. A naive full transcript
+ * makes the router a full-context call: on a ~350k-token agent loop the router
+ * (which must ingest the whole prompt just to emit one JSON line) measured ~57s
+ * and intermittently hit the 120s upstream timeout, then silently fell back to
+ * the default route — exactly when the agent needed a real decision. The router
+ * only classifies the NEXT action, so it needs the agent's role (system), the
+ * original task (first message), the ACTIVE instruction (most recent user
+ * message), and the recent state (last few messages) — NOT the entire history.
+ * This bounds router latency and cost to a small constant regardless of how
+ * large the conversation grows; each message is content-capped so a single huge
+ * tool result cannot blow up the router prompt either.
+ *
+ * The active-instruction anchor matters because OpenCode sessions issue NEW
+ * sub-tasks mid-conversation: after more than `ROUTER_RECENT_WINDOW` mechanical
+ * tool turns (grep / read / list) the substantive instruction would fall out of
+ * the recent window, and the router — seeing only an obsolete first task plus
+ * recent file reads — would misroute the real coding step to `simple`. That is
+ * the very failure this strategy exists to prevent, so the latest user message
+ * is always kept even when it predates the window.
+ */
 function renderRequestForRouter(request: ChatCompletionRequest): string {
   const messages: ChatMessage[] = Array.isArray(request.messages) ? request.messages : [];
-  const lines: string[] = [];
+  const system: ChatMessage[] = [];
+  const nonSystem: ChatMessage[] = [];
   for (const m of messages) {
-    const role = typeof m.role === "string" ? m.role : "user";
-    const content = m.content;
-    let text: string;
-    if (typeof content === "string") {
-      text = content;
-    } else if (Array.isArray(content)) {
-      text = "[multimodal content]";
-    } else {
-      text = "";
+    if (m.role === "system") system.push(m);
+    else nonSystem.push(m);
+  }
+
+  const lines: string[] = system.map(routerMessageLine);
+
+  if (nonSystem.length <= ROUTER_RECENT_WINDOW + 1) {
+    for (const m of nonSystem) lines.push(routerMessageLine(m));
+    return `Classify the route for the following request:\n\n${lines.join("\n")}`;
+  }
+
+  // Build the set of indices to keep, then render them in order with an omission
+  // marker spanning each gap (so the middle is summarized, never silently dropped).
+  const keep = new Set<number>();
+  keep.add(0); // first message — original session framing
+  const recentStart = nonSystem.length - ROUTER_RECENT_WINDOW;
+  for (let i = recentStart; i < nonSystem.length; i++) keep.add(i); // recent window
+  for (let i = recentStart - 1; i > 0; i--) {
+    if (nonSystem[i]?.role === "user") {
+      keep.add(i); // most recent user instruction that predates the window
+      break;
     }
-    lines.push(`${role}: ${text}`);
+  }
+
+  let prev = -1;
+  for (const i of [...keep].sort((a, b) => a - b)) {
+    const gap = i - prev - 1;
+    if (prev >= 0 && gap > 0) {
+      lines.push(`…[${gap} earlier message${gap === 1 ? "" : "s"} omitted]…`);
+    }
+    const m = nonSystem[i];
+    if (m) lines.push(routerMessageLine(m));
+    prev = i;
   }
   return `Classify the route for the following request:\n\n${lines.join("\n")}`;
 }

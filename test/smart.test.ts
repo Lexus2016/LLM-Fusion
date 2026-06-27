@@ -434,6 +434,68 @@ describe("smart strategy", () => {
     const simpleBody = up.recorded.find((b) => b.model === "deepseek");
     expect(simpleBody?.stream).toBe(true);
   });
+
+  it("router prompt stays bounded on a huge conversation (system + first task + recent window)", async () => {
+    // A multi-day agent loop can carry a ~350k-token history. The router must NOT
+    // ingest all of it — that full-context call measured ~57s live and intermittently
+    // hit the 120s upstream timeout, silently dropping to the default route. It now
+    // sees a compact view: the system role, the original task, and the recent turns.
+    const huge = "X".repeat(40_000); // file-dump-sized messages
+    const messages: ChatCompletionRequest["messages"] = [
+      { role: "system", content: "You are a coding agent. SYSTEM_MARKER" },
+      { role: "user", content: "ORIGINAL_TASK_MARKER: refactor the auth module" },
+    ];
+    for (let i = 0; i < 20; i++) {
+      messages.push({ role: "assistant", content: `step ${i} ${huge}` });
+      messages.push({ role: "tool", content: `output ${i} ${huge}` });
+    }
+    messages.push({ role: "tool", content: "LATEST_MARKER: the next step reads a file" });
+    const rawTotal = messages.reduce((n, m) => n + String(m.content).length, 0);
+
+    const up = makeUpstream(chatWith(routeFusion));
+    const res = await smartStrategy.execute(ctx(up.client, { model: "smart-inline", messages }, "smart-inline"));
+    expect(res.status).toBe(200);
+
+    const routerBodies = up.routerBodies();
+    expect(routerBodies).toHaveLength(1);
+    const userMsg = z.object({ content: z.string() }).parse((routerBodies[0]?.messages ?? [])[1]);
+    const transcript = userMsg.content;
+
+    // Bounded: the router prompt is a small constant, NOT the ~1.6M-char history.
+    expect(rawTotal).toBeGreaterThan(800_000);
+    expect(transcript.length).toBeLessThan(50_000);
+    // Still carries every signal the router actually needs to classify the next action.
+    expect(transcript).toContain("SYSTEM_MARKER"); // agent role
+    expect(transcript).toContain("ORIGINAL_TASK_MARKER"); // overall intent (first user message)
+    expect(transcript).toContain("LATEST_MARKER"); // recent state (latest message)
+    expect(transcript).toContain("earlier messages omitted"); // the middle is summarized, not dropped silently
+  });
+
+  it("keeps the active user instruction even when it predates the recent window", async () => {
+    // Multi-day session: an OLD task first, then a NEW sub-task, then more than
+    // ROUTER_RECENT_WINDOW mechanical tool turns. The new instruction must still
+    // reach the router — otherwise the substantive coding step that follows gets
+    // misrouted to `simple` (the exact failure this strategy exists to prevent).
+    const huge = "X".repeat(20_000);
+    const messages: ChatCompletionRequest["messages"] = [
+      { role: "system", content: "coding agent" },
+      { role: "user", content: "OLD_TASK: set up the repo" },
+      { role: "assistant", content: "repo ready" },
+      { role: "user", content: "ACTIVE_TASK: refactor the auth module to support JWT" },
+    ];
+    for (let i = 0; i < 10; i++) {
+      messages.push({ role: "assistant", content: `grep step ${i}` });
+      messages.push({ role: "tool", content: `file ${i} ${huge}` });
+    }
+
+    const up = makeUpstream(chatWith(routeFusion));
+    const res = await smartStrategy.execute(ctx(up.client, { model: "smart-inline", messages }, "smart-inline"));
+    expect(res.status).toBe(200);
+
+    const userMsg = z.object({ content: z.string() }).parse((up.routerBodies()[0]?.messages ?? [])[1]);
+    expect(userMsg.content).toContain("ACTIVE_TASK"); // survived 20 mechanical turns of truncation
+    expect(userMsg.content).toContain("OLD_TASK"); // first-message framing kept too
+  });
 });
 
 describe("smart config validation", () => {
