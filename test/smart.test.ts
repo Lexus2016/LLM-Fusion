@@ -223,6 +223,21 @@ describe("smart strategy", () => {
     expect(called).not.toContain("deepseek"); // did NOT silently fall back to the simple default
   });
 
+  it("parses a router decision wrapped in ```json fences (no false default fallback)", async () => {
+    const routeFusionFenced = (): Response =>
+      jsonResponse({
+        choices: [
+          { message: { content: "```json\n" + JSON.stringify({ route: "fusion", reason: "hard" }) + "\n```" } },
+        ],
+      });
+    const up = makeUpstream(chatWith(routeFusionFenced));
+    const res = await smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+    expect(res.status).toBe(200);
+    const called = up.modelsCalled();
+    for (const m of PANEL) expect(called).toContain(m); // fence stripped -> fusion route honored
+    expect(called).not.toContain("deepseek");
+  });
+
   it("escalate_on_tool_error=false defers to the router even on a failing tool result", async () => {
     const up = makeUpstream(chatWith(routeSimple));
     const res = await smartStrategy.execute(

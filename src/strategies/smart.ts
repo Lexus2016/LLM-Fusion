@@ -19,6 +19,7 @@ import {
 import { singleStrategy } from "./single";
 import { fusionStrategy } from "./fusion";
 import { assertSingleVisionCapable } from "../vision";
+import { extractJsonObject } from "../json";
 
 /**
  * `smart` strategy — a classifier/router in front of two sub-routes (spec §5.8,
@@ -271,9 +272,13 @@ function resolveFusion(ctx: StrategyContext, cfg: SmartModelConfig): FusionModel
 /** Parse the router content as a route decision; null on any failure. */
 function parseRouteDecision(content: string | null): RouteDecision | null {
   if (content === null) return null;
+  // Same fence/prose-tolerance as the judge: extract the balanced JSON object so a
+  // ```json fence does not push a valid decision onto the default route.
+  const jsonText = extractJsonObject(content);
+  if (jsonText === null) return null;
   let raw: unknown;
   try {
-    raw = JSON.parse(content);
+    raw = JSON.parse(jsonText);
   } catch {
     return null;
   }

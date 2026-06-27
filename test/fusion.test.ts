@@ -315,6 +315,18 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(ctxText).toContain("ans-m2");
   });
 
+  it("gives the judge the original user request, not just the panel answers (2a)", async () => {
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(
+      ctx(up.client, req({ messages: [{ role: "user", content: "CAPITAL-OF-FRANCE-MARKER" }] })),
+    );
+    expect(res.status).toBe(200);
+    const judgeBody = up.recorded.find((b) => b.model === "j");
+    const judgeUser = userContents(judgeBody!).join("\n");
+    expect(judgeUser).toContain("CAPITAL-OF-FRANCE-MARKER"); // judge can see what was asked
+    expect(judgeUser).toContain("EXPERT ANSWERS"); // ...alongside the panel answers
+  });
+
   it("falls back to raw panel answers when the judge returns invalid JSON", async () => {
     const up = makeUpstream(defaultChat(false)); // judge emits non-JSON
     const res = await fusionStrategy.execute(ctx(up.client, req()));
@@ -323,6 +335,25 @@ describe("fusion strategy — panel/judge/synth", () => {
     const ctxText = systemContents(synthBody!).join("\n");
     expect(ctxText).not.toContain("JUDGE ANALYSIS");
     expect(ctxText).toContain("ans-m1"); // synth got the raw panel answers
+  });
+
+  it("parses a judge response wrapped in ```json fences (no false raw-panel fallback)", async () => {
+    const analysis = { consensus: "they agree", disagreements: [], unique_insights: [], blind_spots: [] };
+    const up = makeUpstream((body) => {
+      if (body.model === "j") {
+        // Thinking models intermittently wrap JSON in fences despite json_object.
+        return jsonResponse({
+          choices: [{ message: { content: "```json\n" + JSON.stringify(analysis) + "\n```" } }],
+        });
+      }
+      return defaultChat()(body);
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    expect(res.status).toBe(200);
+    const synthBody = up.recorded.find((b) => b.model === "s");
+    const ctxText = systemContents(synthBody!).join("\n");
+    expect(ctxText).toContain("JUDGE ANALYSIS"); // fence stripped -> analysis used
+    expect(ctxText).toContain("they agree");
   });
 
   it("streams synth SSE to the client when stream:true; returns JSON otherwise", async () => {

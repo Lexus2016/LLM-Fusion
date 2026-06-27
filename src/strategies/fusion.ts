@@ -2,6 +2,7 @@ import { z } from "zod";
 import type {
   ChatCompletionRequest,
   ChatCompletionResult,
+  ChatMessage,
   Strategy,
   StrategyContext,
   UpstreamClient,
@@ -18,6 +19,7 @@ import {
   UpstreamTimeoutError,
 } from "../errors";
 import { openAiBodyToNativeChat, requestHasImages } from "../vision";
+import { extractJsonObject } from "../json";
 import {
   failureKindForError,
   failureKindForStatus,
@@ -512,10 +514,12 @@ function buildPanelBody(
 // --- Judge stage -----------------------------------------------------------
 
 const JUDGE_SYSTEM_PROMPT =
-  "You are an impartial judge. You are given several independent expert answers to the same user request. " +
-  "Analyze them and respond with ONLY a JSON object with these keys: " +
-  '"consensus" (where the experts agree), "disagreements" (where they differ), ' +
-  '"unique_insights" (points raised by only one expert), and "blind_spots" (gaps none of them addressed). ' +
+  "You are an impartial judge. You are given the user's ORIGINAL REQUEST followed by several independent " +
+  "expert answers to it. Assess the answers AGAINST THE REQUEST and respond with ONLY a JSON object with these keys: " +
+  '"consensus" (where the experts agree), "disagreements" (where they conflict — and, where the request makes it ' +
+  'determinable, which side is correct and why), "unique_insights" (correct, useful points raised by only one expert), ' +
+  'and "blind_spots" (anything the request needs that none of them addressed). ' +
+  "Judge factual correctness and how well each answer actually serves the request; do not reward verbosity. " +
   "Each value may be a string or an array of strings. Output JSON only — no prose, no code fences.";
 
 async function runJudge(
@@ -538,7 +542,14 @@ async function runJudge(
     stream: false,
     messages: [
       { role: "system", content: JUDGE_SYSTEM_PROMPT },
-      { role: "user", content: renderPanelForJudge(panelAnswers) },
+      {
+        role: "user",
+        content:
+          "ORIGINAL USER REQUEST:\n" +
+          renderRequestForJudge(ctx.request) +
+          "\n\nEXPERT ANSWERS:\n" +
+          renderPanelForJudge(panelAnswers),
+      },
     ],
   };
   const timeoutMs = defaults.judge_timeout_s * 1000;
@@ -600,9 +611,14 @@ async function runJudge(
 
 function parseJudgeAnalysis(content: string | null): JudgeAnalysis | null {
   if (content === null) return null;
+  // Models wrap their JSON in ```json fences or surrounding prose intermittently
+  // (even with response_format: json_object) — extract the balanced object first
+  // so one stray fence does not waste the whole judge stage.
+  const jsonText = extractJsonObject(content);
+  if (jsonText === null) return null;
   let raw: unknown;
   try {
-    raw = JSON.parse(content);
+    raw = JSON.parse(jsonText);
   } catch {
     return null;
   }
@@ -734,6 +750,25 @@ function renderPanelForJudge(panelAnswers: PanelAnswer[]): string {
   return panelAnswers
     .map((a, i) => `--- Expert ${i + 1} (${a.member}) ---\n${a.content}`)
     .join("\n\n");
+}
+
+/**
+ * Render the user's instruction for the judge: the `user`/`system` messages only.
+ * The judge needs to know WHAT WAS ASKED to adjudicate factual conflicts, but the
+ * assistant/tool history is what the panel already digested into its answers, so
+ * re-sending it would just bloat the judge call (often the bulk of a large context).
+ */
+function renderRequestForJudge(request: ChatCompletionRequest): string {
+  const messages: ChatMessage[] = Array.isArray(request.messages) ? request.messages : [];
+  const lines: string[] = [];
+  for (const m of messages) {
+    const role = typeof m.role === "string" ? m.role : "user";
+    if (role !== "user" && role !== "system") continue;
+    const text =
+      typeof m.content === "string" ? m.content : Array.isArray(m.content) ? "[multimodal content]" : "";
+    if (text.length > 0) lines.push(`${role}: ${text}`);
+  }
+  return lines.join("\n");
 }
 
 // --- Shared helpers --------------------------------------------------------

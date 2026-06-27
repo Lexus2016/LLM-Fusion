@@ -216,4 +216,48 @@ describe("server", () => {
     await new Promise((resolve) => setTimeout(resolve, 10)); // let the pipeTo rejection settle the log
     expect(lines.find((l) => l.msg === "request usage")).toBeDefined();
   });
+
+  it("fused stream preserves chunk order: promoted content, then usage, then [DONE] (5b)", async () => {
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: async (input, init) => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.endsWith("/api/show")) return jsonResponse({ capabilities: ["completion"], model_info: {} });
+        const body = JSON.parse(String(init?.body));
+        if (body.stream === true) {
+          // synth streams reasoning-only deltas -> the promotion transform turns them into content
+          return sseResponse([
+            { choices: [{ delta: { reasoning: "alpha " } }] },
+            { choices: [{ delta: { reasoning: "beta" } }] },
+          ]);
+        }
+        if (body.response_format) {
+          return jsonResponse({ choices: [{ message: { content: JSON.stringify({ consensus: "ok" }) } }] });
+        }
+        return jsonResponse({ choices: [{ message: { content: "panel-ans" } }] });
+      },
+    });
+    const capabilities = new CapabilityService({ client, getOverrides: () => config.overrides, logger });
+    const app = createApp({ getConfig: () => config, client, capabilities, getAuthToken: () => undefined, logger });
+    const res = await app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "fusion-1", stream: true, messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    const text = await res.text();
+    // reasoning was promoted to content (both transforms ran)
+    expect(text).toContain('"content":"alpha "');
+    expect(text).toContain('"content":"beta"');
+    // ordering invariant: all content -> the single usage chunk -> [DONE]
+    const idxContent = text.lastIndexOf('"content":"beta"');
+    const idxUsage = text.indexOf("fusion-usage");
+    const idxDone = text.indexOf("[DONE]");
+    expect(idxUsage).toBeGreaterThan(idxContent);
+    expect(idxDone).toBeGreaterThan(idxUsage);
+    expect(text.match(/\[DONE\]/g)?.length).toBe(1); // exactly one terminator
+    expect(text.match(/fusion-usage/g)?.length).toBe(1); // exactly one usage chunk
+  });
 });

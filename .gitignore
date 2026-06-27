@@ -6,3 +6,4 @@ dist
 research-test/
 docs/superpowers/specs/
 AUDIT*
+.serena/
