@@ -74,7 +74,9 @@ models:
 
   fusion-coder:                       # programming / planning / audit — fusion (multiple viewpoints)
     strategy: fusion
-    panel: [glm-5.2, kimi-k2.7-code, gemini-3-flash-preview]  # GLM + Moonshot + Google (Western decorrelator)
+    panel: [glm-5.2, kimi-k2.7-code, gpt-oss:120b]  # GLM + Moonshot + OpenAI-OSS (Western decorrelator).
+                                                    # NOT gemini here: a Gemini panel member 400s ("thought_signature")
+                                                    # on tool-call history from other models and is dropped silently.
     judge: glm-5.2                    # most reliable structured-JSON of the field -> fewer judge-parse failures
     synth: kimi-k2.7-code             # most complete, compilable code generator in the shoot-out
     tool_mode: deliberate

@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { watch } from "node:fs";
 import type { FSWatcher } from "node:fs";
+import { dirname, basename } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { Logger } from "pino";
 import { z } from "zod";
@@ -247,13 +248,31 @@ export async function createConfigManager(path: string, logger: Logger): Promise
     }
   }
 
-  const watcher: FSWatcher = watch(path, { persistent: false }, () => {
-    // Debounce: editors often emit several events for one save.
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => {
-      void reload();
-    }, 120);
-  });
+  // Watch the containing DIRECTORY, not the file. An atomic save (write-temp +
+  // rename over the path, which most editors and our own file tooling do) replaces
+  // the file's inode; a file-level `fs.watch` then goes deaf on some platforms
+  // (notably macOS, where it kqueues the inode), so hot-reload fires only once per
+  // process and every later edit is silently missed. A directory watch survives the
+  // replace (the directory inode is stable); we filter events down to our file.
+  const dir = dirname(path);
+  const base = basename(path);
+  let watcher: FSWatcher | undefined;
+  try {
+    watcher = watch(dir, { persistent: false }, (_event, filename) => {
+      // `filename` can be null on some platforms; when present, ignore siblings.
+      if (filename !== null && filename !== base) return;
+      // Debounce: a single save emits several events.
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        void reload();
+      }, 120);
+    });
+  } catch (err) {
+    logger.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      "config watch failed to arm; hot-reload disabled",
+    );
+  }
 
   return {
     get config() {
@@ -264,7 +283,11 @@ export async function createConfigManager(path: string, logger: Logger): Promise
     },
     close() {
       if (timer) clearTimeout(timer);
-      watcher.close();
+      try {
+        watcher?.close();
+      } catch {
+        /* already closed */
+      }
     },
   };
 }

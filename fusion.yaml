@@ -66,10 +66,15 @@ models:
   # fusion-coder — programming, planning, audit. Fusion = multiple viewpoints
   #   (coding/architecture decisions genuinely benefit from diverse takes).
   #   P1: glm-5.2 14 (best JS-concurrency reasoning) | kimi 13 (most complete
-  #   impl) | gemini-3-flash 12 (fast, Western lineage decorrelates the panel).
+  #   impl) | gpt-oss:120b (OpenAI lineage — Western decorrelator). gemini-3-flash
+  #   was the original 3rd member, but it returns 400 "Function call is missing a
+  #   thought_signature in functionCall parts" on every panel request carrying
+  #   tool-call history from other models (i.e. every agent-loop step), and the
+  #   panel drops it SILENTLY (extractAnswer -> null) — so fusion-coder ran at 2/3.
+  #   gpt-oss handles foreign tool-call history cleanly (verified 3/3 panel-shaped).
   fusion-coder:
     strategy: fusion
-    panel: [glm-5.2, kimi-k2.7-code, gemini-3-flash-preview]
+    panel: [glm-5.2, kimi-k2.7-code, gpt-oss:120b]
     judge: glm-5.2                    # most reliable structured-JSON (router shoot-out) -> fewer judge-parse failures
     synth: kimi-k2.7-code             # coding specialist; produced the most complete, compilable implementation
     tool_mode: deliberate

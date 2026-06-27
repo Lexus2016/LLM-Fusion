@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { parseConfig } from "../src/config";
+import { parseConfig, createConfigManager } from "../src/config";
+import { createLogger } from "../src/logging";
+import { mkdtempSync, writeFileSync, renameSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const minimal = {
   upstream: { base_url: "https://ollama.com", api_key_env: "OLLAMA_API_KEY" },
@@ -83,4 +87,54 @@ describe("config", () => {
       }),
     ).toThrow();
   });
+});
+
+describe("config hot-reload", () => {
+  const yaml = (target: string) =>
+    `upstream:\n  base_url: https://ollama.com\n  api_key_env: OLLAMA_API_KEY\n` +
+    `models:\n  fast:\n    strategy: single\n    target: ${target}\n`;
+
+  function writeAtomic(path: string, content: string): void {
+    // write-temp + rename = atomic replace; this is exactly what detaches a naive
+    // single-shot fs.watch from the new inode.
+    const tmp = `${path}.tmp`;
+    writeFileSync(tmp, content);
+    renameSync(tmp, path);
+  }
+
+  async function waitFor(pred: () => boolean, timeoutMs: number): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (pred()) return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    throw new Error("waitFor timed out");
+  }
+
+  it("survives repeated atomic saves — the watcher re-arms (fires more than once)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "llm-fusion-cfg-"));
+    const path = join(dir, "fusion.yaml");
+    writeFileSync(path, yaml("glm-5.2"));
+    const mgr = await createConfigManager(path, createLogger({ level: "silent" }));
+    let reloads = 0;
+    mgr.onReload(() => {
+      reloads++;
+    });
+    try {
+      // Two SEPARATE atomic saves. With the old single-shot fs.watch the FIRST
+      // rename detached the watcher from the new inode, so the SECOND save was
+      // silently missed and `reloads` stalled at 1 — the exact bug this guards.
+      writeAtomic(path, yaml("kimi-k2.7-code"));
+      await waitFor(() => reloads >= 1, 8000);
+      writeAtomic(path, yaml("deepseek-v4-pro"));
+      await waitFor(() => reloads >= 2, 8000);
+
+      expect(reloads).toBeGreaterThanOrEqual(2);
+      const m = mgr.config.models["fast"];
+      expect(m && m.strategy === "single" ? m.target : null).toBe("deepseek-v4-pro");
+    } finally {
+      mgr.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 25000);
 });

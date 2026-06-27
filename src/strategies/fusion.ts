@@ -489,13 +489,47 @@ async function callPanelMember(
         status: result.status,
         latencyMs: Date.now() - startedAt,
       });
+    } else {
+      // A 4xx used to drop the member SILENTLY — e.g. a Gemini panel member
+      // returning 400 "missing a thought_signature" on foreign tool-call history,
+      // which surfaced only as an unexplained 2/3 panel. Always log it.
+      ctx.logger.warn(
+        {
+          stage: "panel",
+          model: member,
+          status: result.status,
+          latencyMs: Date.now() - startedAt,
+          reason: shortErrorReason(result.data),
+        },
+        "fusion: panel member dropped (client error response)",
+      );
     }
     return null;
   }
   resilience.breaker.recordSuccess(member);
   const content = extractAnswer(result.data);
-  if (content === null) return null;
+  if (content === null) {
+    // 200 but no usable text (empty content AND empty reasoning, or an unparseable
+    // shape). Previously a silent drop; log it so a thin panel is never a mystery.
+    ctx.logger.warn(
+      { stage: "panel", model: member, latencyMs: Date.now() - startedAt },
+      "fusion: panel member returned no usable content (dropped)",
+    );
+    return null;
+  }
   return { member, content };
+}
+
+/** Best-effort short error string from an upstream error body, for logging only. */
+const UpstreamErrorBodySchema = z
+  .object({ error: z.union([z.string(), z.object({ message: z.string() }).passthrough()]) })
+  .passthrough();
+function shortErrorReason(data: unknown): string | undefined {
+  const parsed = UpstreamErrorBodySchema.safeParse(data);
+  if (!parsed.success) return undefined;
+  const e = parsed.data.error;
+  const msg = typeof e === "string" ? e : e.message;
+  return msg.length > 160 ? `${msg.slice(0, 160)}…` : msg;
 }
 
 function buildPanelBody(
