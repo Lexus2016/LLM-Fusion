@@ -1,6 +1,6 @@
 # llm-fusion — Fusion Proxy
 
-> **Self-hosted, OpenAI-compatible deliberation proxy for Ollama Cloud.**  
+> **Self-hosted, OpenAI-compatible and Anthropic Messages API deliberation proxy for Ollama Cloud.**  
 > One virtual model name runs a panel of models, a judge, and a synthesizer — or a smart router that decides per request whether that heavy treatment is even worth it.
 
 If you know **OpenRouter Fusion**, you already get the idea: *many models think, one answers*.  
@@ -289,6 +289,30 @@ fusion-opencode fusion-coder
 Honors `FUSION_PROXY_URL` (default `http://127.0.0.1:8080`) and, if your proxy requires client
 auth, `FUSION_PROXY_TOKEN` (used as the apiKey OpenCode sends).
 
+### Claude Code integration
+
+Claude Code uses the **Anthropic Messages API**. llm-fusion exposes `POST /v1/messages` on the
+same base URL, so you can point Claude Code at the proxy root with a few environment variables.
+
+#### One-command launcher (`fusion-claude`)
+
+`bin/fusion-claude` starts the proxy (if needed), exports the Anthropic env vars, and launches
+Claude Code with the model you choose:
+
+```bash
+./bin/fusion-claude fusion-agents            # autonomous agent loops (default)
+./bin/fusion-claude fusion-coder             # programming / planning
+./bin/fusion-claude fusion-researcher        # research / reports
+./bin/fusion-claude fusion-agents run "Fix the failing test in src/foo.ts"
+```
+
+It honors `FUSION_PROXY_URL` and `FUSION_PROXY_TOKEN` exactly like `fusion-opencode`. The key
+difference from OpenAI-compatible clients is the base URL: Claude Code uses the proxy **root**
+(`http://127.0.0.1:8080`), not `/v1`, because it calls `/v1/messages`.
+
+For the full setup guide, env-var reference, and troubleshooting, see
+[`docs/claude-code.md`](./docs/claude-code.md).
+
 ### For AI agents (any OpenAI-compatible client)
 
 The proxy is a drop-in OpenAI Chat Completions endpoint, so any agent framework that speaks OpenAI works — not just OpenCode (Continue, Cline, Aider with an OpenAI base URL, your own loop). Wire it with:
@@ -312,6 +336,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | Method & path | Purpose |
 |---------------|---------|
 | `POST /v1/chat/completions` | Main inference entrypoint. OpenAI-compatible; supports `stream`, `tools`, `tool_choice`, and image content blocks. Routed by the virtual `model` name. |
+| `POST /v1/messages` | Anthropic Messages API entrypoint for Claude Code. Translates Anthropic content blocks to/from the internal OpenAI pipeline; supports streaming and tool use. |
 | `GET /v1/models` | Lists the configured virtual models (OpenAI list shape). Adds `context_window` / `supports_vision` where capability discovery knows them. |
 | `GET /health` | Liveness. `200` if the process is up. No upstream check. |
 | `GET /ready` | Readiness. `200` only if the upstream is reachable and a representative model is discoverable; otherwise `503`. |

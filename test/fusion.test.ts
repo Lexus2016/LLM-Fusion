@@ -30,6 +30,15 @@ const config = parseConfig({
       fusion_planning_turn_only: true,
     },
     "fusion-vision": { strategy: "fusion", panel: ["vm1", "vm2"], judge: "j", synth: "vs" },
+    // Synth-only (bypass) with a NON-vision panel but a vision-capable synth: the
+    // vision gate must validate only the synth here (the panel never runs).
+    "fusion-bypass-vision": {
+      strategy: "fusion",
+      panel: ["nv1", "nv2"],
+      judge: "j",
+      synth: "vs",
+      tool_mode: "bypass",
+    },
     "fusion-no-promote": {
       strategy: "fusion",
       panel: ["m1", "m2", "m3"],
@@ -465,6 +474,33 @@ describe("fusion strategy — vision gate", () => {
     expect(res.status).toBe(200);
     expect(up.modelsCalled()).toContain("vs"); // synth ran
     expect(up.modelsCalled()).toContain("vm1"); // vision panel ran
+  });
+
+  it("synth-only (bypass) image request validates the SYNTH, not the panel (HIGH-3)", async () => {
+    // The panel never runs on a synth-only path, so a non-vision panel must NOT
+    // block a valid image request whose synth IS vision-capable. (Old code ran the
+    // vision gate before the degrade check and 400'd on the non-vision panel.)
+    const visionShow: ShowHandler = (model) =>
+      jsonResponse({
+        capabilities: model === "vs" ? ["vision", "completion"] : ["completion"], // only the synth has vision
+        model_info: {},
+      });
+    const up = makeUpstream(defaultChat(), visionShow);
+    const res = await fusionStrategy.execute(
+      ctx(up.client, imageReq("fusion-bypass-vision"), "fusion-bypass-vision"),
+    );
+    expect(res.status).toBe(200);
+    expect(up.modelsCalled()).toContain("vs"); // synth ran
+    expect(up.modelsCalled()).not.toContain("nv1"); // panel was correctly skipped (bypass)
+  });
+
+  it("synth-only image request still rejects when the SYNTH is not vision-capable (400)", async () => {
+    const noVisionShow: ShowHandler = () =>
+      jsonResponse({ capabilities: ["completion"], model_info: {} }); // nothing is vision-capable
+    const up = makeUpstream(defaultChat(), noVisionShow);
+    await expect(
+      fusionStrategy.execute(ctx(up.client, imageReq("fusion-bypass-vision"), "fusion-bypass-vision")),
+    ).rejects.toMatchObject({ httpStatus: 400 });
   });
 });
 

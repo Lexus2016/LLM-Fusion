@@ -20,6 +20,7 @@ import { singleStrategy } from "./single";
 import { fusionStrategy } from "./fusion";
 import { assertSingleVisionCapable } from "../vision";
 import { extractJsonObject } from "../json";
+import { withTimeout, realTimer } from "../timeout";
 
 /**
  * `smart` strategy — a classifier/router in front of two sub-routes (spec §5.8,
@@ -173,8 +174,22 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
 
   const startedAt = Date.now();
   let result: ChatCompletionResult;
+  // Stage timeout: bound the router independently of the full upstream request
+  // timeout so a slow router cannot hang the whole request — on timeout it throws
+  // and the catch below degrades to the default route. The abort frees the
+  // limiter slot promptly; the client's abort signal (if any) is combined in so a
+  // disconnect cancels the router call too.
+  const timeoutMs = ctx.config.defaults.router_timeout_s * 1000;
+  const stageAbort = new AbortController();
+  const signal = ctx.signal ? AbortSignal.any([ctx.signal, stageAbort.signal]) : stageAbort.signal;
   try {
-    result = await resilience.limiter(() => ctx.client.chatCompletions(body, { stream: false }));
+    result = await withTimeout(
+      resilience.limiter(() => ctx.client.chatCompletions(body, { stream: false, signal })),
+      timeoutMs,
+      realTimer,
+      `smart router '${router}' timed out after ${timeoutMs}ms`,
+      () => stageAbort.abort(),
+    );
   } catch (err) {
     resilience.breaker.recordFailure(router);
     ctx.usage?.recordError(router);

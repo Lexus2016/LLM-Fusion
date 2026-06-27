@@ -15,6 +15,7 @@ import {
   type PricingMap,
 } from "./usage";
 import { createAuthMiddleware } from "./auth";
+import { createAnthropicApp } from "./anthropic";
 import { dispatch, entryMembers, representativeMember } from "./router";
 import { BadRequestError, FusionError, toErrorResponse } from "./errors";
 
@@ -49,6 +50,13 @@ interface ModelListItem {
   supports_vision?: boolean;
 }
 
+/**
+ * Readiness must answer fast: it pings ONE upstream model via /api/show. Bound it
+ * well under the full upstream request timeout so a slow/unreachable upstream
+ * returns `503 degraded` quickly instead of hanging a load-balancer probe.
+ */
+const READY_TIMEOUT_MS = 5_000;
+
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
   const auth = createAuthMiddleware(deps.getAuthToken);
@@ -66,7 +74,7 @@ export function createApp(deps: AppDeps): Hono {
       return c.json({ status: "degraded", reason: "no models configured" }, 503);
     }
     try {
-      await deps.client.show(member);
+      await deps.client.show(member, { signal: AbortSignal.timeout(READY_TIMEOUT_MS) });
       return c.json({ status: "ok" });
     } catch (err) {
       deps.logger.warn({ err: errMessage(err) }, "readiness check failed (upstream unreachable)");
@@ -124,6 +132,9 @@ export function createApp(deps: AppDeps): Hono {
     return c.json({ object: "list", data });
   });
 
+  // Anthropic Messages API compatibility on the same base URL.
+  app.route("/", createAnthropicApp(deps));
+
   app.post("/v1/chat/completions", auth, async (c) => {
     // Per-request correlation id + latency. Prompt CONTENT is never logged
     // (spec §12); only the virtual model name, status, and timing. The id is
@@ -160,6 +171,8 @@ export function createApp(deps: AppDeps): Hono {
         logger: reqLogger,
         resilience,
         usage,
+        // Client abort signal: a disconnect cancels in-flight upstream calls.
+        signal: c.req.raw.signal,
       });
       const strategy = config.models[model]?.strategy ?? "unknown";
       const decorated = await decorateUsage(res, usage, {

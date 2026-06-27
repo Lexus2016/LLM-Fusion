@@ -6,6 +6,7 @@ import {
   failureKindForError,
   logUpstreamFailure,
 } from "../attribution";
+import { promoteReasoningNonStream, makeReasoningPromotionTransform } from "../reasoning";
 
 /**
  * `failover` strategy — try a `chain` of real upstream models in order with
@@ -57,6 +58,10 @@ export const failoverStrategy: Strategy = {
     const stream = ctx.request.stream === true;
     const resilience =
       ctx.resilience ?? createResilience({ maxConcurrency: ctx.config.upstream.max_concurrency });
+    // Reasoning->content promotion flag, threaded into the response builders so a
+    // "thinking" chain member returning reasoning-only content is normalized too.
+    const promote =
+      ctx.modelConfig.promote_reasoning_to_content ?? ctx.config.defaults.promote_reasoning_to_content;
 
     let attempted = 0;
     let lastError: FusionError | undefined;
@@ -75,8 +80,8 @@ export const failoverStrategy: Strategy = {
       }
       attempted += 1;
       const outcome = stream
-        ? await attemptStreamMember(ctx, resilience, member)
-        : await attemptJsonMember(ctx, resilience, member);
+        ? await attemptStreamMember(ctx, resilience, member, promote)
+        : await attemptJsonMember(ctx, resilience, member, promote);
       if (outcome.kind === "return") return outcome.response;
       lastError = outcome.error;
       ctx.logger.warn(
@@ -102,6 +107,7 @@ async function attemptJsonMember(
   ctx: StrategyContext,
   resilience: Resilience,
   member: string,
+  promote: boolean,
 ): Promise<MemberOutcome> {
   const { breaker, sleep, backoff, policy } = resilience;
   const body: Record<string, unknown> = { ...ctx.request, model: member };
@@ -112,7 +118,7 @@ async function attemptJsonMember(
     const startedAt = Date.now();
     let result: ChatCompletionResult;
     try {
-      result = await resilience.limiter(() => ctx.client.chatCompletions(body, { stream: false }));
+      result = await resilience.limiter(() => ctx.client.chatCompletions(body, { stream: false, signal: ctx.signal }));
     } catch (err) {
       breaker.recordFailure(member);
       ctx.usage?.recordError(member);
@@ -135,7 +141,7 @@ async function attemptJsonMember(
     const status = result.status;
     if (status < 400) {
       breaker.recordSuccess(member);
-      return { kind: "return", response: buildResponse(result) };
+      return { kind: "return", response: buildResponse(result, promote) };
     }
     if (status === 429) {
       breaker.recordFailure(member);
@@ -152,7 +158,7 @@ async function attemptJsonMember(
         continue; // SAME member — never advance on 429
       }
       // Exhausted waiting: surface the rate-limit (still not a chain advance).
-      return { kind: "return", response: buildResponse(result) };
+      return { kind: "return", response: buildResponse(result, promote) };
     }
     if (status >= 500) {
       breaker.recordFailure(member);
@@ -174,7 +180,7 @@ async function attemptJsonMember(
       };
     }
     // 4xx other than 429 — client/request error: surface immediately (passthrough).
-    return { kind: "return", response: buildResponse(result) };
+    return { kind: "return", response: buildResponse(result, promote) };
   }
 }
 
@@ -183,6 +189,7 @@ async function attemptStreamMember(
   ctx: StrategyContext,
   resilience: Resilience,
   member: string,
+  promote: boolean,
 ): Promise<MemberOutcome> {
   const { breaker, sleep, backoff, policy } = resilience;
   const body: Record<string, unknown> = { ...ctx.request, model: member };
@@ -193,7 +200,7 @@ async function attemptStreamMember(
     const startedAt = Date.now();
     let result: ChatCompletionResult;
     try {
-      result = await resilience.limiter(() => ctx.client.chatCompletions(body, { stream: true }));
+      result = await resilience.limiter(() => ctx.client.chatCompletions(body, { stream: true, signal: ctx.signal }));
     } catch (err) {
       breaker.recordFailure(member);
       ctx.usage?.recordError(member);
@@ -230,7 +237,7 @@ async function attemptStreamMember(
           rateLimitRetries += 1;
           continue;
         }
-        return { kind: "return", response: buildResponse(result) };
+        return { kind: "return", response: buildResponse(result, promote) };
       }
       if (status >= 500) {
         breaker.recordFailure(member);
@@ -252,10 +259,10 @@ async function attemptStreamMember(
         };
       }
       if (status >= 400) {
-        return { kind: "return", response: buildResponse(result) };
+        return { kind: "return", response: buildResponse(result, promote) };
       }
       breaker.recordSuccess(member);
-      return { kind: "return", response: buildResponse(result) };
+      return { kind: "return", response: buildResponse(result, promote) };
     }
 
     // kind === "stream": peek until the stream COMMITS real content to decide
@@ -299,7 +306,8 @@ async function attemptStreamMember(
       return { kind: "return", response: new Response(empty, { status: result.status, headers }) };
     }
     const out = buildCommittedStream(peek.reader, peek.prefix);
-    return { kind: "return", response: new Response(out, { status: result.status, headers }) };
+    const committedBody = promote ? out.pipeThrough(makeReasoningPromotionTransform()) : out;
+    return { kind: "return", response: new Response(committedBody, { status: result.status, headers }) };
   }
 }
 
@@ -414,15 +422,20 @@ function buildCommittedStream(
 }
 
 /** Build a `Response` from a (non-committed) upstream result, mirroring `single`. */
-function buildResponse(result: ChatCompletionResult): Response {
+function buildResponse(result: ChatCompletionResult, promote: boolean): Response {
   if (result.kind === "stream") {
     const headers: Record<string, string> = {
       ...STREAM_HEADERS_BASE,
       "content-type": result.contentType ?? "text/event-stream",
     };
-    return new Response(result.body, { status: result.status, headers });
+    const body =
+      promote && result.status < 400 && result.body
+        ? result.body.pipeThrough(makeReasoningPromotionTransform())
+        : result.body;
+    return new Response(body, { status: result.status, headers });
   }
-  return new Response(JSON.stringify(result.data ?? null), {
+  const data = promote && result.status < 400 ? promoteReasoningNonStream(result.data) : result.data;
+  return new Response(JSON.stringify(data ?? null), {
     status: result.status,
     headers: { "content-type": "application/json" },
   });

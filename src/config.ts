@@ -20,6 +20,8 @@ const SingleModelSchema = z
   .object({
     strategy: z.literal("single"),
     target: z.string().min(1),
+    // Per-model override of `defaults.promote_reasoning_to_content`.
+    promote_reasoning_to_content: z.boolean().optional(),
   })
   .strict();
 
@@ -27,6 +29,8 @@ const FailoverModelSchema = z
   .object({
     strategy: z.literal("failover"),
     chain: z.array(z.string().min(1)).min(1),
+    // Per-model override of `defaults.promote_reasoning_to_content`.
+    promote_reasoning_to_content: z.boolean().optional(),
   })
   .strict();
 
@@ -125,6 +129,10 @@ const DefaultsSchema = z
   .object({
     panel_member_timeout_s: z.number().int().positive().default(90),
     judge_timeout_s: z.number().int().positive().default(60),
+    // Stage timeout for the smart router's single classification call. Bounds the
+    // router independently of the full upstream request timeout, so a slow router
+    // cannot hang the whole request; on timeout it degrades to the default route.
+    router_timeout_s: z.number().int().positive().default(30),
     min_panel_success: z.number().int().min(1).default(1),
     // When true (default), reasoning-only upstream replies (final text in the
     // `reasoning`/`reasoning_content` field with empty `content`) are normalized

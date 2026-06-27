@@ -6,6 +6,7 @@ import {
   isAvailabilityFailureStatus,
   logUpstreamFailure,
 } from "../attribution";
+import { promoteReasoningNonStream, makeReasoningPromotionTransform } from "../reasoning";
 
 /**
  * `single` strategy — 1:1 passthrough to a single target model. Supports both
@@ -46,8 +47,8 @@ export const singleStrategy: Strategy = {
     let result: ChatCompletionResult;
     try {
       result = resilience
-        ? await resilience.limiter(() => ctx.client.chatCompletions(body, { stream }))
-        : await ctx.client.chatCompletions(body, { stream });
+        ? await resilience.limiter(() => ctx.client.chatCompletions(body, { stream, signal: ctx.signal }))
+        : await ctx.client.chatCompletions(body, { stream, signal: ctx.signal });
     } catch (err) {
       resilience?.breaker.recordFailure(target);
       ctx.usage?.recordError(target);
@@ -78,15 +79,27 @@ export const singleStrategy: Strategy = {
       });
     }
 
+    // Reasoning->content promotion (when enabled): some "thinking" target models
+    // return their final answer in `reasoning` with empty `content`; content-only
+    // clients (e.g. OpenCode) would otherwise render nothing. Applied only to
+    // successful (2xx) responses, for both streamed and non-streamed bodies.
+    const promote =
+      ctx.modelConfig.promote_reasoning_to_content ?? ctx.config.defaults.promote_reasoning_to_content;
+
     if (result.kind === "stream") {
       const headers: Record<string, string> = {
         ...STREAM_HEADERS_BASE,
         "content-type": result.contentType ?? "text/event-stream",
       };
-      return new Response(result.body, { status: result.status, headers });
+      const body =
+        promote && result.status < 400 && result.body
+          ? result.body.pipeThrough(makeReasoningPromotionTransform())
+          : result.body;
+      return new Response(body, { status: result.status, headers });
     }
 
-    return new Response(JSON.stringify(result.data ?? null), {
+    const data = promote && result.status < 400 ? promoteReasoningNonStream(result.data) : result.data;
+    return new Response(JSON.stringify(data ?? null), {
       status: result.status,
       headers: { "content-type": "application/json" },
     });

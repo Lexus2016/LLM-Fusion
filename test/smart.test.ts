@@ -496,6 +496,42 @@ describe("smart strategy", () => {
     expect(userMsg.content).toContain("ACTIVE_TASK"); // survived 20 mechanical turns of truncation
     expect(userMsg.content).toContain("OLD_TASK"); // first-message framing kept too
   });
+
+  it("a router that hangs past router_timeout_s degrades to the default route (HIGH-2)", async () => {
+    // Without a stage timeout the router could hang up to the full upstream timeout;
+    // it must instead time out fast and fall back to the configured default route.
+    const fastCfg = parseConfig({
+      upstream,
+      defaults: { router_timeout_s: 1 },
+      models: {
+        "smart-to": {
+          strategy: "smart",
+          router: "rt",
+          default: "simple",
+          simple: { target: "deepseek" },
+          fusion: { panel: ["p1", "p2", "p3"], judge: "jdg", synth: "syn" },
+        },
+      },
+    });
+    const up = makeUpstream((body) => {
+      if (body.model === "rt") return new Promise<Response>(() => {}); // router hangs forever
+      return jsonResponse({ choices: [{ message: { content: "simple-answer" } }] });
+    });
+    const entry = fastCfg.models["smart-to"];
+    if (!entry) throw new Error("missing smart-to");
+    const capabilities = new CapabilityService({ client: up.client, getOverrides: () => fastCfg.overrides, logger });
+    const sctx: StrategyContext = {
+      request: req("smart-to"),
+      config: fastCfg,
+      client: up.client,
+      capabilities,
+      logger,
+      modelConfig: entry,
+    };
+    const res = await smartStrategy.execute(sctx);
+    expect(res.status).toBe(200);
+    expect(up.modelsCalled()).toContain("deepseek"); // degraded to default=simple after the router timed out
+  }, 6000);
 });
 
 describe("smart config validation", () => {

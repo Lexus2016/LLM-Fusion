@@ -16,7 +16,6 @@ import {
   CircuitOpenError,
   FusionError,
   NativeStreamingNotImplementedError,
-  UpstreamTimeoutError,
 } from "../errors";
 import { openAiBodyToNativeChat, requestHasImages } from "../vision";
 import { extractJsonObject } from "../json";
@@ -26,6 +25,12 @@ import {
   isAvailabilityFailureStatus,
   logUpstreamFailure,
 } from "../attribution";
+import { withTimeout, realTimer, combineSignals } from "../timeout";
+import type { TimerFactory } from "../timeout";
+// Re-exported: the fusion strategy's timer-injection API (FusionDeps.timer) is
+// typed by TimerFactory, so tests that inject a deterministic timer import it here.
+export type { TimerFactory };
+import { extractAnswer, promoteReasoningNonStream, makeReasoningPromotionTransform } from "../reasoning";
 
 /**
  * `fusion` strategy — the core algorithm (spec §5.7 / §8.2):
@@ -55,227 +60,6 @@ const STREAM_HEADERS_BASE: Record<string, string> = {
   "cache-control": "no-cache",
   connection: "keep-alive",
 };
-
-// --- Injectable per-stage timeout seam ------------------------------------
-
-/** A pending timeout: `expired` resolves when the deadline is reached. */
-export interface StageTimeout {
-  expired: Promise<void>;
-  cancel(): void;
-}
-
-/** Schedules a stage timeout. Default uses real timers; tests inject their own. */
-export type TimerFactory = (ms: number) => StageTimeout;
-
-const realTimer: TimerFactory = (ms) => {
-  let handle: ReturnType<typeof setTimeout> | undefined;
-  const expired = new Promise<void>((resolve) => {
-    handle = setTimeout(resolve, ms);
-  });
-  return {
-    expired,
-    cancel() {
-      if (handle !== undefined) clearTimeout(handle);
-    },
-  };
-};
-
-/**
- * Race `work` against a stage timeout. On timeout `onTimeout` runs first — used
- * to abort the in-flight upstream call so its concurrency-limiter slot frees
- * promptly instead of lingering until the call settles on its own — and a typed
- * `UpstreamTimeoutError` is thrown so the proxy is always first to fail.
- */
-async function withTimeout<T>(
-  work: Promise<T>,
-  ms: number,
-  timer: TimerFactory,
-  label: string,
-  onTimeout?: () => void,
-): Promise<T> {
-  const t = timer(ms);
-  try {
-    return await Promise.race([
-      work,
-      t.expired.then((): never => {
-        onTimeout?.();
-        throw new UpstreamTimeoutError(label);
-      }),
-    ]);
-  } finally {
-    t.cancel();
-  }
-}
-
-// --- Defensive parsing of upstream completion bodies ----------------------
-
-/**
- * A non-streamed assistant message, including the `reasoning` /
- * `reasoning_content` fields some Ollama Cloud "thinking" models populate
- * instead of `content`.
- */
-const ReasoningMessageSchema = z
-  .object({
-    content: z.union([z.string(), z.null()]).optional(),
-    reasoning: z.union([z.string(), z.null()]).optional(),
-    reasoning_content: z.union([z.string(), z.null()]).optional(),
-    tool_calls: z.unknown().optional(),
-  })
-  .passthrough();
-
-type ReasoningMessage = z.infer<typeof ReasoningMessageSchema>;
-
-const CompletionSchema = z
-  .object({
-    choices: z.array(z.object({ message: ReasoningMessageSchema }).passthrough()).optional(),
-    // Native /api/chat shape: { message: { content } }.
-    message: ReasoningMessageSchema.optional(),
-  })
-  .passthrough();
-
-/** First non-empty string among the candidates, else "". */
-function firstNonEmpty(...values: Array<string | null | undefined>): string {
-  for (const v of values) {
-    if (typeof v === "string" && v.length > 0) return v;
-  }
-  return "";
-}
-
-/** The reasoning text of a message: `reasoning`, then `reasoning_content`, else "". */
-function reasoningText(message: ReasoningMessage): string {
-  return firstNonEmpty(message.reasoning, message.reasoning_content);
-}
-
-/**
- * Effective assistant text for a message: `content` when it has non-whitespace
- * text, otherwise the model's `reasoning` / `reasoning_content`. Some "thinking"
- * models return their final answer in `reasoning` with an empty `content`; the
- * judge (and any text consumer) needs that real text ALWAYS — independent of the
- * `promote_reasoning_to_content` flag.
- */
-function effectiveText(message: ReasoningMessage | undefined): string {
-  if (!message) return "";
-  const content = typeof message.content === "string" ? message.content : "";
-  if (content.trim().length > 0) return content;
-  return reasoningText(message);
-}
-
-/** Extract assistant text from an OpenAI- or native-shaped completion. */
-function extractAnswer(data: unknown): string | null {
-  const parsed = CompletionSchema.safeParse(data);
-  if (!parsed.success) return null;
-  const fromChoices = effectiveText(parsed.data.choices?.[0]?.message);
-  if (fromChoices.length > 0) return fromChoices;
-  const fromNative = effectiveText(parsed.data.message);
-  if (fromNative.length > 0) return fromNative;
-  return null;
-}
-
-/**
- * Non-stream synth normalization: when a message has empty/whitespace `content`,
- * no tool calls, and non-empty reasoning, promote the reasoning into `content`
- * so content-only clients render the answer. Returns the (possibly rewritten)
- * data; all unrelated fields are preserved.
- */
-function promoteReasoningNonStream(data: unknown): unknown {
-  const parsed = CompletionSchema.safeParse(data);
-  if (!parsed.success) return data;
-  const messages: ReasoningMessage[] = [];
-  for (const choice of parsed.data.choices ?? []) messages.push(choice.message);
-  if (parsed.data.message) messages.push(parsed.data.message);
-  let mutated = false;
-  for (const message of messages) {
-    const content = typeof message.content === "string" ? message.content : "";
-    if (content.trim().length > 0) continue; // real content already present
-    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) continue; // tool path
-    const reasoning = reasoningText(message);
-    if (reasoning.length === 0) continue;
-    message.content = reasoning;
-    mutated = true;
-  }
-  return mutated ? parsed.data : data;
-}
-
-// --- Streaming reasoning->content normalization ---------------------------
-
-const StreamDeltaSchema = z
-  .object({
-    content: z.union([z.string(), z.null()]).optional(),
-    reasoning: z.union([z.string(), z.null()]).optional(),
-    reasoning_content: z.union([z.string(), z.null()]).optional(),
-    tool_calls: z.unknown().optional(),
-  })
-  .passthrough();
-
-const StreamChunkSchema = z
-  .object({
-    choices: z.array(z.object({ delta: StreamDeltaSchema.optional() }).passthrough()).optional(),
-  })
-  .passthrough();
-
-/**
- * SSE transform that re-emits `delta.reasoning` / `delta.reasoning_content`
- * fragments as `delta.content`, but ONLY until a real `delta.content` fragment
- * appears; once real content arrives, every later event passes through verbatim
- * (no duplication). `tool_calls` deltas and `finish_reason` are never touched.
- * Only a partial trailing line is buffered — never the whole response.
- */
-function makeReasoningPromotionTransform(): TransformStream<Uint8Array, Uint8Array> {
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  let buffer = "";
-  let realContentSeen = false;
-
-  const handleLine = (line: string): string => {
-    if (realContentSeen) return line; // real content already streamed — pass through
-    if (!line.startsWith("data:")) return line; // blank separators, comments, etc.
-    const payload = line.slice("data:".length).trim();
-    if (payload.length === 0 || payload === "[DONE]") return line;
-    let chunk: unknown;
-    try {
-      chunk = JSON.parse(payload);
-    } catch {
-      return line;
-    }
-    const parsed = StreamChunkSchema.safeParse(chunk);
-    if (!parsed.success || !parsed.data.choices) return line;
-    let modified = false;
-    for (const choice of parsed.data.choices) {
-      const delta = choice.delta;
-      if (!delta) continue;
-      const content = typeof delta.content === "string" ? delta.content : "";
-      if (content.length > 0) {
-        realContentSeen = true; // real content — leave this and every later event alone
-        continue;
-      }
-      const reasoning = firstNonEmpty(delta.reasoning, delta.reasoning_content);
-      if (reasoning.length === 0) continue; // nothing to promote (incl. tool_calls-only deltas)
-      delta.content = reasoning;
-      delete delta.reasoning;
-      delete delta.reasoning_content;
-      modified = true;
-    }
-    return modified ? `data: ${JSON.stringify(parsed.data)}` : line;
-  };
-
-  return new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      buffer += decoder.decode(chunk, { stream: true });
-      let out = "";
-      let nl: number;
-      while ((nl = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, nl);
-        buffer = buffer.slice(nl + 1);
-        out += handleLine(line) + "\n";
-      }
-      if (out.length > 0) controller.enqueue(encoder.encode(out));
-    },
-    flush(controller) {
-      buffer += decoder.decode();
-      if (buffer.length > 0) controller.enqueue(encoder.encode(handleLine(buffer)));
-    },
-  });
-}
 
 const JudgeAnalysisSchema = z
   .object({
@@ -335,17 +119,26 @@ async function runFusion(
   // Effective reasoning->content promotion: per-model override wins over the default.
   const promote = cfg.promote_reasoning_to_content ?? defaults.promote_reasoning_to_content;
 
-  // Vision gate (spec §5.11 / §10.1): only run discovery when images are present
-  // so the common text path adds no upstream calls.
-  let panelMembers = cfg.panel;
-  if (hasImages) {
-    panelMembers = await applyVisionGate(ctx, cfg);
-  }
-
-  // Degradations that skip panel+judge entirely.
+  // Degradations that skip panel+judge entirely. Computed BEFORE the vision gate
+  // so a synth-only image request is validated against the SYNTH alone — the panel
+  // never runs, so requiring vision-capable panel members would wrongly reject it.
   const planningDegrade =
     cfg.fusion_planning_turn_only && latestMessageIsToolResult(request);
-  if (cfg.tool_mode === "bypass" || planningDegrade) {
+  const synthOnly = cfg.tool_mode === "bypass" || planningDegrade;
+
+  // Vision gate (spec §5.11 / §10.1): only run discovery when images are present
+  // so the common text path adds no upstream calls. Synth-only validates just the
+  // synth; the full path validates the panel and the synth.
+  let panelMembers = cfg.panel;
+  if (hasImages) {
+    if (synthOnly) {
+      await assertSynthVision(ctx, cfg);
+    } else {
+      panelMembers = await applyVisionGate(ctx, cfg);
+    }
+  }
+
+  if (synthOnly) {
     logger.info(
       { model: request.model, reason: cfg.tool_mode === "bypass" ? "bypass" : "planning_turn_only" },
       "fusion: synth-only path",
@@ -392,13 +185,18 @@ async function applyVisionGate(ctx: StrategyContext, cfg: FusionModelConfig): Pr
       `fusion model '${ctx.request.model}' received image input but none of its panel members are vision-capable`,
     );
   }
+  await assertSynthVision(ctx, cfg);
+  return visionPanel;
+}
+
+/** Image input requires a vision-capable synth (the synth always runs, in every path). */
+async function assertSynthVision(ctx: StrategyContext, cfg: FusionModelConfig): Promise<void> {
   const { capability: synthCap } = await ctx.capabilities.discover(cfg.synth);
   if (!synthCap.vision) {
     throw new CapabilityError(
       `fusion model '${ctx.request.model}' received image input but its synth model '${cfg.synth}' is not vision-capable`,
     );
   }
-  return visionPanel;
 }
 
 // --- Panel stage -----------------------------------------------------------
@@ -446,7 +244,7 @@ async function callPanelMember(
   try {
     result = await withTimeout(
       resilience.limiter(() =>
-        invokeUpstream(ctx.client, body, { stream: false, native: opts.native, signal: abort.signal }),
+        invokeUpstream(ctx.client, body, { stream: false, native: opts.native, signal: combineSignals(ctx.signal, abort.signal) }),
       ),
       timeoutMs,
       timer,
@@ -595,7 +393,7 @@ async function runJudge(
   const abort = new AbortController();
   try {
     result = await withTimeout(
-      resilience.limiter(() => ctx.client.chatCompletions(body, { stream: false, signal: abort.signal })),
+      resilience.limiter(() => ctx.client.chatCompletions(body, { stream: false, signal: combineSignals(ctx.signal, abort.signal) })),
       timeoutMs,
       timer,
       `judge '${judge}' timed out after ${timeoutMs}ms`,
@@ -682,7 +480,7 @@ async function runSynth(
   let result: ChatCompletionResult;
   try {
     result = await resilience.limiter(() =>
-      invokeUpstream(ctx.client, body, { stream: opts.stream, native: opts.native }),
+      invokeUpstream(ctx.client, body, { stream: opts.stream, native: opts.native, signal: ctx.signal }),
     );
   } catch (err) {
     resilience.breaker.recordFailure(synth);

@@ -112,6 +112,47 @@ describe("single strategy", () => {
     expect(text).toContain('"content":"b"');
     expect(text).toContain("[DONE]");
   });
+
+  it("promotes reasoning -> content when content is empty (thinking target, HIGH-1)", async () => {
+    // A "thinking" model returns its answer in `reasoning` with empty `content`;
+    // the single passthrough now normalizes it so content-only clients see the text.
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: () =>
+            jsonResponse({
+              choices: [
+                { index: 0, message: { role: "assistant", content: "", reasoning: "THE ANSWER" }, finish_reason: "stop" },
+              ],
+            }),
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(ctxWith(client, { model: "fast-glm", messages: [] }));
+    const body = JSON.parse(await res.text());
+    expect(body.choices[0].message.content).toBe("THE ANSWER");
+  });
+
+  it("propagates the context abort signal to upstream (M-1 client disconnect)", async () => {
+    // The hanging fetch only settles when ITS signal aborts; aborting the context
+    // signal must reject the strategy call — proving ctx.signal reaches upstream.
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: (_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        }),
+    });
+    const ac = new AbortController();
+    const ctx = ctxWith(client, { model: "fast-glm", messages: [] });
+    const pending = singleStrategy.execute({ ...ctx, signal: ac.signal });
+    ac.abort();
+    await expect(pending).rejects.toThrow();
+  });
 });
 
 describe("single strategy — circuit breaker availability semantics", () => {

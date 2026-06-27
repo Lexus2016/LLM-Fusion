@@ -84,7 +84,7 @@ export interface UpstreamClient {
     opts: { stream: boolean; signal?: AbortSignal },
   ): Promise<ChatCompletionResult>;
   /** Native discovery path: `POST {baseUrl}/api/show {model}` -> raw JSON. */
-  show(model: string): Promise<unknown>;
+  show(model: string, opts?: { signal?: AbortSignal }): Promise<unknown>;
   /**
    * Native chat path (`/api/chat`, NDJSON transport). Used for vision when
    * `api_mode === "native"`. The non-stream path is implemented; native
@@ -176,6 +176,13 @@ export interface RequestContext {
    * contexts work without accounting; the server always supplies one.
    */
   usage?: UsageAccumulator;
+  /**
+   * The client request's abort signal. Combined (via AbortSignal.any) with each
+   * stage's own timeout when calling upstream, so a client disconnect cancels the
+   * in-flight upstream work instead of letting it run to completion orphaned.
+   * Optional so bare unit contexts work without one; the server always supplies it.
+   */
+  signal?: AbortSignal;
 }
 
 export interface StrategyContext extends RequestContext {

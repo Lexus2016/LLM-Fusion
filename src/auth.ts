@@ -33,9 +33,15 @@ export function createAuthMiddleware(getToken: () => string | undefined): Middle
       await next();
       return;
     }
-    const header = c.req.header("authorization") ?? "";
-    const match = /^Bearer\s+(.+)$/i.exec(header);
-    const provided = match?.[1];
+    let provided: string | undefined;
+    const authHeader = c.req.header("authorization") ?? "";
+    const bearerMatch = /^Bearer\s+(.+)$/i.exec(authHeader);
+    if (bearerMatch) {
+      provided = bearerMatch[1];
+    } else {
+      // Anthropic SDK / Claude Code sends the key in `x-api-key`.
+      provided = c.req.header("x-api-key");
+    }
     if (!provided || !tokensMatch(provided, token)) {
       return c.json(
         { error: { message: "invalid or missing client token", type: "authentication_error", code: null } },

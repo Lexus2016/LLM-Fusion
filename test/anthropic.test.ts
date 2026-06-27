@@ -1,0 +1,331 @@
+import { describe, it, expect } from "vitest";
+import { createApp } from "../src/server";
+import { OllamaClient } from "../src/upstream/ollama";
+import { CapabilityService } from "../src/capabilities";
+import { parseConfig } from "../src/config";
+import { createLogger } from "../src/logging";
+import { mockFetch, jsonResponse, sseResponse } from "./helpers";
+import type { MockRoute } from "./helpers";
+import {
+  anthropicToOpenAiRequest,
+  openAiToAnthropicResponse,
+  type AnthropicRequest,
+} from "../src/anthropic";
+
+const logger = createLogger({ level: "silent" });
+
+const config = parseConfig({
+  upstream: { base_url: "https://mock.test", api_key_env: "X" },
+  server: { bind: "127.0.0.1", port: 8080 },
+  models: {
+    "anthropic-fast": { strategy: "single", target: "glm-5.2" },
+    "anthropic-fusion": { strategy: "fusion", panel: ["a", "b"], judge: "a", synth: "b" },
+  },
+});
+
+function defaultRoutes(): MockRoute[] {
+  return [
+    {
+      match: (u) => u.endsWith("/v1/chat/completions"),
+      respond: () =>
+        jsonResponse({
+          id: "up-1",
+          choices: [{ message: { role: "assistant", content: "hello" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+        }),
+    },
+    {
+      match: (u) => u.endsWith("/api/show"),
+      respond: () => jsonResponse({ capabilities: ["completion"], model_info: {} }),
+    },
+  ];
+}
+
+function makeApp(routes: MockRoute[] = defaultRoutes(), authToken?: string) {
+  const client = new OllamaClient({
+    baseUrl: "https://mock.test",
+    apiKey: "k",
+    fetchFn: mockFetch(routes),
+  });
+  const capabilities = new CapabilityService({
+    client,
+    getOverrides: () => config.overrides,
+    logger,
+  });
+  return createApp({
+    getConfig: () => config,
+    client,
+    capabilities,
+    getAuthToken: () => authToken,
+    logger,
+  });
+}
+
+function postMessages(app: ReturnType<typeof makeApp>, body: unknown, headers?: Record<string, string>) {
+  return app.request("/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  });
+}
+
+describe("anthropic translation", () => {
+  it("maps a simple user + system prompt to OpenAI messages", () => {
+    const req: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [{ role: "user", content: "hi" }],
+      system: "be brief",
+    };
+    const openAi = anthropicToOpenAiRequest(req);
+    expect(openAi.model).toBe("anthropic-fast");
+    expect(openAi.messages).toEqual([
+      { role: "system", content: "be brief" },
+      { role: "user", content: "hi" },
+    ]);
+  });
+
+  it("maps a system role message inside messages to an OpenAI system message", () => {
+    const req: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [
+        { role: "system", content: "be brief" },
+        { role: "user", content: "hi" },
+      ],
+    };
+    const openAi = anthropicToOpenAiRequest(req);
+    expect(openAi.messages).toEqual([
+      { role: "system", content: "be brief" },
+      { role: "user", content: "hi" },
+    ]);
+  });
+
+  it("maps assistant tool_use to OpenAI tool_calls", () => {
+    const req: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [
+        { role: "user", content: "run it" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "okay" },
+            { type: "tool_use", id: "tu-1", name: "bash", input: { command: "echo hi" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "tu-1", content: "hi" }],
+        },
+      ],
+    };
+    const openAi = anthropicToOpenAiRequest(req);
+    expect(openAi.messages).toEqual([
+      { role: "user", content: "run it" },
+      {
+        role: "assistant",
+        content: "okay",
+        tool_calls: [
+          {
+            id: "tu-1",
+            type: "function",
+            function: { name: "bash", arguments: JSON.stringify({ command: "echo hi" }) },
+          },
+        ],
+      },
+      { role: "tool", content: "hi", tool_call_id: "tu-1" },
+    ]);
+  });
+
+  it("maps Anthropic tools to OpenAI functions", () => {
+    const req: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ name: "read", description: "read a file", input_schema: { type: "object" } }],
+      tool_choice: { type: "tool", name: "read" },
+      max_tokens: 1024,
+      temperature: 0.5,
+      top_p: 0.9,
+    };
+    const openAi = anthropicToOpenAiRequest(req);
+    expect(openAi.tools).toEqual([
+      {
+        type: "function",
+        function: { name: "read", description: "read a file", parameters: { type: "object" } },
+      },
+    ]);
+    expect(openAi.tool_choice).toEqual({ type: "function", function: { name: "read" } });
+    expect(openAi.max_tokens).toBe(1024);
+    expect(openAi.temperature).toBe(0.5);
+    expect(openAi.top_p).toBe(0.9);
+  });
+
+  it("maps an OpenAI response with content to an Anthropic message", () => {
+    const openAi = {
+      id: "r-1",
+      choices: [{ message: { role: "assistant", content: "hello" }, finish_reason: "stop" }],
+    };
+    const anthropic = openAiToAnthropicResponse(openAi, "anthropic-fast", {
+      upstreamCalls: 1,
+      promptTokens: 3,
+      completionTokens: 2,
+      totalTokens: 5,
+      costUsd: null,
+    });
+    expect(anthropic).toMatchObject({
+      id: "r-1",
+      type: "message",
+      role: "assistant",
+      model: "anthropic-fast",
+      content: [{ type: "text", text: "hello" }],
+      stop_reason: "end_turn",
+      usage: { input_tokens: 3, output_tokens: 2 },
+    });
+  });
+
+  it("maps OpenAI tool_calls to Anthropic tool_use blocks", () => {
+    const openAi = {
+      id: "r-2",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "tu-2",
+                function: { name: "bash", arguments: JSON.stringify({ command: "ls" }) },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    };
+    const anthropic = openAiToAnthropicResponse(openAi, "anthropic-fast", {
+      upstreamCalls: 1,
+      promptTokens: 4,
+      completionTokens: 5,
+      totalTokens: 9,
+      costUsd: null,
+    });
+    expect(anthropic).toMatchObject({
+      type: "message",
+      stop_reason: "tool_use",
+      content: [{ type: "tool_use", id: "tu-2", name: "bash", input: { command: "ls" } }],
+      usage: { input_tokens: 4, output_tokens: 5 },
+    });
+  });
+});
+
+describe("anthropic route", () => {
+  it("POST /v1/messages returns an Anthropic-shaped message", async () => {
+    const res = await postMessages(makeApp(), {
+      model: "anthropic-fast",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.type).toBe("message");
+    expect(body.role).toBe("assistant");
+    expect(body.content).toEqual([{ type: "text", text: "hello" }]);
+    expect(body.stop_reason).toBe("end_turn");
+    expect(res.headers.get("x-fusion-usage")).toContain('"calls":1');
+  });
+
+  it("POST /v1/messages streams Anthropic SSE events", async () => {
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () => sseResponse([{ choices: [{ delta: { content: "x" } }] }]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-fast",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    const text = await res.text();
+    expect(text).toContain('event: message_start');
+    expect(text).toContain('"type":"text_delta"');
+    expect(text).toContain('"text":"x"');
+    expect(text).toContain('event: message_delta');
+    expect(text).toContain('event: message_stop');
+    expect(res.headers.get("x-fusion-usage")).toContain('"calls":1');
+  });
+
+  it("authenticates with x-api-key header", async () => {
+    const app = makeApp(defaultRoutes(), "secret");
+    const ok = await postMessages(
+      app,
+      { model: "anthropic-fast", messages: [{ role: "user", content: "hi" }] },
+      { "x-api-key": "secret" },
+    );
+    expect(ok.status).toBe(200);
+
+    const bad = await postMessages(
+      app,
+      { model: "anthropic-fast", messages: [{ role: "user", content: "hi" }] },
+      { "x-api-key": "wrong" },
+    );
+    expect(bad.status).toBe(401);
+  });
+
+  it("rejects malformed Anthropic bodies with 400", async () => {
+    const res = await postMessages(makeApp(), {});
+    expect(res.status).toBe(400);
+  });
+
+  it("maps upstream tool_calls to a streamed Anthropic tool_use block", async () => {
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          sseResponse([
+            {
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [{ index: 0, id: "tu-3", function: { name: "bash" } }],
+                  },
+                },
+              ],
+            },
+            {
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [{ index: 0, function: { arguments: '{"co' } }],
+                  },
+                },
+              ],
+            },
+            {
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [{ index: 0, function: { arguments: 'mmand":"ls"}' } }],
+                  },
+                },
+              ],
+            },
+          ]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-fast",
+      stream: true,
+      messages: [{ role: "user", content: "list files" }],
+    });
+    const text = await res.text();
+    expect(text).toContain('"type":"tool_use"');
+    expect(text).toContain('"name":"bash"');
+    expect(text).toContain('"type":"input_json_delta"');
+    const partials = [...text.matchAll(/"partial_json":("(?:\\.|[^"\\])*")/g)]
+      .map((m) => m[1])
+      .filter((s): s is string => s != null)
+      .map((s) => JSON.parse(s) as string);
+    const combined = partials.join("");
+    expect(JSON.parse(combined)).toEqual({ command: "ls" });
+  });
+});

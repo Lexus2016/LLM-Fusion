@@ -32,6 +32,7 @@ export async function dispatch(ctx: RequestContext): Promise<Response> {
     logger: ctx.logger,
     resilience: ctx.resilience,
     usage: ctx.usage,
+    signal: ctx.signal,
     modelConfig: entry,
   };
 

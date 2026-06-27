@@ -92,12 +92,13 @@ export class OllamaClient implements UpstreamClient {
     return { kind: "json", status: res.status, data, usage: usageFromBody(data) };
   }
 
-  async show(model: string): Promise<unknown> {
+  async show(model: string, opts: { signal?: AbortSignal } = {}): Promise<unknown> {
     const url = `${this.baseUrl}/api/show`;
     const res = await this.doFetch(url, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify({ model }),
+      signal: opts.signal,
     });
     if (!res.ok) {
       const data = await readBody(res);

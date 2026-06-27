@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# fusion-claude — launch Claude Code wired to the llm-fusion Fusion Proxy.
+#
+# Usage:
+#   fusion-claude <model> [claude args...]
+#   fusion-claude fusion-agents                 # interactive TUI with smart routing
+#   fusion-claude fusion-coder                  # interactive TUI for coding
+#   fusion-claude fusion-researcher run "Summarize X"  # headless one-shot
+#
+# What it does:
+#   1. starts the proxy (npm start) if it is not already answering on /health;
+#   2. exports the Anthropic env vars Claude Code needs;
+#   3. launches claude with the remaining arguments.
+#
+# Env:
+#   FUSION_PROXY_URL           override proxy URL (default http://127.0.0.1:8080)
+#   FUSION_PROXY_TOKEN         if your proxy requires client auth, used as ANTHROPIC_AUTH_TOKEN
+#   ANTHROPIC_SMALL_FAST_MODEL override the fast model Claude uses for light tasks (default fast-kimi)
+set -euo pipefail
+
+MODEL="${1:-fusion-agents}"
+[ "$#" -gt 0 ] && shift
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROXY_URL="${FUSION_PROXY_URL:-http://127.0.0.1:8080}"
+
+# 1. ensure the proxy is up ---------------------------------------------------
+if ! curl -fsS "$PROXY_URL/health" >/dev/null 2>&1; then
+  echo "[fusion-claude] proxy not up — starting it from $REPO ..." >&2
+  ( cd "$REPO" && nohup npm start >"${TMPDIR:-/tmp}/llm-fusion-proxy.log" 2>&1 & )
+  for _ in $(seq 1 60); do
+    curl -fsS "$PROXY_URL/health" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  if ! curl -fsS "$PROXY_URL/health" >/dev/null 2>&1; then
+    echo "[fusion-claude] proxy failed to start — see ${TMPDIR:-/tmp}/llm-fusion-proxy.log" >&2
+    exit 1
+  fi
+  echo "[fusion-claude] proxy is up at $PROXY_URL" >&2
+fi
+
+# 2. wire Claude Code to the proxy -------------------------------------------
+export ANTHROPIC_BASE_URL="$PROXY_URL"
+export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-fast-kimi}"
+export ANTHROPIC_AUTH_TOKEN="${FUSION_PROXY_TOKEN:-local-no-auth}"
+
+# 3. launch Claude Code ------------------------------------------------------
+echo "[fusion-claude] launching: claude $* (model=$ANTHROPIC_MODEL, fast=$ANTHROPIC_SMALL_FAST_MODEL)" >&2
+exec claude "$@"
