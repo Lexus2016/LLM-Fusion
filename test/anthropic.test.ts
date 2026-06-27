@@ -214,6 +214,100 @@ describe("anthropic translation", () => {
       usage: { input_tokens: 4, output_tokens: 5 },
     });
   });
+
+  it("accepts null assistant content and converts it to an empty string", () => {
+    const req: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: null },
+      ],
+    };
+    const openAi = anthropicToOpenAiRequest(req);
+    expect(openAi.messages).toEqual([
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "" },
+    ]);
+  });
+
+  it("ignores thinking and redacted_thinking blocks", () => {
+    const req: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "step one" },
+            { type: "redacted_thinking", data: "abcd" },
+            { type: "text", text: "result" },
+          ],
+        },
+      ],
+    };
+    const openAi = anthropicToOpenAiRequest(req);
+    expect(openAi.messages).toEqual([{ role: "assistant", content: "result" }]);
+  });
+
+  it("accepts a tool_result with null content", () => {
+    const req: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [
+        { role: "user", content: "run it" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "tu-1", name: "bash", input: { command: "ls" } }],
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "tu-1", content: null }],
+        },
+      ],
+    };
+    const openAi = anthropicToOpenAiRequest(req);
+    expect(openAi.messages).toEqual([
+      { role: "user", content: "run it" },
+      { role: "assistant", tool_calls: [{ id: "tu-1", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "ls" }) } }] },
+      { role: "tool", content: "", tool_call_id: "tu-1" },
+    ]);
+  });
+
+  it("accepts a tool_result containing an image and maps it to a URL string", () => {
+    const req: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tu-2",
+              content: [
+                { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" } },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const openAi = anthropicToOpenAiRequest(req);
+    expect(openAi.messages).toEqual([
+      { role: "tool", content: "data:image/png;base64,iVBORw0KGgo=", tool_call_id: "tu-2" },
+    ]);
+  });
+
+  it("falls back to empty content when an assistant message has only thinking blocks", () => {
+    const req: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "internal reasoning" }],
+        },
+      ],
+    };
+    const openAi = anthropicToOpenAiRequest(req);
+    expect(openAi.messages).toEqual([{ role: "assistant", content: "" }]);
+  });
 });
 
 describe("anthropic route", () => {
@@ -274,6 +368,24 @@ describe("anthropic route", () => {
   it("rejects malformed Anthropic bodies with 400", async () => {
     const res = await postMessages(makeApp(), {});
     expect(res.status).toBe(400);
+  });
+
+  it("accepts a request with null content and thinking blocks", async () => {
+    const res = await postMessages(makeApp(), {
+      model: "anthropic-fast",
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "step" },
+            { type: "text", text: "hello" },
+          ],
+        },
+        { role: "user", content: null },
+      ],
+    });
+    expect(res.status).toBe(200);
   });
 
   it("maps upstream tool_calls to a streamed Anthropic tool_use block", async () => {

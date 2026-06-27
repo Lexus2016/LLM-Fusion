@@ -65,9 +65,25 @@ const ToolResultBlockSchema = z
   .object({
     type: z.literal("tool_result"),
     tool_use_id: z.string(),
-    content: z.union([z.string(), z.array(TextBlockSchema)]).default(""),
+    // Allow null and image arrays because the Anthropic SDK / Claude Code can
+    // emit them in real agent loops (e.g. a tool that returns nothing, or a
+    // vision tool that returns a screenshot). They are translated best-effort
+    // into the OpenAI chat-completions shape.
+    content: z.union([z.string(), z.null(), z.array(z.union([TextBlockSchema, ImageBlockSchema]))]).default(""),
     is_error: z.boolean().optional(),
   })
+  .passthrough();
+
+// Extended-thinking blocks appear in model responses; a strict Anthropic
+// client would not send them back, but the SDK may preserve them in the
+// message history. Accept them for compatibility and ignore them when
+// translating to OpenAI, which has no equivalent concept.
+const ThinkingBlockSchema = z
+  .object({ type: z.literal("thinking"), thinking: z.string() })
+  .passthrough();
+
+const RedactedThinkingBlockSchema = z
+  .object({ type: z.literal("redacted_thinking"), data: z.string() })
   .passthrough();
 
 const ContentBlockSchema = z.union([
@@ -75,12 +91,16 @@ const ContentBlockSchema = z.union([
   ImageBlockSchema,
   ToolUseBlockSchema,
   ToolResultBlockSchema,
+  ThinkingBlockSchema,
+  RedactedThinkingBlockSchema,
 ]);
 
 const MessageSchema = z
   .object({
     role: z.enum(["user", "assistant", "system"]),
-    content: z.union([z.string(), z.array(ContentBlockSchema)]),
+    // null content is accepted because Claude Code occasionally emits it for
+    // assistant/tool messages; it is normalised to an empty string upstream.
+    content: z.union([z.string(), z.null(), z.array(ContentBlockSchema)]),
   })
   .passthrough();
 
@@ -97,7 +117,7 @@ const ToolChoiceSchema = z.union([
   z.object({ type: z.enum(["auto", "any", "tool"]), name: z.string().optional() }).passthrough(),
 ]);
 
-const AnthropicRequestSchema = z
+export const AnthropicRequestSchema = z
   .object({
     model: z.string().min(1),
     messages: z.array(MessageSchema),
@@ -181,8 +201,11 @@ export function anthropicToOpenAiRequest(req: AnthropicRequest): ChatCompletionR
 }
 
 function anthropicUserContentToOpenAi(
-  content: string | AnthropicContentBlock[],
+  content: string | AnthropicContentBlock[] | null,
 ): ChatMessage[] {
+  if (content == null) {
+    return [{ role: "user", content: "" }];
+  }
   if (typeof content === "string") {
     return [{ role: "user", content }];
   }
@@ -211,9 +234,13 @@ function anthropicUserContentToOpenAi(
     } else if (block.type === "tool_result") {
       flushUser();
       const toolContent =
-        typeof block.content === "string"
-          ? block.content
-          : block.content.map((b) => b.text).join("\n");
+        block.content == null
+          ? ""
+          : typeof block.content === "string"
+            ? block.content
+            : block.content
+                .map((b) => (b.type === "image" ? anthropicImageUrl(b.source) : b.text))
+                .join("\n");
       result.push({
         role: "tool",
         content: toolContent,
@@ -226,8 +253,11 @@ function anthropicUserContentToOpenAi(
 }
 
 function anthropicSystemContentToOpenAi(
-  content: string | AnthropicContentBlock[],
+  content: string | AnthropicContentBlock[] | null,
 ): ChatMessage {
+  if (content == null) {
+    return { role: "system", content: "" };
+  }
   if (typeof content === "string") {
     return { role: "system", content };
   }
@@ -241,8 +271,11 @@ function anthropicSystemContentToOpenAi(
 }
 
 function anthropicAssistantContentToOpenAi(
-  content: string | AnthropicContentBlock[],
+  content: string | AnthropicContentBlock[] | null,
 ): ChatMessage {
+  if (content == null) {
+    return { role: "assistant", content: "" };
+  }
   if (typeof content === "string") {
     return { role: "assistant", content };
   }
@@ -268,6 +301,7 @@ function anthropicAssistantContentToOpenAi(
   const message: ChatMessage = { role: "assistant" };
   if (textParts.length > 0) message.content = textParts.join("\n");
   if (toolCalls.length > 0) message.tool_calls = toolCalls;
+  if (message.content == null && message.tool_calls == null) message.content = "";
   return message;
 }
 
