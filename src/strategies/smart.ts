@@ -21,6 +21,7 @@ import { fusionStrategy } from "./fusion";
 import { assertSingleVisionCapable } from "../vision";
 import { extractJsonObject } from "../json";
 import { withTimeout, realTimer } from "../timeout";
+import { createHash } from "node:crypto";
 
 /**
  * `smart` strategy — a classifier/router in front of two sub-routes (spec §5.8,
@@ -84,6 +85,45 @@ const RouteDecisionSchema = z
   })
   .passthrough();
 type RouteDecision = z.infer<typeof RouteDecisionSchema>;
+
+/**
+ * Router-decision cache. A long agent loop re-issues the classifier every turn,
+ * but consecutive turns with an identical routing view (same recent window,
+ * same latest tool result) yield the same decision — re-paying one router
+ * round-trip of latency and one upstream call each time. The cache keys on the
+ * exact request body the router is asked to classify, so a hit is provably the
+ * same decision the model would return. Only successfully parsed router
+ * decisions are cached; failures (timeout / non-OK / unparseable) fall through
+ * to the default route and are NOT cached, so a transient blip self-heals on the
+ * next identical request. In-flight coalescing (`routerPending`) collapses
+ * concurrent identical requests onto a single upstream call.
+ */
+const MAX_ROUTER_CACHE_SIZE = 256;
+const routerCache = new Map<string, "simple" | "fusion">();
+const routerPending = new Map<string, Promise<"simple" | "fusion">>();
+
+/** Stable hash of a router request body for use as a cache key. */
+function routerCacheKey(body: Record<string, unknown>): string {
+  return createHash("sha256").update(JSON.stringify(body)).digest("hex");
+}
+
+/** Test-only: clear the router decision cache and any in-flight promises. */
+export function __resetRouterCacheForTesting(): void {
+  routerCache.clear();
+  routerPending.clear();
+}
+
+/** Insert a successful router decision into the LRU-bounded cache. */
+function setRouterCache(key: string, route: "simple" | "fusion"): void {
+  // Delete-then-set moves an existing key to the end (most-recently-used),
+  // approximating LRU on Map's insertion-order iteration below.
+  routerCache.delete(key);
+  routerCache.set(key, route);
+  if (routerCache.size > MAX_ROUTER_CACHE_SIZE) {
+    const oldest = routerCache.keys().next().value;
+    if (oldest !== undefined) routerCache.delete(oldest);
+  }
+}
 
 /** OpenAI- or native-shaped completion envelope (only the content we read). */
 const RouterMessageSchema = z
@@ -176,6 +216,52 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
     ],
   };
 
+  const key = routerCacheKey(body);
+  const cached = routerCache.get(key);
+  if (cached !== undefined) {
+    ctx.logger.debug(
+      { router, model: ctx.request.model, route: cached },
+      "smart: router cache hit; reusing prior decision",
+    );
+    return cached;
+  }
+
+  // Collapse concurrent identical requests onto a single upstream call so a burst
+  // of identical in-flight requests does not pay N router round-trips.
+  const inFlight = routerPending.get(key);
+  if (inFlight) {
+    ctx.logger.debug(
+      { router, model: ctx.request.model },
+      "smart: router cache coalesce; awaiting in-flight classifier",
+    );
+    return inFlight;
+  }
+
+  const promise = classifyUncached(ctx, cfg, resilience, body, key).finally(() => {
+    routerPending.delete(key);
+  });
+  routerPending.set(key, promise);
+  return promise;
+}
+
+/**
+ * The actual upstream classifier call. Isolated from `classify` so the cache
+ * wrapper can short-circuit on a hit / coalesce in-flight duplicates. Returns
+ * the configured `default` route on any failure (error, timeout, non-OK status,
+ * unparseable/invalid JSON) — never throws. Only a successfully parsed router
+ * decision is written to the cache; a failure must NOT be cached, so a
+ * transient blip self-heals on the next identical request.
+ */
+async function classifyUncached(
+  ctx: StrategyContext,
+  cfg: SmartModelConfig,
+  resilience: Resilience,
+  body: Record<string, unknown>,
+  key: string,
+): Promise<"simple" | "fusion"> {
+  const router = cfg.router;
+  const fallback = cfg.default;
+
   const startedAt = Date.now();
   let result: ChatCompletionResult;
   // Stage timeout: bound the router independently of the full upstream request
@@ -253,6 +339,7 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
     { router, model: ctx.request.model, route: decision.route, reason: decision.reason },
     "smart: router decision",
   );
+  setRouterCache(key, decision.route);
   return decision.route;
 }
 

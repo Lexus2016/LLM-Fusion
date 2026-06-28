@@ -1,6 +1,6 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import { z } from "zod";
-import { smartStrategy } from "../src/strategies/smart";
+import { smartStrategy, __resetRouterCacheForTesting } from "../src/strategies/smart";
 import { OllamaClient } from "../src/upstream/ollama";
 import { CapabilityService } from "../src/capabilities";
 import { parseConfig } from "../src/config";
@@ -167,6 +167,11 @@ function reqWithToolResult(model: string, toolContent: string): ChatCompletionRe
 }
 
 describe("smart strategy", () => {
+  // The router-decision cache is module-level; reset it between tests so a
+  // prior test's cached decision does not short-circuit the router call the
+  // next test asserts on.
+  beforeEach(() => __resetRouterCacheForTesting());
+
   it("route=simple runs only the simple path; router called once, non-streamed", async () => {
     const up = makeUpstream(chatWith(routeSimple));
     const res = await smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
@@ -395,6 +400,9 @@ describe("smart strategy", () => {
     await smartStrategy.execute(ctx(upS.client, req("smart-inline"), "smart-inline"));
     expect(upS.modelsCalled()).toContain("deepseek");
 
+    // Same `req("smart-inline")` yields an identical router body, so the decision
+    // is cached from the simple half; reset to force a fresh router call here.
+    __resetRouterCacheForTesting();
     const upF = makeUpstream(chatWith(routeFusion));
     await smartStrategy.execute(ctx(upF.client, req("smart-inline"), "smart-inline"));
     for (const m of [...PANEL, "jdg", "syn"]) expect(upF.modelsCalled()).toContain(m);
@@ -406,14 +414,20 @@ describe("smart strategy", () => {
     await smartStrategy.execute(ctx(inlineS.client, req("smart-inline"), "smart-inline"));
     const refS = makeUpstream(chatWith(routeSimple));
     await smartStrategy.execute(ctx(refS.client, req("smart-ref"), "smart-ref"));
-    expect([...refS.modelsCalled()].sort()).toEqual([...inlineS.modelsCalled()].sort());
+    // The router model `rt` is the same across both; compare only the sub-route.
+    expect([...refS.modelsCalled()].filter((m) => m !== "rt").sort()).toEqual(
+      [...inlineS.modelsCalled()].filter((m) => m !== "rt").sort(),
+    );
 
-    // fusion route
+    // fusion route — reset so the cached simple decision does not short-circuit.
+    __resetRouterCacheForTesting();
     const inlineF = makeUpstream(chatWith(routeFusion));
     await smartStrategy.execute(ctx(inlineF.client, req("smart-inline"), "smart-inline"));
     const refF = makeUpstream(chatWith(routeFusion));
     await smartStrategy.execute(ctx(refF.client, req("smart-ref"), "smart-ref"));
-    expect([...refF.modelsCalled()].sort()).toEqual([...inlineF.modelsCalled()].sort());
+    expect([...refF.modelsCalled()].filter((m) => m !== "rt").sort()).toEqual(
+      [...inlineF.modelsCalled()].filter((m) => m !== "rt").sort(),
+    );
   });
 
   it("stream=true + route=simple pipes the sub-route SSE; router stays non-streamed", async () => {
@@ -532,6 +546,80 @@ describe("smart strategy", () => {
     expect(res.status).toBe(200);
     expect(up.modelsCalled()).toContain("deepseek"); // degraded to default=simple after the router timed out
   }, 6000);
+
+  it("router decision is cached: an identical second request skips the router call", async () => {
+    const up = makeUpstream(chatWith(routeSimple));
+    await smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+    expect(up.routerBodies()).toHaveLength(1);
+
+    // Same request -> identical router body -> cache hit, no second router call.
+    const up2 = makeUpstream(chatWith(routeSimple));
+    await smartStrategy.execute(ctx(up2.client, req("smart-inline"), "smart-inline"));
+    expect(up2.routerBodies()).toHaveLength(0);
+    // The cached decision still dispatches to the simple sub-route.
+    expect(up2.modelsCalled()).toContain("deepseek");
+  });
+
+  it("concurrent identical requests coalesce onto a single router call", async () => {
+    // Block the router call until both requests are in flight, so a cache-hit
+    // shortcut cannot masquerade as coalescing: the router cannot resolve until
+    // we release it, by which point both classify() calls must have entered.
+    let release!: () => void;
+    const routerBlocked = new Promise<void>((r) => (release = r));
+    const chat = chatWith(routeSimple);
+    const up = makeUpstream((body) => {
+      if (body.model === "rt") return routerBlocked.then(() => chat(body));
+      return chat(body);
+    });
+
+    // Fire both without awaiting so they race into classify() concurrently.
+    const pA = smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+    const pB = smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+    // Let the event loop turn so both have reached the in-flight pending entry.
+    await new Promise((r) => setImmediate(r));
+    release();
+
+    const [a, b] = await Promise.all([pA, pB]);
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+    // Coalesced: only ONE router call serviced both concurrent requests. Without
+    // coalescing the blocked router would have been invoked twice.
+    expect(up.routerBodies()).toHaveLength(1);
+  });
+
+  it("router cache is keyed by the request: a different message forces a fresh router call", async () => {
+    const up = makeUpstream(chatWith(routeFusion));
+    await smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+    expect(up.routerBodies()).toHaveLength(1);
+
+    // A different user message changes the router body -> cache miss -> new call.
+    const up2 = makeUpstream(chatWith(routeFusion));
+    await smartStrategy.execute(
+      ctx(up2.client, { ...req("smart-inline"), messages: [{ role: "user", content: "different" }] }, "smart-inline"),
+    );
+    // A body-keyed cache means the second request does NOT reuse the first
+    // decision, so the router must be called again.
+    expect(up2.routerBodies()).toHaveLength(1);
+  });
+
+  it("a router failure is NOT cached: an identical retry re-invokes the router", async () => {
+    // First request: router returns garbage -> fallback to default, uncached.
+    const up1 = makeUpstream(chatWith(routerGarbage));
+    await smartStrategy.execute(ctx(up1.client, req("smart-inline"), "smart-inline"));
+    expect(up1.routerBodies()).toHaveLength(1);
+
+    // Identical request must still call the router (no cached fallback), and this
+    // time it succeeds -> the decision is now cached.
+    const up2 = makeUpstream(chatWith(routeSimple));
+    await smartStrategy.execute(ctx(up2.client, req("smart-inline"), "smart-inline"));
+    expect(up2.routerBodies()).toHaveLength(1);
+    expect(up2.modelsCalled()).toContain("deepseek");
+
+    // Third identical request now hits the cache.
+    const up3 = makeUpstream(chatWith(routeSimple));
+    await smartStrategy.execute(ctx(up3.client, req("smart-inline"), "smart-inline"));
+    expect(up3.routerBodies()).toHaveLength(0);
+  });
 });
 
 describe("smart config validation", () => {
