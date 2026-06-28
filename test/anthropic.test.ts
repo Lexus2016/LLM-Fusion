@@ -308,6 +308,119 @@ describe("anthropic translation", () => {
     const openAi = anthropicToOpenAiRequest(req);
     expect(openAi.messages).toEqual([{ role: "assistant", content: "" }]);
   });
+
+  it("accepts thinking and redacted_thinking with missing or null content fields", () => {
+    const req: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", signature: "sig1" },
+            { type: "redacted_thinking", signature: "sig2" },
+          ],
+        },
+      ],
+    };
+    const openAi = anthropicToOpenAiRequest(req);
+    expect(openAi.messages).toEqual([{ role: "assistant", content: "" }]);
+  });
+
+  it("accepts a tool_use block with null and string inputs", () => {
+    const req1: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "tu-1", name: "bash", input: null },
+          ],
+        },
+      ],
+    };
+    const openAi1 = anthropicToOpenAiRequest(req1);
+    expect(openAi1.messages).toEqual([
+      {
+        role: "assistant",
+        tool_calls: [
+          {
+            id: "tu-1",
+            type: "function",
+            function: { name: "bash", arguments: "{}" },
+          },
+        ],
+      },
+    ]);
+
+    const req2: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "tu-2", name: "bash", input: '{"arg":"val"}' },
+          ],
+        },
+      ],
+    };
+    const openAi2 = anthropicToOpenAiRequest(req2);
+    expect(openAi2.messages).toEqual([
+      {
+        role: "assistant",
+        tool_calls: [
+          {
+            id: "tu-2",
+            type: "function",
+            function: { name: "bash", arguments: '{"arg":"val"}' },
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("accepts a tool_result with embedded thinking blocks", () => {
+    const req: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tu-1",
+              content: [
+                { type: "thinking", thinking: "thought text" },
+                { type: "text", text: "result text" },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const openAi = anthropicToOpenAiRequest(req);
+    expect(openAi.messages).toEqual([
+      { role: "tool", content: "thought text\nresult text", tool_call_id: "tu-1" },
+    ]);
+  });
+
+  it("accepts a single content block object directly in content", () => {
+    const req: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [
+        {
+          role: "user",
+          content: { type: "text", text: "hello" },
+        },
+      ],
+    };
+    const openAi = anthropicToOpenAiRequest(req);
+    expect(openAi.messages).toEqual([
+      {
+        role: "user",
+        content: [{ type: "text", text: "hello" }],
+      },
+    ]);
+  });
 });
 
 describe("anthropic route", () => {

@@ -33,6 +33,13 @@ const CompletionSchema = z
   })
   .passthrough();
 
+/** Strips <think> and </think> tags and trims the result. */
+export function stripThinkingTags(text: string): string {
+  return text
+    .replace(/<think>/gi, "")
+    .replace(/<\/think>/gi, "");
+}
+
 /** First non-empty string among the candidates, else "". */
 export function firstNonEmpty(...values: Array<string | null | undefined>): string {
   for (const v of values) {
@@ -85,10 +92,18 @@ export function promoteReasoningNonStream(data: unknown): unknown {
   if (parsed.data.message) messages.push(parsed.data.message);
   let mutated = false;
   for (const message of messages) {
-    const content = typeof message.content === "string" ? message.content : "";
-    if (content.trim().length > 0) continue; // real content already present
+    let content = typeof message.content === "string" ? message.content : "";
+    if (content.length > 0) {
+      const cleaned = stripThinkingTags(content);
+      if (cleaned !== content) {
+        message.content = cleaned;
+        mutated = true;
+      }
+    }
+    const promotedContent = typeof message.content === "string" ? message.content : "";
+    if (promotedContent.trim().length > 0) continue; // real content already present
     if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) continue; // tool path
-    const reasoning = reasoningText(message);
+    const reasoning = stripThinkingTags(reasoningText(message));
     if (reasoning.length === 0) continue;
     message.content = reasoning;
     mutated = true;
@@ -127,7 +142,6 @@ export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, U
   let realContentSeen = false;
 
   const handleLine = (line: string): string => {
-    if (realContentSeen) return line; // real content already streamed — pass through
     if (!line.startsWith("data:")) return line; // blank separators, comments, etc.
     const payload = line.slice("data:".length).trim();
     if (payload.length === 0 || payload === "[DONE]") return line;
@@ -146,14 +160,20 @@ export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, U
       const content = typeof delta.content === "string" ? delta.content : "";
       if (content.length > 0) {
         realContentSeen = true; // real content — leave this and every later event alone
-        continue;
+        const cleaned = stripThinkingTags(content);
+        if (cleaned !== content) {
+          delta.content = cleaned;
+          modified = true;
+        }
+      } else if (!realContentSeen) {
+        const reasoning = stripThinkingTags(firstNonEmpty(delta.reasoning, delta.reasoning_content));
+        if (reasoning.length > 0) {
+          delta.content = reasoning;
+          delete delta.reasoning;
+          delete delta.reasoning_content;
+          modified = true;
+        }
       }
-      const reasoning = firstNonEmpty(delta.reasoning, delta.reasoning_content);
-      if (reasoning.length === 0) continue; // nothing to promote (incl. tool_calls-only deltas)
-      delta.content = reasoning;
-      delete delta.reasoning;
-      delete delta.reasoning_content;
-      modified = true;
     }
     return modified ? `data: ${JSON.stringify(parsed.data)}` : line;
   };

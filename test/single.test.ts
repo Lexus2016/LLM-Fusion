@@ -136,6 +136,27 @@ describe("single strategy", () => {
     expect(body.choices[0].message.content).toBe("THE ANSWER");
   });
 
+  it("strips <think> and </think> tags from promoted reasoning and content", async () => {
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: () =>
+            jsonResponse({
+              choices: [
+                { index: 0, message: { role: "assistant", content: "hello</think>", reasoning: "" }, finish_reason: "stop" },
+              ],
+            }),
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(ctxWith(client, { model: "fast-glm", messages: [] }));
+    const body = JSON.parse(await res.text());
+    expect(body.choices[0].message.content).toBe("hello");
+  });
+
   it("propagates the context abort signal to upstream (M-1 client disconnect)", async () => {
     // The hanging fetch only settles when ITS signal aborts; aborting the context
     // signal must reject the strategy call — proving ctx.signal reaches upstream.

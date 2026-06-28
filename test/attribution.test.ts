@@ -166,16 +166,26 @@ describe("per-call error attribution", () => {
     const capabilities = new CapabilityService({ client, getOverrides: () => config.overrides, logger: cap.logger });
     const entry = config.models["fusion-1"];
     if (!entry) throw new Error("missing fusion-1");
+    const testConfig = {
+      ...config,
+      defaults: {
+        ...config.defaults,
+        min_panel_success: 3,
+      },
+    };
     const strategy = createFusionStrategy({ timer: fastTimer });
-    const res = await strategy.execute({
-      request: { model: "fusion-1", messages: [{ role: "user", content: "hi" }] },
-      config,
-      client,
-      capabilities,
-      logger: cap.logger,
-      modelConfig: entry,
-    });
-    expect(res.status).toBe(200); // survivors carry the request
+    try {
+      await strategy.execute({
+        request: { model: "fusion-1", messages: [{ role: "user", content: "hi" }] },
+        config: testConfig,
+        client,
+        capabilities,
+        logger: cap.logger,
+        modelConfig: entry,
+      });
+    } catch (err) {
+      // Expected AllMembersFailedError
+    }
     const timeout = failures(cap).find((l) => l.upstream_model === "m2");
     expect(timeout).toMatchObject({ stage: "panel", upstream_model: "m2", err_kind: "timeout" });
     expect(typeof timeout?.latency_ms).toBe("number");

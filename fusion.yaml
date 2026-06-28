@@ -6,7 +6,7 @@ upstream:
   base_url: https://ollama.com        # Ollama Cloud root
   api_key_env: OLLAMA_API_KEY         # env var holding the Bearer key (never inline the key)
   api_mode: openai                    # Phase 0 confirmed: /v1 chat + SSE + tool_calls all work (auto | openai | native)
-  max_concurrency: 4                  # global p-limit across all in-flight calls (default: 4)
+  max_concurrency: 8                  # global p-limit across all in-flight calls (default: 4)
   request_timeout_s: 120              # per upstream call; MUST be < 182 (default: 170)
 
 server:
@@ -20,7 +20,7 @@ server:
 defaults:                             # applied to every model unless overridden per-model
   panel_member_timeout_s: 90          # per panel member (default: 90)
   judge_timeout_s: 120                # judge stage (default: 60)
-  min_panel_success: 1                # min successful panel answers, else 502 (default: 1)
+  min_panel_success: 2                # min successful panel answers, else 502 (default: 1)
 
 models:
   # single — 1:1 passthrough to one fast model.

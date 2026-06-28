@@ -17,6 +17,7 @@ import { dispatch } from "./router";
 import { UsageAccumulator, usageHeaderValue, toOpenAiUsage } from "./usage";
 import { createAuthMiddleware } from "./auth";
 import { BadRequestError, FusionError, toErrorResponse } from "./errors";
+import { stripThinkingTags } from "./reasoning";
 
 /**
  * Anthropic Messages API compatibility layer.
@@ -52,12 +53,26 @@ const ImageBlockSchema = z
   })
   .passthrough();
 
+const ThinkingBlockSchema = z
+  .object({
+    type: z.literal("thinking"),
+    thinking: z.string().optional().nullable(),
+  })
+  .passthrough();
+
+const RedactedThinkingBlockSchema = z
+  .object({
+    type: z.literal("redacted_thinking"),
+    data: z.string().optional().nullable(),
+  })
+  .passthrough();
+
 const ToolUseBlockSchema = z
   .object({
     type: z.literal("tool_use"),
     id: z.string(),
     name: z.string(),
-    input: z.record(z.string(), z.unknown()).default({}),
+    input: z.union([z.record(z.string(), z.unknown()), z.string(), z.null()]).optional().default({}),
   })
   .passthrough();
 
@@ -69,21 +84,15 @@ const ToolResultBlockSchema = z
     // emit them in real agent loops (e.g. a tool that returns nothing, or a
     // vision tool that returns a screenshot). They are translated best-effort
     // into the OpenAI chat-completions shape.
-    content: z.union([z.string(), z.null(), z.array(z.union([TextBlockSchema, ImageBlockSchema]))]).default(""),
+    content: z
+      .union([
+        z.string(),
+        z.null(),
+        z.array(z.union([TextBlockSchema, ImageBlockSchema, ThinkingBlockSchema, RedactedThinkingBlockSchema])),
+      ])
+      .default(""),
     is_error: z.boolean().optional(),
   })
-  .passthrough();
-
-// Extended-thinking blocks appear in model responses; a strict Anthropic
-// client would not send them back, but the SDK may preserve them in the
-// message history. Accept them for compatibility and ignore them when
-// translating to OpenAI, which has no equivalent concept.
-const ThinkingBlockSchema = z
-  .object({ type: z.literal("thinking"), thinking: z.string() })
-  .passthrough();
-
-const RedactedThinkingBlockSchema = z
-  .object({ type: z.literal("redacted_thinking"), data: z.string() })
   .passthrough();
 
 const ContentBlockSchema = z.union([
@@ -100,7 +109,7 @@ const MessageSchema = z
     role: z.enum(["user", "assistant", "system"]),
     // null content is accepted because Claude Code occasionally emits it for
     // assistant/tool messages; it is normalised to an empty string upstream.
-    content: z.union([z.string(), z.null(), z.array(ContentBlockSchema)]),
+    content: z.union([z.string(), z.null(), ContentBlockSchema, z.array(ContentBlockSchema)]),
   })
   .passthrough();
 
@@ -201,7 +210,7 @@ export function anthropicToOpenAiRequest(req: AnthropicRequest): ChatCompletionR
 }
 
 function anthropicUserContentToOpenAi(
-  content: string | AnthropicContentBlock[] | null,
+  content: string | AnthropicContentBlock | AnthropicContentBlock[] | null,
 ): ChatMessage[] {
   if (content == null) {
     return [{ role: "user", content: "" }];
@@ -223,7 +232,8 @@ function anthropicUserContentToOpenAi(
     currentUser = null;
   };
 
-  for (const block of content) {
+  const blocks = Array.isArray(content) ? content : [content];
+  for (const block of blocks) {
     if (block.type === "text") {
       if (!currentUser) currentUser = { role: "user", content: [] };
       currentUser.content.push({ type: "text", text: block.text });
@@ -239,7 +249,19 @@ function anthropicUserContentToOpenAi(
           : typeof block.content === "string"
             ? block.content
             : block.content
-                .map((b) => (b.type === "image" ? anthropicImageUrl(b.source) : b.text))
+                .map((b) => {
+                  if (b.type === "image") {
+                    return anthropicImageUrl(b.source);
+                  }
+                  if (b.type === "text") {
+                    return b.text;
+                  }
+                  if (b.type === "thinking") {
+                    return b.thinking || "";
+                  }
+                  return "";
+                })
+                .filter(Boolean)
                 .join("\n");
       result.push({
         role: "tool",
@@ -253,7 +275,7 @@ function anthropicUserContentToOpenAi(
 }
 
 function anthropicSystemContentToOpenAi(
-  content: string | AnthropicContentBlock[] | null,
+  content: string | AnthropicContentBlock | AnthropicContentBlock[] | null,
 ): ChatMessage {
   if (content == null) {
     return { role: "system", content: "" };
@@ -261,8 +283,9 @@ function anthropicSystemContentToOpenAi(
   if (typeof content === "string") {
     return { role: "system", content };
   }
+  const blocks = Array.isArray(content) ? content : [content];
   let text = "";
-  for (const block of content) {
+  for (const block of blocks) {
     if (block.type === "text") {
       text += (text.length > 0 ? "\n" : "") + block.text;
     }
@@ -271,7 +294,7 @@ function anthropicSystemContentToOpenAi(
 }
 
 function anthropicAssistantContentToOpenAi(
-  content: string | AnthropicContentBlock[] | null,
+  content: string | AnthropicContentBlock | AnthropicContentBlock[] | null,
 ): ChatMessage {
   if (content == null) {
     return { role: "assistant", content: "" };
@@ -282,17 +305,26 @@ function anthropicAssistantContentToOpenAi(
 
   const textParts: string[] = [];
   const toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
+  const blocks = Array.isArray(content) ? content : [content];
 
-  for (const block of content) {
+  for (const block of blocks) {
     if (block.type === "text") {
       textParts.push(block.text);
     } else if (block.type === "tool_use") {
+      let args = "{}";
+      if (block.input != null) {
+        if (typeof block.input === "string") {
+          args = block.input;
+        } else {
+          args = JSON.stringify(block.input);
+        }
+      }
       toolCalls.push({
         id: block.id,
         type: "function",
         function: {
           name: block.name,
-          arguments: JSON.stringify(block.input),
+          arguments: args,
         },
       });
     }
@@ -375,7 +407,7 @@ export function openAiToAnthropicResponse(
   const finishReason = choice?.finish_reason ?? null;
 
   const contentBlocks: Array<Record<string, unknown>> = [];
-  const textContent = typeof message?.content === "string" ? message.content : "";
+  const textContent = typeof message?.content === "string" ? stripThinkingTags(message.content) : "";
   if (textContent.length > 0) {
     contentBlocks.push({ type: "text", text: textContent });
   }
@@ -550,16 +582,19 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
     const delta = choice.delta;
     if (!delta) return;
 
-    const text = delta.content ?? delta.reasoning;
-    if (typeof text === "string" && text.length > 0) {
-      if (!activeBlock || activeBlock.kind !== "text") {
-        startTextBlock(controller);
+    const rawText = delta.content ?? delta.reasoning;
+    if (typeof rawText === "string" && rawText.length > 0) {
+      const text = stripThinkingTags(rawText);
+      if (text.length > 0) {
+        if (!activeBlock || activeBlock.kind !== "text") {
+          startTextBlock(controller);
+        }
+        emit(controller, "content_block_delta", {
+          type: "content_block_delta",
+          index: activeBlock!.index,
+          delta: { type: "text_delta", text },
+        });
       }
-      emit(controller, "content_block_delta", {
-        type: "content_block_delta",
-        index: activeBlock!.index,
-        delta: { type: "text_delta", text },
-      });
     }
 
     for (const tc of delta.tool_calls ?? []) {

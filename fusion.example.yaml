@@ -14,7 +14,7 @@ server:
 defaults:                             # applied to every model unless overridden per-model
   panel_member_timeout_s: 90          # per panel member (default: 90)
   judge_timeout_s: 60                 # judge stage (default: 60)
-  min_panel_success: 1                # min successful panel answers, else 502 (default: 1)
+  min_panel_success: 2                # min successful panel answers, else 502 (default: 1)
 
 models:
   # --- fusion strategy (Phase 3) ---

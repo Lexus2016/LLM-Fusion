@@ -52,23 +52,27 @@ const ROUTER_SYSTEM_PROMPT = [
   "Decide whether the user's request needs multi-model deliberation (\"fusion\") or whether a single capable model suffices (\"simple\").",
   'Reply with ONLY a JSON object of the form {"route": "simple" | "fusion", "reason": "<short reason>"}.',
   "",
-  'Choose "fusion" when the request is any of:',
-  "- complex, multi-faceted, or multi-step (several sub-problems, trade-offs, or moving parts);",
-  "- ambiguous or underspecified (the best answer depends on assumptions worth cross-checking);",
-  "- high-stakes or hard to reverse (correctness, safety, money, data loss, or production impact);",
-  "- architecture, system design, or API/schema design;",
-  "- security, threat modeling, or anything where a subtle mistake is costly;",
-  "- debugging, root-cause analysis, or reasoning about why something fails;",
-  "- research, comparison, or synthesis across multiple sources or options;",
-  "- anything that benefits from several models cross-checking each other to catch blind spots.",
+  'Choose "fusion" only when the request is genuinely complex or high-stakes:',
+  "- complex, multi-faceted, or multi-step architecture or system design decisions;",
+  "- ambiguous or underspecified requirements where assumptions must be debated;",
+  "- critical, high-stakes tasks where a mistake causes data loss, security bugs, or money loss;",
+  "- debugging deep, unknown root-causes of failures (where it is unclear why something is broken);",
+  "- research, comparison, or synthesis of conflicting trade-offs across multiple options;",
+  "- security auditing, cryptography, or threat modeling.",
   "",
-  'Choose "simple" only when the request is genuinely routine: a single-step task, a factual lookup, a short edit, a trivial transformation, boilerplate, or casual conversation that one strong model answers well on its own.',
+  'Choose "simple" for all routine coding, editing, and execution tasks:',
+  "- writing unit tests, adding test cases, or creating straightforward test suites (correctness is easily checked by running them);",
+  "- writing routine helper functions, boilerplate, basic scripts, or straightforward implementations;",
+  "- making minor edits, refactoring local functions, or formatting code;",
+  "- fixing clear-cut syntax errors, typos, or well-defined bugs with obvious solutions;",
+  "- explaining code, documenting code, or writing markdown documentation;",
+  "- factual lookups, casual conversation, grep/search, or mechanical operations.",
   "",
   "If this is an agent mid-loop (the latest message is a tool result), classify the model's NEXT action:",
-  '- "fusion" when the next step will write, modify, or review code; fix a bug; design or refactor; analyze a failure; or make a correctness/architecture decision — the substantive work where several viewpoints raise quality.',
-  '- "simple" when the next step is mechanical: reading or opening a file, listing a directory, grep/search, running a command just to gather information, or acknowledging a result before moving on.',
+  '- "fusion" only for substantive, complex design/architecture changes, debugging unknown errors, or high-stakes security/API modifications.',
+  '- "simple" for routine actions: writing unit tests, adding tests, writing basic helpers/boilerplate, editing minor files, reading/viewing files, running commands/tests, or mechanical tool updates.',
   "",
-  "When in doubt between the two, prefer \"fusion\" — the cost of under-deliberating a hard task outweighs the cost of deliberating an easy one.",
+  "When in doubt, choose \"simple\" if the output is easily verified by running tests or a compiler, as the test runner serves as the correction gate.",
   "Output the JSON object and nothing else.",
 ].join("\n");
 
@@ -183,12 +187,14 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
   const stageAbort = new AbortController();
   const signal = ctx.signal ? AbortSignal.any([ctx.signal, stageAbort.signal]) : stageAbort.signal;
   try {
-    result = await withTimeout(
-      resilience.limiter(() => ctx.client.chatCompletions(body, { stream: false, signal })),
-      timeoutMs,
-      realTimer,
-      `smart router '${router}' timed out after ${timeoutMs}ms`,
-      () => stageAbort.abort(),
+    result = await resilience.limiter(() =>
+      withTimeout(
+        ctx.client.chatCompletions(body, { stream: false, signal }),
+        timeoutMs,
+        realTimer,
+        `smart router '${router}' timed out after ${timeoutMs}ms`,
+        () => stageAbort.abort(),
+      ),
     );
   } catch (err) {
     resilience.breaker.recordFailure(router);

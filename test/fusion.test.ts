@@ -68,7 +68,7 @@ const RecordedBodySchema = z
   .passthrough();
 type RecordedBody = z.infer<typeof RecordedBodySchema>;
 
-type ChatHandler = (body: RecordedBody) => Response | Promise<Response>;
+type ChatHandler = (body: RecordedBody, signal?: AbortSignal) => Response | Promise<Response>;
 type ShowHandler = (model: string) => Response;
 
 interface Upstream {
@@ -89,7 +89,7 @@ function makeUpstream(chat: ChatHandler, show?: ShowHandler): Upstream {
     if (url.endsWith("/v1/chat/completions") || url.endsWith("/api/chat")) {
       const body = RecordedBodySchema.parse(JSON.parse(String(init?.body)));
       recorded.push(body);
-      return chat(body);
+      return chat(body, init?.signal ?? undefined);
     }
     return jsonResponse({ error: `no route for ${url}` }, 404);
   };
@@ -243,6 +243,83 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(judgeInput).not.toContain("ans-m2");
   });
 
+  it("cancels other panel members early if min_panel_success is met", async () => {
+    let m2Aborted = false;
+    let m3Aborted = false;
+    const chat = defaultChat();
+    const up = makeUpstream((body, signal) => {
+      if (body.model === "m1") {
+        return chat(body);
+      }
+      if (body.model === "m2") {
+        return new Promise<Response>((resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            m2Aborted = true;
+            reject(new DOMException("aborted", "AbortError"));
+          });
+        });
+      }
+      if (body.model === "m3") {
+        return new Promise<Response>((resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            m3Aborted = true;
+            reject(new DOMException("aborted", "AbortError"));
+          });
+        });
+      }
+      return chat(body);
+    });
+
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    expect(res.status).toBe(200);
+
+    // Wait a brief moment for async promises to settle
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(m2Aborted).toBe(true);
+    expect(m3Aborted).toBe(true);
+
+    // Judge saw only the answer from m1
+    const judgeBody = up.recorded.find((b) => b.model === "j");
+    expect(judgeBody).toBeDefined();
+    const judgeInput = userContents(judgeBody!).join("\n");
+    expect(judgeInput).toContain("ans-m1");
+    expect(judgeInput).not.toContain("ans-m2");
+    expect(judgeInput).not.toContain("ans-m3");
+  });
+
+  it("does NOT cancel panel members early if they have started delivering tokens", async () => {
+    let m2Aborted = false;
+    const chat = defaultChat();
+    const up = makeUpstream((body, signal) => {
+      if (body.model === "m1") {
+        return chat(body);
+      }
+      if (body.model === "m2") {
+        // Stream one token, then block
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"chunk"}}]}\n'));
+            signal?.addEventListener("abort", () => {
+              m2Aborted = true;
+            });
+          }
+        });
+        return jsonResponse(stream);
+      }
+      return chat(body);
+    });
+
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    expect(res.status).toBe(200);
+
+    // Wait a brief moment for async promises to settle
+    await new Promise((r) => setTimeout(r, 10));
+
+    // m2 has started delivering, so it should NOT be aborted!
+    expect(m2Aborted).toBe(false);
+  });
+
   it("times out a slow panel member and proceeds with the survivors", async () => {
     // Injected timer fires after 5ms regardless of the configured 90s.
     const fastTimer: TimerFactory = () => {
@@ -376,7 +453,7 @@ describe("fusion strategy — panel/judge/synth", () => {
     const synthBody = upStream.recorded.find((b) => b.model === "s");
     expect(synthBody?.stream).toBe(true);
     const panelStreamed = upStream.recorded.filter((b) => b.model.startsWith("m") && b.stream === true);
-    expect(panelStreamed).toHaveLength(0);
+    expect(panelStreamed).toHaveLength(3);
 
     const upJson = makeUpstream(defaultChat(true, false));
     const jsonRes = await fusionStrategy.execute(ctx(upJson.client, req({ stream: false })));

@@ -30,7 +30,7 @@ import type { TimerFactory } from "../timeout";
 // Re-exported: the fusion strategy's timer-injection API (FusionDeps.timer) is
 // typed by TimerFactory, so tests that inject a deterministic timer import it here.
 export type { TimerFactory };
-import { extractAnswer, promoteReasoningNonStream, makeReasoningPromotionTransform } from "../reasoning";
+import { extractAnswer, promoteReasoningNonStream, makeReasoningPromotionTransform, stripThinkingTags } from "../reasoning";
 
 /**
  * `fusion` strategy — the core algorithm (spec §5.7 / §8.2):
@@ -201,6 +201,96 @@ async function assertSynthVision(ctx: StrategyContext, cfg: FusionModelConfig): 
 
 // --- Panel stage -----------------------------------------------------------
 
+/** Accumulates a stream default output while notifying when the first token starts delivering. */
+async function accumulateStreamAndTrack(
+  stream: ReadableStream<Uint8Array>,
+  onFirstToken: () => void,
+  signal?: AbortSignal,
+): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let accumulatedRaw = "";
+  let calledFirstToken = false;
+
+  try {
+    for (;;) {
+      if (signal?.aborted) {
+        throw new DOMException("aborted", "AbortError");
+      }
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) {
+        const chunkStr = decoder.decode(value, { stream: true });
+        accumulatedRaw += chunkStr;
+
+        if (accumulatedRaw.length > 0 && !calledFirstToken) {
+          const trimmed = accumulatedRaw.trim();
+          if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+            // Raw JSON response
+            calledFirstToken = true;
+            onFirstToken();
+          } else if (trimmed.includes("data:")) {
+            // Check if we received the first real data chunk in SSE
+            const lines = trimmed.split("\n");
+            for (const line of lines) {
+              const tl = line.trim();
+              if (tl.startsWith("data:") && tl !== "data: [DONE]") {
+                try {
+                  const payload = tl.slice("data:".length).trim();
+                  const chunk = JSON.parse(payload);
+                  const choice = chunk.choices?.[0];
+                  const text = choice?.delta?.content || choice?.delta?.reasoning || choice?.delta?.reasoning_content || "";
+                  if (text.length > 0) {
+                    calledFirstToken = true;
+                    onFirstToken();
+                    break;
+                  }
+                } catch {
+                  // ignore
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    accumulatedRaw += decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+
+  // Parse the final accumulatedRaw string
+  const trimmed = accumulatedRaw.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      const choice = parsed.choices?.[0];
+      return choice?.message?.content || choice?.message?.reasoning || parsed.message?.content || "";
+    } catch {
+      return "";
+    }
+  }
+
+  // Parse SSE lines
+  let content = "";
+  const lines = accumulatedRaw.split("\n");
+  for (const line of lines) {
+    const tl = line.trim();
+    if (tl.startsWith("data:") && tl !== "data: [DONE]") {
+      try {
+        const payload = tl.slice("data:".length).trim();
+        const chunk = JSON.parse(payload);
+        const choice = chunk.choices?.[0];
+        const text = choice?.delta?.content || choice?.delta?.reasoning || choice?.delta?.reasoning_content || "";
+        content += text;
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return content;
+}
+
 async function runPanel(
   ctx: StrategyContext,
   resilience: Resilience,
@@ -209,19 +299,86 @@ async function runPanel(
   opts: { hasTools: boolean; native: boolean },
 ): Promise<PanelAnswer[]> {
   const timeoutMs = ctx.config.defaults.panel_member_timeout_s * 1000;
-  const tasks = members.map((member) =>
-    callPanelMember(ctx, resilience, member, timer, timeoutMs, opts).catch((err: unknown) => {
-      ctx.logger.warn(
-        { member, reason: err instanceof Error ? err.message : String(err) },
-        "fusion: panel member failed, dropping",
-      );
-      return null;
-    }),
-  );
-  const settled = await Promise.all(tasks);
+  const minSuccess = ctx.config.defaults.min_panel_success;
+
   const answers: PanelAnswer[] = [];
-  for (const a of settled) if (a) answers.push(a);
-  return answers;
+  let completedCount = 0;
+
+  if (members.length === 0) {
+    return [];
+  }
+
+  const memberControllers = members.map(() => new AbortController());
+  const hasStartedDelivering = members.map(() => false);
+  const completed = members.map(() => false);
+
+  return new Promise<PanelAnswer[]>((resolve) => {
+    const checkFinished = () => {
+      const successfulCount = answers.length;
+      if (successfulCount >= minSuccess) {
+        // Early cancellation: abort only members that have NOT started delivering yet!
+        for (let i = 0; i < members.length; i++) {
+          if (!completed[i] && !hasStartedDelivering[i]) {
+            memberControllers[i]?.abort();
+          }
+        }
+        resolve(answers);
+        return true;
+      }
+      if (completedCount === members.length) {
+        resolve(answers);
+        return true;
+      }
+      return false;
+    };
+
+    if (checkFinished()) return;
+
+    members.forEach((member, i) => {
+      const controller = memberControllers[i];
+      if (!controller) return;
+      const combinedSignal = ctx.signal
+        ? AbortSignal.any([ctx.signal, controller.signal])
+        : controller.signal;
+
+      callPanelMember(
+        ctx,
+        resilience,
+        member,
+        timer,
+        timeoutMs,
+        opts,
+        combinedSignal,
+        () => {
+          hasStartedDelivering[i] = true;
+        },
+      )
+        .then((ans) => {
+          completed[i] = true;
+          completedCount++;
+          if (ans) {
+            answers.push(ans);
+          }
+          checkFinished();
+        })
+        .catch((err) => {
+          completed[i] = true;
+          completedCount++;
+          if (!controller.signal.aborted) {
+            ctx.logger.warn(
+              { member, reason: err instanceof Error ? err.message : String(err) },
+              "fusion: panel member failed, dropping",
+            );
+          } else {
+            ctx.logger.debug(
+              { member },
+              "fusion: panel member cancelled early",
+            );
+          }
+          checkFinished();
+        });
+    });
+  });
 }
 
 async function callPanelMember(
@@ -231,6 +388,8 @@ async function callPanelMember(
   timer: TimerFactory,
   timeoutMs: number,
   opts: { hasTools: boolean; native: boolean },
+  signal?: AbortSignal,
+  onFirstToken?: () => void,
 ): Promise<PanelAnswer | null> {
   if (!resilience.breaker.canAttempt(member)) {
     logUpstreamFailure(ctx.logger, { stage: "panel", model: member, kind: "circuit_open", latencyMs: 0 });
@@ -241,17 +400,21 @@ async function callPanelMember(
   const startedAt = Date.now();
   let result: ChatCompletionResult;
   const abort = new AbortController();
+  const useStream = !opts.native;
   try {
-    result = await withTimeout(
-      resilience.limiter(() =>
-        invokeUpstream(ctx.client, body, { stream: false, native: opts.native, signal: combineSignals(ctx.signal, abort.signal) }),
+    result = await resilience.limiter(() =>
+      withTimeout(
+        invokeUpstream(ctx.client, body, { stream: useStream, native: opts.native, signal: combineSignals(signal ?? ctx.signal, abort.signal) }),
+        timeoutMs,
+        timer,
+        `panel member '${member}' timed out after ${timeoutMs}ms`,
+        () => abort.abort(),
       ),
-      timeoutMs,
-      timer,
-      `panel member '${member}' timed out after ${timeoutMs}ms`,
-      () => abort.abort(),
     );
   } catch (err) {
+    if (signal?.aborted) {
+      throw err;
+    }
     resilience.breaker.recordFailure(member);
     ctx.usage?.recordError(member);
     logUpstreamFailure(ctx.logger, {
@@ -264,17 +427,7 @@ async function callPanelMember(
     throw err;
   }
   ctx.usage?.record(member, result);
-  if (result.kind !== "json") {
-    resilience.breaker.recordFailure(member);
-    logUpstreamFailure(ctx.logger, {
-      stage: "panel",
-      model: member,
-      kind: "error",
-      latencyMs: Date.now() - startedAt,
-      reason: "unexpected non-json panel result",
-    });
-    return null;
-  }
+
   if (result.status >= 400) {
     // Drop the answer either way; only availability failures (429/5xx) trip the
     // breaker and get attributed — a 4xx is a request-shape issue, not a sick model.
@@ -297,16 +450,37 @@ async function callPanelMember(
           model: member,
           status: result.status,
           latencyMs: Date.now() - startedAt,
-          reason: shortErrorReason(result.data),
+          reason: result.kind === "json" ? shortErrorReason(result.data) : "unexpected stream error response",
         },
         "fusion: panel member dropped (client error response)",
       );
     }
     return null;
   }
+
+  let content = "";
+  if (result.kind === "stream" && result.body) {
+    content = await accumulateStreamAndTrack(result.body, onFirstToken ?? (() => {}), signal);
+  } else if (result.kind === "json") {
+    content = extractAnswer(result.data) ?? "";
+    if (content.length > 0 && onFirstToken) {
+      onFirstToken();
+    }
+  } else {
+    resilience.breaker.recordFailure(member);
+    logUpstreamFailure(ctx.logger, {
+      stage: "panel",
+      model: member,
+      kind: "error",
+      latencyMs: Date.now() - startedAt,
+      reason: "unexpected non-json/non-stream panel result",
+    });
+    return null;
+  }
+
   resilience.breaker.recordSuccess(member);
-  const content = extractAnswer(result.data);
-  if (content === null) {
+  const cleanedContent = stripThinkingTags(content);
+  if (cleanedContent === "") {
     // 200 but no usable text (empty content AND empty reasoning, or an unparseable
     // shape). Previously a silent drop; log it so a thin panel is never a mystery.
     ctx.logger.warn(
@@ -315,7 +489,7 @@ async function callPanelMember(
     );
     return null;
   }
-  return { member, content };
+  return { member, content: cleanedContent };
 }
 
 /** Best-effort short error string from an upstream error body, for logging only. */
@@ -392,12 +566,14 @@ async function runJudge(
   let result: ChatCompletionResult;
   const abort = new AbortController();
   try {
-    result = await withTimeout(
-      resilience.limiter(() => ctx.client.chatCompletions(body, { stream: false, signal: combineSignals(ctx.signal, abort.signal) })),
-      timeoutMs,
-      timer,
-      `judge '${judge}' timed out after ${timeoutMs}ms`,
-      () => abort.abort(),
+    result = await resilience.limiter(() =>
+      withTimeout(
+        ctx.client.chatCompletions(body, { stream: false, signal: combineSignals(ctx.signal, abort.signal) }),
+        timeoutMs,
+        timer,
+        `judge '${judge}' timed out after ${timeoutMs}ms`,
+        () => abort.abort(),
+      ),
     );
   } catch (err) {
     resilience.breaker.recordFailure(judge);

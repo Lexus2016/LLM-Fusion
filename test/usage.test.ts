@@ -309,7 +309,7 @@ describe("usage accounting", () => {
 
   it("include_usage is NOT set on non-stream upstream requests", async () => {
     const { app, recorded } = makeApp(buildConfig());
-    await post(app, { model: "fusion-m", messages: [{ role: "user", content: "hard" }] });
+    await post(app, { model: "single-m", messages: [{ role: "user", content: "hard" }] });
     expect(recorded.length).toBeGreaterThan(0);
     expect(recorded.every((r) => r.includeUsage === false)).toBe(true);
   });
