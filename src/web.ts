@@ -4,10 +4,13 @@
  * Design — a single shared pre-stage, NOT a per-member tool loop:
  *   1. One Tavily search is run ONCE per fusion call, before the panel fans out.
  *   2. The cleaned results are formatted as prose and injected into every panel
- *      member's prompt as a `system` message — exactly like tool descriptions
- *      are already injected. No panel member ever receives real `tools`, so the
- *      one-`tool_calls`-per-step invariant for the agent loop is untouched: the
- *      synth is still the only stage that may emit a client-visible tool call.
+ *      member's prompt as a `user` turn (inserted before the latest user message),
+ *      NOT as a `system` message: some panel members (kimi-k2.7-code) ignore live
+ *      facts placed in a system role and refuse on a stale training cutoff, while
+ *      the same facts in a user turn make them answer. No panel member ever
+ *      receives real `tools`, so the one-`tool_calls`-per-step invariant for the
+ *      agent loop is untouched: the synth is still the only stage that may emit a
+ *      client-visible tool call.
  *
  * Gating (the user's hard requirement): the feature is OFF unless
  * `TAVILY_API_KEY` is set in the environment, AND the model opts in via
