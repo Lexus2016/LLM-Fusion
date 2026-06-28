@@ -87,6 +87,28 @@ describe("config", () => {
       }),
     ).toThrow();
   });
+
+  it("rejects a fusion model whose adversarial member is not in the panel", () => {
+    expect(() =>
+      parseConfig({
+        ...minimal,
+        models: {
+          f: { strategy: "fusion", panel: ["a", "b"], judge: "a", synth: "b", adversarial: "c" },
+        },
+      }),
+    ).toThrow(/not listed in its panel/);
+  });
+
+  it("rejects a fusion panel that lists the same member twice", () => {
+    expect(() =>
+      parseConfig({
+        ...minimal,
+        models: {
+          f: { strategy: "fusion", panel: ["a", "a", "b"], judge: "a", synth: "b" },
+        },
+      }),
+    ).toThrow(/more than once/);
+  });
 });
 
 describe("config hot-reload", () => {

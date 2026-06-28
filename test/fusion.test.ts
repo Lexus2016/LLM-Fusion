@@ -345,6 +345,45 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(judgeInput).not.toContain("ans-m3");
   });
 
+  it("waits for the adversarial member even after min_panel_success is met (does not drop it)", async () => {
+    // min_panel_success default = 1. m1 answers instantly -> success met. The
+    // adversarial member (m2) is slow. Without the wait-for-adversarial fix the
+    // promise would resolve at m1's success and drop m2's in-flight red-team answer.
+    // With the fix, m2 is waited for and its answer reaches the judge; m3 (a non-
+    // adversarial straggler) IS early-cancelled.
+    let m3Aborted = false;
+    const chat = defaultChat(true);
+    const up = makeUpstream((body, signal) => {
+      if (body.model === "m1") return chat(body); // instant
+      if (body.model === "m2") {
+        // adversarial: deliver after a short delay so it is NOT yet done at m1's success
+        return new Promise<Response>((resolve) => {
+          setTimeout(() => resolve(chat(body)), 40);
+        });
+      }
+      if (body.model === "m3") {
+        return new Promise<Response>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            m3Aborted = true;
+            reject(new DOMException("aborted", "AbortError"));
+          });
+        });
+      }
+      return chat(body);
+    });
+
+    const res = await fusionStrategy.execute(ctx(up.client, req(), "fusion-adv"));
+    expect(res.status).toBe(200);
+
+    // The adversarial member's answer was waited for and reached the judge.
+    const judgeBody = up.recorded.find((b) => b.model === "j");
+    expect(judgeBody).toBeDefined();
+    const judgeInput = userContents(judgeBody!).join("\n");
+    expect(judgeInput).toContain("ans-m2");
+    // The non-adversarial straggler was cancelled as soon as success was met.
+    expect(m3Aborted).toBe(true);
+  });
+
   it("does NOT cancel panel members early if they have started delivering tokens", async () => {
     let m2Aborted = false;
     const chat = defaultChat();

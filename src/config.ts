@@ -34,6 +34,48 @@ const FailoverModelSchema = z
   })
   .strict();
 
+const BinevalDimensionSchema = z
+  .object({
+    dimension: z.string().min(1),
+    question: z.string().min(1),
+  })
+  .strict();
+
+const BinevalSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    // Model to run the evaluator. Defaults to the fusion judge model.
+    model: z.string().min(1).optional(),
+    // Overall score below this marks the output as low-quality (surfaced in headers).
+    threshold: z.number().min(0).max(1).default(0.7),
+    // Per-evaluation timeout. Defaults to the global judge timeout.
+    timeout_s: z.number().int().positive().lt(182).optional(),
+    // Custom binary questions. When absent, the built-in DEFAULT_DIMENSIONS are used.
+    dimensions: z.array(BinevalDimensionSchema).min(1).optional(),
+  })
+  .strict();
+
+/**
+ * Optional web grounding for a fusion panel: one Tavily search before the panel
+ * fans out, results injected as prose context. Requires TAVILY_API_KEY in the
+ * environment; without it the feature stays OFF even when enabled here. Shared
+ * between the top-level fusion model schema and the inline smart-fusion block so
+ * web grounding does not depend on whether `smart` references a fusion model by
+ * string or defines an inline block.
+ */
+const WebSearchSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    max_results: z.number().int().min(1).max(10).default(3),
+    timeout_s: z.number().int().positive().lt(60).default(20),
+    max_context_chars: z.number().int().positive().default(4000),
+    // Skip web grounding when the request is already this large (chars, ≈4
+    // chars/token), so the added context can't overflow a smaller-context panel
+    // member mid-loop. Short planning turns still ground.
+    max_prompt_chars: z.number().int().positive().default(80000),
+  })
+  .optional();
+
 const FusionModelSchema = z
   .object({
     strategy: z.literal("fusion"),
@@ -45,6 +87,15 @@ const FusionModelSchema = z
     // Per-model override of `defaults.promote_reasoning_to_content`. When unset
     // the global default applies.
     promote_reasoning_to_content: z.boolean().optional(),
+    web_search: WebSearchSchema,
+    // Optional adversarial panel member: the name of a model ALREADY listed in
+    // `panel` that should run with a red-team/contrarian prompt (find flaws, hidden
+    // assumptions, edge cases) instead of just answering. Addresses the "fake
+    // consensus" / shared-priors failure mode by forcing one seat to disagree on
+    // purpose. Validated to be a panel member (see superRefine below).
+    adversarial: z.string().min(1).optional(),
+    // Optional BinEval post-synth quality evaluation (non-streaming only).
+    bineval: BinevalSchema.optional(),
   })
   .strict();
 
@@ -58,6 +109,8 @@ const FusionBlockSchema = z
     judge: z.string().min(1),
     synth: z.string().min(1),
     promote_reasoning_to_content: z.boolean().optional(),
+    web_search: WebSearchSchema,
+    bineval: BinevalSchema.optional(),
   })
   .strict();
 
@@ -160,6 +213,32 @@ export const ConfigSchema = z
       if (entry.strategy !== "smart") continue;
       checkSmartReference(cfg.models, ctx, name, "simple", entry.simple);
       checkSmartReference(cfg.models, ctx, name, "fusion", entry.fusion);
+    }
+    // A fusion model's `adversarial` member must be one of its panel members, and the
+    // panel must not list the same model twice — a duplicate means two identical upstream
+    // calls and, for the adversarial slot, only the first copy is protected from early
+    // abort (the second is treated as a normal member and can be cancelled).
+    for (const [name, entry] of Object.entries(cfg.models)) {
+      if (entry.strategy !== "fusion") continue;
+      const adv = entry.adversarial;
+      if (adv !== undefined && !entry.panel.includes(adv)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["models", name, "adversarial"],
+          message: `fusion model '${name}' sets adversarial='${adv}', but '${adv}' is not listed in its panel; adversarial must be an existing panel member`,
+        });
+      }
+      const seen = new Set<string>();
+      for (const member of entry.panel) {
+        if (seen.has(member)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["models", name, "panel"],
+            message: `fusion model '${name}' lists panel member '${member}' more than once; each member must be unique`,
+          });
+        }
+        seen.add(member);
+      }
     }
   });
 

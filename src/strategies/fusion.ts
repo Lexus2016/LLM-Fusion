@@ -156,7 +156,11 @@ async function runFusion(
       { model: request.model, reason: cfg.tool_mode === "bypass" ? "bypass" : "planning_turn_only" },
       "fusion: synth-only path",
     );
-    return runSynth(ctx, resilience, cfg.synth, null, [], { stream, hasTools, native, promote, webContext: null });
+    const synthResponse = await runSynth(ctx, resilience, cfg.synth, null, [], { stream, hasTools, native, promote, webContext: null });
+    // synth-only skips the panel, so the post-synth bineval evaluation (which scores the
+    // panel-synthesized answer) does not apply. Surface that to the client rather than
+    // silently omitting the score header on a model the user configured bineval on.
+    return cfg.bineval?.enabled ? withBinevalSkippedHeader(synthResponse, "synth_only") : synthResponse;
   }
 
   // WEB GROUNDING — one optional Tavily search before the panel fans out; the
@@ -203,10 +207,29 @@ async function runFusion(
 
   // BINEVAL — optional post-synth quality evaluation. Streaming bodies are consumed by
   // the client, so we can only evaluate non-streaming JSON responses.
-  if (!cfg.bineval?.enabled || stream) {
+  if (!cfg.bineval?.enabled) {
     return response;
   }
+  if (stream) {
+    // bineval is configured but cannot run on a streaming response — surface WHY so a
+    // client always streaming never silently sees "no score" and mistakes it for "not
+    // configured". We wrap the stream in a new Response carrying the same body + header.
+    return withBinevalSkippedHeader(response, "streaming");
+  }
   return attachBinevalHeaders(ctx, resilience, cfg, response, timer, defaults);
+}
+
+/**
+ * Wrap a response adding a `X-Fusion-Bineval-Skipped: <reason>` header, used whenever
+ * bineval was configured for the model but the evaluation did not run. Lets a client
+ * tell "evaluation ran and scored high" apart from "evaluation never ran" — otherwise both
+ * look identical (no score header). The body is passed through untouched (works for both
+ * streaming and non-streaming bodies).
+ */
+function withBinevalSkippedHeader(response: Response, reason: string): Response {
+  const headers = new Headers(response.headers);
+  headers.set("X-Fusion-Bineval-Skipped", reason);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
 // --- Vision gate -----------------------------------------------------------
@@ -401,6 +424,8 @@ async function runPanel(
   const completed = members.map(() => false);
 
   return new Promise<PanelAnswer[]>((resolve) => {
+    const adversarialIdx =
+      opts.adversarialModel !== null ? members.indexOf(opts.adversarialModel) : -1;
     const checkFinished = () => {
       const successfulCount = answers.length;
       if (successfulCount >= minSuccess) {
@@ -409,14 +434,22 @@ async function runPanel(
         // contribution is the whole point of the slot, and red-team reasoning is
         // typically slower (it must steelman the opposite and hunt for flaws), so it
         // would be cancelled before delivering precisely when it earns its cost.
+        // Furthermore, we do NOT resolve until the adversarial member has finished
+        // (succeeded OR errored): resolving at min_success would drop its still-
+        // in-flight red-team answer on the floor, defeating the whole slot.
+        let adversarialDone = adversarialIdx < 0 || completed[adversarialIdx];
         for (let i = 0; i < members.length; i++) {
           if (!completed[i] && !hasStartedDelivering[i]) {
-            if (opts.adversarialModel !== null && members[i] === opts.adversarialModel) continue;
+            if (i === adversarialIdx) continue;
             memberControllers[i]?.abort();
           }
         }
-        resolve(answers);
-        return true;
+        if (adversarialDone) {
+          resolve(answers);
+          return true;
+        }
+        // Adversarial still running: keep waiting. Other stragglers already aborted.
+        return false;
       }
       if (completedCount === members.length) {
         resolve(answers);
@@ -1062,21 +1095,40 @@ async function attachBinevalHeaders(
   defaults: { judge_timeout_s: number },
 ): Promise<Response> {
   // Skip evaluation on error responses — the synth failed, there is nothing to score.
-  if (response.status >= 400) return response;
+  if (response.status >= 400) {
+    return withBinevalSkippedHeader(response, "synth_error");
+  }
   const bineval = cfg.bineval;
   if (!bineval) return response;
   const bodyText = await response.text();
   const headers = new Headers(response.headers);
   let result: BinaryEvaluationResult | null = null;
+  // Track WHY the evaluation was skipped so the client can tell "score is high" apart
+  // from "evaluation never ran". Set when we bail out without producing a result.
+  let skippedReason: string | null = null;
 
+  // Parse the synth body separately from the eval call: a throw inside runBineval
+  // (resilience/timeout/programming error) must NOT be mislabelled as a non-JSON body.
+  let data: unknown;
   try {
-    const data = JSON.parse(bodyText);
-    const outputText = extractAnswer(data) ?? "";
-    if (outputText.length > 0) {
-      const requestText = renderRequestForJudge(ctx.request);
-      const model = bineval.model ?? cfg.judge;
-      const timeoutMs = (bineval.timeout_s ?? defaults.judge_timeout_s) * 1000;
-      const questions = bineval.dimensions ?? DEFAULT_DIMENSIONS;
+    data = JSON.parse(bodyText);
+  } catch {
+    headers.set("X-Fusion-Bineval-Skipped", "non_json_body");
+    ctx.logger.warn({ reason: "non_json_body" }, "fusion: bineval skipped");
+    return new Response(bodyText, { status: response.status, statusText: response.statusText, headers });
+  }
+
+  const outputText = extractAnswer(data) ?? "";
+  if (outputText.length === 0) {
+    // 200 but no usable text (e.g. a tool-only response with tool_calls and empty
+    // content) — nothing to score.
+    skippedReason = "empty_output";
+  } else {
+    const requestText = renderRequestForJudge(ctx.request);
+    const model = bineval.model ?? cfg.judge;
+    const timeoutMs = (bineval.timeout_s ?? defaults.judge_timeout_s) * 1000;
+    const questions = bineval.dimensions ?? DEFAULT_DIMENSIONS;
+    try {
       result = await runBineval(
         ctx,
         resilience,
@@ -1087,9 +1139,22 @@ async function attachBinevalHeaders(
         timer,
         timeoutMs,
       );
+    } catch (err) {
+      // The eval call itself threw (unexpected). runBineval normally returns null on
+      // handled failures (eval model error/timeout/circuit); an exception here is an
+      // internal fault — surface it as eval_failed rather than mislabelling the body.
+      ctx.logger.warn(
+        { reason: "eval_exception", err: err instanceof Error ? err.message : String(err) },
+        "fusion: bineval eval call threw",
+      );
+      skippedReason = "eval_failed";
     }
-  } catch {
-    // Non-JSON body: return it unchanged.
+    if (result === null && skippedReason === null) {
+      // runBineval returned null on a handled failure (eval-model error / timeout /
+      // circuit-open / non-2xx / unparseable verdict JSON) — the response is fine, only
+      // the score is missing.
+      skippedReason = "eval_failed";
+    }
   }
 
   if (result) {
@@ -1103,9 +1168,14 @@ async function attachBinevalHeaders(
         "fusion: bineval score below threshold",
       );
     }
+  } else if (skippedReason !== null) {
+    headers.set("X-Fusion-Bineval-Skipped", skippedReason);
+    ctx.logger.warn({ reason: skippedReason }, "fusion: bineval skipped");
   }
 
-  return new Response(bodyText, { status: response.status, headers });
+  // Preserve statusText (withBinevalSkippedHeader does; this path must too) so a custom
+  // upstream status text is not dropped on the scored path.
+  return new Response(bodyText, { status: response.status, statusText: response.statusText, headers });
 }
 
 function buildSynthBody(

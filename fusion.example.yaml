@@ -41,6 +41,55 @@ models:
     #     full panel; only the mechanical in-between steps run cheap.
     fusion_planning_turn_only: false
 
+    # Optional BinEval post-synth quality evaluation (non-streaming responses only).
+    # Adds one extra evaluator call after the synth stage and returns per-dimension
+    # scores in response headers: X-Fusion-Bineval-Score, X-Fusion-Bineval-Dimensions,
+    # and X-Fusion-Bineval-Low-Score when the overall score is below threshold.
+    # When bineval is configured but the evaluation does NOT run, the proxy sets
+    # X-Fusion-Bineval-Skipped: <reason> (streaming | synth_error | eval_failed |
+    # empty_output | non_json_body | synth_only) so a client can tell "score is high"
+    # apart from "evaluation never ran". bineval is report-only — it does NOT trigger
+    # a re-deliberation loop.
+    # Useful for factual consistency checks on research / report outputs.
+    # bineval:
+    #   enabled: true
+    #   model: glm-5.2          # evaluator model; defaults to the fusion judge model
+    #   threshold: 0.7          # overall score below this marks the output as low-quality
+    #   timeout_s: 60           # per-evaluation timeout; defaults to defaults.judge_timeout_s
+    #   # Custom binary questions (optional; omit to use the built-in defaults):
+    #   dimensions:
+    #     - dimension: factual_consistency
+    #       question: "Does the answer contain only claims well-supported by the request and accepted facts?"
+
+    # Optional adversarial panel member: one of the panel models is instructed to
+    # steelman the OPPOSITE case and hunt for flaws, hidden assumptions, edge
+    # cases, and race conditions instead of agreeing with the consensus. This is
+    # role-based decorrelation on top of the lineage-based one: it forces the panel
+    # to contain a genuine dissenting voice, which the judge folds into
+    # `disagreements` and `blind_spots`. The value is "find the flaw", not
+    # "fabricate a flaw" — the adversarial member is allowed to say "I cannot find
+    # a real problem" when the consensus is actually solid.
+    # The value must be a model name ALREADY listed in this model's `panel`.
+    # The adversarial member is never early-cancelled, so it adds latency equal to
+    # the slowest panel member (the others are aborted once min_panel_success is
+    # met and it is still running).
+    # adversarial: kimi-k2.7-code
+
+    # Optional web grounding for the panel (research freshness). The proxy runs
+    # ONE Tavily search before the panel fans out and injects the cleaned results
+    # as prose context into every panel member — no member receives real tools,
+    # so the one-tool_calls-per-step invariant is preserved.
+    # Gated TWO ways (both required, else fully OFF, no latency/cost):
+    #   1. TAVILY_API_KEY must be set in the environment (.env).
+    #   2. web_search.enabled must be true here.
+    # A failed search degrades silently to an ungrounded panel. Respects
+    # fusion_planning_turn_only (no web search on mid-loop tool-result turns).
+    # web_search:
+    #   enabled: true
+    #   max_results: 3           # Tavily results to fetch (1-10)
+    #   timeout_s: 20            # per-search timeout (< 60)
+    #   max_context_chars: 4000  # cap on the injected context block
+
   # --- single strategy (Phase 1) ---
   fast-1:
     strategy: single
