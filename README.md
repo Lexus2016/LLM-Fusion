@@ -13,6 +13,8 @@ No database. No build step. Node 24 + TypeScript + Hono, runs `.ts` directly via
 ## Quickstart
 
 ```bash
+git clone https://github.com/Lexus2016/LLM-Fusion.git llm-fusion
+cd llm-fusion
 npm install                                        # Node ≥ 24
 printf 'OLLAMA_API_KEY=ollama-your-key\n' > .env    # your Ollama Cloud key
 npm start                                          # proxy on http://127.0.0.1:8080
@@ -130,10 +132,33 @@ That is how llm-fusion keeps long agent loops affordable without sacrificing del
 ## Install
 
 ```bash
+git clone https://github.com/Lexus2016/LLM-Fusion.git llm-fusion
+cd llm-fusion
 npm install
 ```
 
 Requires **Node ≥ 24** (the proxy uses native `process.loadEnvFile`, top-level features, and runs TypeScript through `tsx` — there is no separate build step).
+
+---
+
+## Update
+
+`llm-fusion` is tracked in git, not published to npm, so "upgrading" is pulling the latest and refreshing dependencies:
+
+```bash
+git pull                          # fast-forward to the newest commit / tag
+npm install                       # pick up any dependency changes
+```
+
+Then restart the proxy. Your `fusion.yaml` and `.env` are yours — `git pull` never overwrites local changes to them (the shipped `fusion.yaml` carries local model presets you may have edited, so if you edited it, either commit/stash it or keep your edits in a copy referenced via `FUSION_CONFIG`). To pin a specific release instead of tracking `main`:
+
+```bash
+git fetch --tags
+git checkout v0.1.12              # or any tag from the Releases page
+npm install
+```
+
+The `fusion.example.yaml` is the fully annotated reference and does get updated across releases — diff it against your working config when a new version lands to see new options. Changelog: [`CHANGELOG.md`](./CHANGELOG.md), releases: <https://github.com/Lexus2016/LLM-Fusion/releases>.
 
 ---
 
