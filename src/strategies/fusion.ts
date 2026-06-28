@@ -67,6 +67,7 @@ const JudgeAnalysisSchema = z
     disagreements: z.union([z.string(), z.array(z.string())]).optional(),
     unique_insights: z.union([z.string(), z.array(z.string())]).optional(),
     blind_spots: z.union([z.string(), z.array(z.string())]).optional(),
+    hallucination_flags: z.union([z.string(), z.array(z.string())]).optional(),
   })
   .passthrough();
 
@@ -527,7 +528,11 @@ const JUDGE_SYSTEM_PROMPT =
   "expert answers to it. Assess the answers AGAINST THE REQUEST and respond with ONLY a JSON object with these keys: " +
   '"consensus" (where the experts agree), "disagreements" (where they conflict — and, where the request makes it ' +
   'determinable, which side is correct and why), "unique_insights" (correct, useful points raised by only one expert), ' +
-  'and "blind_spots" (anything the request needs that none of them addressed). ' +
+  '"blind_spots" (anything the request needs that none of them addressed), ' +
+  'and "hallucination_flags" (any claims, function/API names, library versions, or facts stated confidently by one ' +
+  "expert but absent from or contradicted by the others — these are likely fabricated). " +
+  "Cross-reference the experts against each other: if only one expert mentions a specific API, function, " +
+  "command, or factual claim and the others do not corroborate it, flag it as suspect. " +
   "Judge factual correctness and how well each answer actually serves the request; do not reward verbosity. " +
   "Each value may be a string or an array of strings. Output JSON only — no prose, no code fences.";
 
@@ -742,7 +747,10 @@ function buildSynthContext(analysis: JudgeAnalysis | null, panelAnswers: PanelAn
       "A panel of expert models answered the user's request, and an impartial judge produced a structured " +
       "analysis of their answers. Write the single best final answer: take the actual content (code, formulas, " +
       "exact text) from the expert answers, and use the judge analysis to resolve disagreements, cover blind " +
-      "spots, and weight the consensus. Do not drop detail that only one expert provided unless it is wrong.\n\n" +
+      "spots, and weight the consensus. Do not drop detail that only one expert provided unless it is wrong. " +
+      "IMPORTANT: if the judge flagged hallucination_flags, treat those items as suspect — omit or explicitly " +
+      "caveat them rather than presenting fabricated information as fact. When experts disagree and you cannot " +
+      "determine which side is correct, say so honestly instead of inventing an answer.\n\n" +
       "JUDGE ANALYSIS (JSON):\n" +
       JSON.stringify(analysis) +
       "\n\nEXPERT ANSWERS:\n" +
