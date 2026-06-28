@@ -1034,4 +1034,43 @@ describe("fusion strategy — web grounding (gated on TAVILY_API_KEY + web_searc
       expect(sysMsgs.some((s) => s.includes("earlier message"))).toBe(true);
     }
   });
+  it("compresses array-based multimodal messages in the panel context", async () => {
+    const bigContent = "x".repeat(15000); // Exceeds PANEL_MSG_HEAD + PANEL_MSG_TAIL
+    const request: ChatCompletionRequest = {
+      model: "fusion-vision",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: "data:..." } },
+            { type: "text", text: `Here is a huge log file:\n${bigContent}` },
+          ],
+        },
+      ],
+    };
+    // Force compression by making total > 200k chars
+    for (let i = 0; i < 20; i++) {
+      request.messages!.push({ role: "assistant", content: `step ${i}` });
+      request.messages!.push({ role: "tool", content: bigContent });
+    }
+
+    // Need a custom capability show function since we are using vision model
+    const show = (model: string): Response =>
+      jsonResponse({
+        capabilities: ["vm1", "vm2", "vs"].includes(model) ? ["completion", "vision"] : ["completion"],
+        model_info: {},
+      });
+    const up = makeUpstream(defaultChat(), show);
+    await fusionStrategy.execute(ctx(up.client, request, "fusion-vision"));
+
+    const panelBody = up.recorded.find((b) => b.model === "vm1");
+    expect(panelBody).toBeDefined();
+    
+    const userMsg = panelBody!.messages.find((m: any) => m.role === "user" && Array.isArray(m.content)) as any;
+    expect(userMsg).toBeDefined();
+    const textPart = userMsg.content.find((p: any) => p.type === "text");
+    expect(textPart.text.length).toBeLessThan(9000); // Capped to 8000 + omit marker
+    expect(textPart.text).toContain("chars omitted");
+  });
 });
+

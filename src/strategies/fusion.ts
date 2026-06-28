@@ -685,11 +685,32 @@ function approxTotalChars(msgs: unknown[]): number {
 
 /** Cap a single message's text content (head + tail with omission marker). */
 function capPanelMessageContent(content: unknown): unknown {
-  if (typeof content !== "string") return content;
   const max = PANEL_MSG_HEAD + PANEL_MSG_TAIL;
-  if (content.length <= max) return content;
-  const omitted = content.length - max;
-  return `${content.slice(0, PANEL_MSG_HEAD)}\n…[${omitted} chars omitted]…\n${content.slice(-PANEL_MSG_TAIL)}`;
+
+  if (typeof content === "string") {
+    if (content.length <= max) return content;
+    const omitted = content.length - max;
+    return `${content.slice(0, PANEL_MSG_HEAD)}\n…[${omitted} chars omitted]…\n${content.slice(-PANEL_MSG_TAIL)}`;
+  }
+
+  if (Array.isArray(content)) {
+    return content.map((part) => {
+      if (typeof part === "object" && part !== null && "text" in part) {
+        const rec = part as Record<string, unknown>;
+        if (typeof rec.text === "string" && rec.text.length > max) {
+          const text = rec.text;
+          const omitted = text.length - max;
+          return {
+            ...rec,
+            text: `${text.slice(0, PANEL_MSG_HEAD)}\n…[${omitted} chars omitted]…\n${text.slice(-PANEL_MSG_TAIL)}`,
+          };
+        }
+      }
+      return part;
+    });
+  }
+
+  return content;
 }
 
 /**
