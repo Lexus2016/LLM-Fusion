@@ -60,6 +60,15 @@ const config = parseConfig({
       simple: { target: "deepseek" },
       fusion: "fusion-pto",
     },
+    // Vision-capable simple target, for the router-hallucination-guard "image present" test.
+    "vision-single": { strategy: "single", target: "vdeepseek" },
+    "smart-vision": {
+      strategy: "smart",
+      router: "rt",
+      default: "fusion",
+      simple: "vision-single",
+      fusion: { panel: ["p1", "p2", "p3"], judge: "jdg", synth: "syn" },
+    },
   },
 });
 
@@ -77,6 +86,7 @@ const RecordedBodySchema = z
 type RecordedBody = z.infer<typeof RecordedBodySchema>;
 
 type ChatHandler = (body: RecordedBody) => Response | Promise<Response>;
+type ShowHandler = (model: string) => Response;
 
 interface Upstream {
   client: UpstreamClient;
@@ -85,13 +95,14 @@ interface Upstream {
   routerBodies: () => RecordedBody[];
 }
 
-function makeUpstream(chat: ChatHandler): Upstream {
+function makeUpstream(chat: ChatHandler, show?: ShowHandler): Upstream {
   const recorded: RecordedBody[] = [];
   const fetchFn: FetchFn = async (input, init) => {
     const url =
       typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     if (url.endsWith("/api/show")) {
-      return jsonResponse({ capabilities: ["completion"], model_info: {} });
+      const model = z.object({ model: z.string() }).parse(JSON.parse(String(init?.body))).model;
+      return show ? show(model) : jsonResponse({ capabilities: ["completion"], model_info: {} });
     }
     if (url.endsWith("/v1/chat/completions") || url.endsWith("/api/chat")) {
       const body = RecordedBodySchema.parse(JSON.parse(String(init?.body)));
@@ -138,7 +149,7 @@ function chatWith(routerResp: () => Response): ChatHandler {
       if (body.stream === true) return sseResponse([{ choices: [{ delta: { content: "final" } }] }]);
       return jsonResponse({ choices: [{ message: { content: "final" } }] });
     }
-    if (body.model === "deepseek" || body.model === "simp-t") {
+    if (body.model === "deepseek" || body.model === "simp-t" || body.model === "vdeepseek") {
       if (body.stream === true) {
         return sseResponse([{ choices: [{ delta: { content: "simple-answer" } }] }]);
       }
@@ -393,6 +404,126 @@ describe("smart strategy", () => {
     const called = up.modelsCalled();
     expect(called).toContain("deepseek");
     for (const p of PANEL) expect(called).not.toContain(p);
+  });
+
+  // --- router hallucination guard: an image/screenshot "reason" with no image present ---
+  const routeSimpleClaimingImage = (): Response =>
+    jsonResponse({
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({
+              route: "simple",
+              reason: "User sent a screenshot/image in response to a completed task; routine interpretation.",
+            }),
+          },
+        },
+      ],
+    });
+  const routeFusionClaimingImage = (): Response =>
+    jsonResponse({
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({
+              route: "fusion",
+              reason: "User attached a screenshot; needs deep analysis.",
+            }),
+          },
+        },
+      ],
+    });
+
+  it("router claims an image that is NOT present -> treats as untrustworthy, falls back to default=simple", async () => {
+    __resetRouterCacheForTesting();
+    const up = makeUpstream(chatWith(routeSimpleClaimingImage));
+    // Plain-text request, no image_url blocks.
+    const res = await smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+    expect(res.status).toBe(200);
+    const called = up.modelsCalled();
+    // Default is simple -> deepseek ran; the router's "simple" choice happened to
+    // match default, but the guard is what made the decision trustworthy.
+    expect(called).toContain("deepseek");
+  });
+
+  it("router claims an image that is NOT present, chose fusion -> falls back to default=simple (cost control)", async () => {
+    __resetRouterCacheForTesting();
+    const up = makeUpstream(chatWith(routeFusionClaimingImage));
+    const res = await smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+    expect(res.status).toBe(200);
+    const called = up.modelsCalled();
+    // Guard caught the fabricated image; default=simple runs, fusion panel does NOT.
+    expect(called).toContain("deepseek");
+    for (const p of PANEL) expect(called).not.toContain(p);
+  });
+
+  it("router claims an image that IS present -> decision is trusted (no fallback)", async () => {
+    __resetRouterCacheForTesting();
+    // smart-vision has default=fusion, so a guard fallback would run the PANEL.
+    // If the guard correctly trusts the router (an image really is present), the
+    // router's "simple" choice runs the vision-capable simple target and the
+    // panel does NOT.
+    const show = (model: string): Response =>
+      jsonResponse({
+        capabilities: model === "vdeepseek" ? ["completion", "vision"] : ["completion"],
+        model_info: {},
+      });
+    const up = makeUpstream(chatWith(routeSimpleClaimingImage), show);
+    const res = await smartStrategy.execute(
+      ctx(
+        up.client,
+        req("smart-vision", {
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "look at this" },
+                { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } },
+              ],
+            },
+          ],
+        }),
+        "smart-vision",
+      ),
+    );
+    expect(res.status).toBe(200);
+    const called = up.modelsCalled();
+    // Router said simple and the image claim is true -> trusted -> simple runs,
+    // panel does NOT (which it WOULD have, had the guard fallen back to default=fusion).
+    expect(called).toContain("vdeepseek");
+    for (const p of PANEL) expect(called).not.toContain(p);
+  });
+
+  it("router MENTIONS an image in a negating context (no image present) -> NOT flagged, decision trusted", async () => {
+    // Real production case: user pasted text; the router correctly observed
+    // "no actual image attachment / plain-text" but mentioned the word "image".
+    // The guard must NOT treat that as a hallucination and override a correct call.
+    __resetRouterCacheForTesting();
+    const routeNegatedImage = (): Response =>
+      jsonResponse({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                route: "simple",
+                reason:
+                  "The latest user message is a plain-text marker '[multimodal content]' with no actual image attachment; routine conversational interaction.",
+              }),
+            },
+          },
+        ],
+      });
+    // smart-default-fusion: default=fusion. If the guard WRONGLY fired, it would
+    // fall back to fusion (panel runs). If it correctly trusts the router, simple
+    // (deepseek) runs and the panel does NOT.
+    const up = makeUpstream(chatWith(routeNegatedImage));
+    const res = await smartStrategy.execute(
+      ctx(up.client, req("smart-default-fusion"), "smart-default-fusion"),
+    );
+    expect(res.status).toBe(200);
+    const called = up.modelsCalled();
+    expect(called).toContain("deepseek"); // router's "simple" trusted
+    for (const p of PANEL) expect(called).not.toContain(p); // no fallback to fusion
   });
 
   it("inline sub-configs route correctly for both simple and fusion", async () => {
@@ -689,5 +820,106 @@ describe("smart config validation", () => {
         },
       }),
     ).toThrow(/cannot reference other smart models/);
+  });
+
+  // --- Issue 1: routerMessageLine extracts text from array content ----------
+
+  it("router sees actual text from array-formatted messages, not '[multimodal content]'", async () => {
+    const up = makeUpstream(chatWith(routeSimple));
+    // Send a message with content as an array of text parts (standard OpenAI format).
+    // Before the fix, the router would see "[multimodal content]" instead of the actual text.
+    const request: ChatCompletionRequest = {
+      model: "smart-inline",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "design a new authentication system with OAuth2 and JWT" },
+          ],
+        },
+      ],
+    };
+    const res = await smartStrategy.execute(ctx(up.client, request, "smart-inline"));
+    expect(res.status).toBe(200);
+
+    // Verify the router was called and its prompt contains the actual text,
+    // not the old "[multimodal content]" placeholder.
+    const routerCalls = up.routerBodies();
+    expect(routerCalls.length).toBe(1);
+    const routerMessages = routerCalls[0]?.messages ?? [];
+    const userMsg = routerMessages.find(
+      (m: unknown) => typeof m === "object" && m !== null && (m as Record<string, unknown>).role === "user",
+    );
+    expect(userMsg).toBeDefined();
+    const userContent = (userMsg as Record<string, unknown>).content;
+    expect(typeof userContent).toBe("string");
+    expect(userContent).toContain("OAuth2");
+    expect(userContent).toContain("JWT");
+    expect(userContent).not.toContain("[multimodal content]");
+  });
+
+  it("router sees '[has image]' prefix when array content includes an image_url part", async () => {
+    const show = (model: string): Response =>
+      jsonResponse({
+        capabilities: model === "vdeepseek" ? ["completion", "vision"] : ["completion"],
+        model_info: {},
+      });
+    const up = makeUpstream(chatWith(routeSimple), show);
+    const request: ChatCompletionRequest = {
+      model: "smart-vision",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "describe this screenshot" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,abc" } },
+          ],
+        },
+      ],
+    };
+    const res = await smartStrategy.execute(ctx(up.client, request, "smart-vision"));
+    expect(res.status).toBe(200);
+
+    const routerCalls = up.routerBodies();
+    expect(routerCalls.length).toBe(1);
+    const routerMessages = routerCalls[0]?.messages ?? [];
+    const userMsg = routerMessages.find(
+      (m: unknown) => typeof m === "object" && m !== null && (m as Record<string, unknown>).role === "user",
+    );
+    const userContent = (userMsg as Record<string, unknown>).content;
+    expect(typeof userContent).toBe("string");
+    expect(userContent).toContain("[has image]");
+    expect(userContent).toContain("describe this screenshot");
+  });
+
+  // --- Issue 3: fusion panel failure falls back to simple -------------------
+
+  it("auto-falls back to simple when fusion panel fails with AllMembersFailedError", async () => {
+    let callCount = 0;
+    const up = makeUpstream((body) => {
+      callCount++;
+      if (body.model === "rt") return routeFusion(); // router picks fusion
+      // Panel members all fail with 400 (simulating context overflow)
+      if (body.model === "p1" || body.model === "p2" || body.model === "p3") {
+        return jsonResponse(
+          { error: { message: "prompt too long; exceeded max context length" } },
+          400,
+        );
+      }
+      // Simple fallback target
+      if (body.model === "deepseek") {
+        return jsonResponse({ choices: [{ message: { content: "fallback-answer" } }] });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await smartStrategy.execute(
+      ctx(up.client, req("smart-inline"), "smart-inline"),
+    );
+    // Should succeed (200) via simple fallback, not fail with 502.
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain("fallback-answer");
+    // Verify the simple model was called (the fallback path).
+    expect(up.modelsCalled()).toContain("deepseek");
   });
 });

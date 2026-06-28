@@ -9,7 +9,7 @@ import type {
 import type { FusionModelConfig, SingleModelConfig, SmartModelConfig } from "../config";
 import type { Resilience } from "../concurrency";
 import { createResilience } from "../concurrency";
-import { FusionError } from "../errors";
+import { AllMembersFailedError, FusionError } from "../errors";
 import {
   failureKindForError,
   failureKindForStatus,
@@ -18,7 +18,7 @@ import {
 } from "../attribution";
 import { singleStrategy } from "./single";
 import { fusionStrategy } from "./fusion";
-import { assertSingleVisionCapable } from "../vision";
+import { assertSingleVisionCapable, requestHasImages } from "../vision";
 import { extractJsonObject } from "../json";
 import { withTimeout, realTimer } from "../timeout";
 import { createHash } from "node:crypto";
@@ -74,6 +74,8 @@ const ROUTER_SYSTEM_PROMPT = [
   '- "simple" for routine actions: writing unit tests, adding tests, writing basic helpers/boilerplate, editing minor files, reading/viewing files, running commands/tests, or mechanical tool updates.',
   "",
   "When in doubt, choose \"simple\" if the output is easily verified by running tests or a compiler, as the test runner serves as the correction gate.",
+  "",
+  "Ground your reason in the LITERAL content of the latest message. Do NOT invent multimodal content: do NOT claim the user sent an image, screenshot, photo, or file unless an image/attachment is actually present in the message. If the latest message is plain text, treat it as plain text.",
   "Output the JSON object and nothing else.",
 ].join("\n");
 
@@ -169,21 +171,50 @@ export const smartStrategy: Strategy = {
     const route = await classify(ctx, cfg);
 
     if (route === "simple") {
-      const modelConfig = resolveSimple(ctx, cfg);
-      // Vision gate on the resolved single target: an image request smart-routed
-      // to a non-vision target fails clean (400) instead of an opaque upstream
-      // error. Mirrors the `single` dispatch gate in router.ts.
-      await assertSingleVisionCapable(ctx.capabilities, ctx.request, modelConfig.target, ctx.request.model);
-      return singleStrategy.execute({ ...ctx, modelConfig });
+      return executeSimple(ctx, cfg);
     }
-    // The router has decided this step is worth deliberation, so run the FULL panel
-    // even mid-loop: a referenced fusion model's `fusion_planning_turn_only` would
-    // otherwise degrade a tool-continuation step back to synth-only, silently
-    // overriding the router's choice (the whole reason it routed to fusion here).
-    const modelConfig = { ...resolveFusion(ctx, cfg), fusion_planning_turn_only: false };
-    return fusionStrategy.execute({ ...ctx, modelConfig });
+    return executeFusionWithFallback(ctx, cfg);
   },
 };
+
+/** Run the simple sub-strategy with vision validation. */
+async function executeSimple(ctx: StrategyContext, cfg: SmartModelConfig): Promise<Response> {
+  const modelConfig = resolveSimple(ctx, cfg);
+  // Vision gate on the resolved single target: an image request smart-routed
+  // to a non-vision target fails clean (400) instead of an opaque upstream
+  // error. Mirrors the `single` dispatch gate in router.ts.
+  await assertSingleVisionCapable(ctx.capabilities, ctx.request, modelConfig.target, ctx.request.model);
+  return singleStrategy.execute({ ...ctx, modelConfig });
+}
+
+/**
+ * Run fusion with auto-fallback to simple on panel failure. When fusion fails
+ * (e.g. context overflow → all panel members return 400) the smart strategy
+ * degrades to simple instead of bubbling a 502 to the client. A fusion failure
+ * can lose its deliberation but never fails the user's request.
+ */
+async function executeFusionWithFallback(ctx: StrategyContext, cfg: SmartModelConfig): Promise<Response> {
+  // The router has decided this step is worth deliberation, so run the FULL panel
+  // even mid-loop: a referenced fusion model's `fusion_planning_turn_only` would
+  // otherwise degrade a tool-continuation step back to synth-only, silently
+  // overriding the router's choice (the whole reason it routed to fusion here).
+  const modelConfig = { ...resolveFusion(ctx, cfg), fusion_planning_turn_only: false };
+  try {
+    return await fusionStrategy.execute({ ...ctx, modelConfig });
+  } catch (err) {
+    // AllMembersFailedError = panel could not produce enough answers (context
+    // overflow, all models down, etc.). Degrade to simple so the request still
+    // gets a response — a single-model answer is better than a 502.
+    if (err instanceof AllMembersFailedError) {
+      ctx.logger.warn(
+        { model: ctx.request.model, reason: err.message },
+        "smart: fusion panel failed; falling back to simple",
+      );
+      return executeSimple(ctx, cfg);
+    }
+    throw err;
+  }
+}
 
 /**
  * Run the best-effort classifier. Returns the configured `default` route on any
@@ -335,6 +366,21 @@ async function classifyUncached(
     return fallback;
   }
 
+  // Hallucination guard: the router (an LLM) can confabulate multimodal input —
+  // e.g. "user sent a screenshot/image" as a reason to pick `simple` — even when
+  // the request is plain text with no image_url blocks. A reason that claims an
+  // image which isn't there means the router did not actually ground its decision
+  // in the real message, so its route is untrustworthy: fall back to the
+  // configured default (consistent with how any other untrustworthy router reply
+  // is handled). Do NOT cache it.
+  if (claimsImage(decision.reason) && !requestHasImages(ctx.request)) {
+    ctx.logger.warn(
+      { router, model: ctx.request.model, route: fallback, reason: decision.reason },
+      "smart: router claimed an image/screenshot that is not present; treating decision as untrustworthy, using default route",
+    );
+    return fallback;
+  }
+
   ctx.logger.info(
     { router, model: ctx.request.model, route: decision.route, reason: decision.reason },
     "smart: router decision",
@@ -372,6 +418,8 @@ function resolveFusion(ctx: StrategyContext, cfg: SmartModelConfig): FusionModel
       tool_mode: "deliberate",
       fusion_planning_turn_only: false,
       promote_reasoning_to_content: ref.promote_reasoning_to_content,
+      web_search: ref.web_search,
+      bineval: ref.bineval,
     };
   }
   const target = ctx.config.models[ref];
@@ -386,6 +434,43 @@ function resolveFusion(ctx: StrategyContext, cfg: SmartModelConfig): FusionModel
 }
 
 /** Parse the router content as a route decision; null on any failure. */
+/**
+ * Does a free-text router reason claim the request carried an image, screenshot,
+ * photo, or other visual/attached content? Used by the hallucination guard to
+ * catch a router that invents multimodal input to justify its route.
+ */
+/**
+ * Does a free-text router reason AFFIRMATIVELY claim the request carried an
+ * image, screenshot, photo, or other visual/attached content? Used by the
+ * hallucination guard to catch a router that invents multimodal input to
+ * justify its route.
+ *
+ * Crucially, this returns FALSE when the router merely MENTIONS images in a
+ * negating/absence context — e.g. "no actual image attachment", "plain-text,
+ * not multimodal", "without a screenshot". A router that correctly observes
+ * there is no image is reasoning properly, not hallucinating, and must not be
+ * flagged (flagging it would override a correct decision and spam warnings on
+ * every paste where the router dutifully notes the absence of an image).
+ */
+function claimsImage(reason: string | undefined): boolean {
+  if (!reason) return false;
+  const lower = reason.toLowerCase();
+  // Negated/absence context: the router explicitly says there is NO image /
+  // the message is plain text. Treat as "not a claim" and trust the router.
+  if (
+    /no (?:actual )?(?:image|screenshot|photo|picture|attachment|multimodal)/.test(lower) ||
+    /without (?:an? )?(?:image|screenshot|photo|picture|attachment|multimodal)/.test(lower) ||
+    /not (?:a |an )?(?:image|screenshot|photo|picture|multimodal)/.test(lower) ||
+    /\bplain[- ]?text\b/.test(lower) ||
+    /no (?:file |visual )?attachment/.test(lower) ||
+    /\btext[- ]?only\b/.test(lower)
+  ) {
+    return false;
+  }
+  // Affirmative claim that an image/screenshot/etc. is present.
+  return /\b(image|screenshot|photo|picture|figure|diagram|chart|scan|attachment|multimodal)\b/i.test(reason);
+}
+
 function parseRouteDecision(content: string | null): RouteDecision | null {
   if (content === null) return null;
   // Same fence/prose-tolerance as the judge: extract the balanced JSON object so a
@@ -461,7 +546,17 @@ function routerMessageLine(m: ChatMessage): string {
   if (typeof content === "string") {
     text = content;
   } else if (Array.isArray(content)) {
-    text = "[multimodal content]";
+    // Extract actual text from structured content parts (OpenAI array format).
+    // The old code replaced ALL array content with "[multimodal content]",
+    // blinding the router to the message's actual text and making it impossible
+    // to classify complexity. Now we extract text and only flag real images.
+    const ImagePartSchema = z.object({ type: z.literal("image_url") }).passthrough();
+    const hasImage = content.some(
+      (p: unknown) => ImagePartSchema.safeParse(p).success,
+    );
+    text = messageContentText(content);
+    if (hasImage) text = `[has image] ${text}`;
+    if (text.trim().length === 0) text = "[empty content]";
   } else {
     text = "";
   }

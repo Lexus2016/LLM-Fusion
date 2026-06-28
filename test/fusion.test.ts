@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { z } from "zod";
 import { createFusionStrategy, fusionStrategy } from "../src/strategies/fusion";
 import type { TimerFactory } from "../src/strategies/fusion";
@@ -45,6 +45,22 @@ const config = parseConfig({
       judge: "j",
       synth: "s",
       promote_reasoning_to_content: false,
+    },
+    // Adversarial panel slot: m2 runs with a contrarian prompt.
+    "fusion-adv": {
+      strategy: "fusion",
+      panel: ["m1", "m2", "m3"],
+      judge: "j",
+      synth: "s",
+      adversarial: "m2",
+    },
+    // Web grounding: opt-in via web_search.enabled; needs TAVILY_API_KEY at runtime.
+    "fusion-web": {
+      strategy: "fusion",
+      panel: ["m1", "m2", "m3"],
+      judge: "j",
+      synth: "s",
+      web_search: { enabled: true, max_results: 3, timeout_s: 10, max_context_chars: 4000 },
     },
   },
 });
@@ -241,6 +257,47 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(judgeInput).toContain("ans-m1");
     expect(judgeInput).toContain("ans-m3");
     expect(judgeInput).not.toContain("ans-m2");
+  });
+
+  it("runs the adversarial member with a contrarian prompt, others without it", async () => {
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req(), "fusion-adv"));
+    expect(res.status).toBe(200);
+
+    const panelBodies = up.recorded.filter((b) => b.model.startsWith("m"));
+    expect(panelBodies).toHaveLength(3);
+    const m2 = panelBodies.find((b) => b.model === "m2");
+    const others = panelBodies.filter((b) => b.model !== "m2");
+    expect(m2).toBeDefined();
+    // The adversarial member got the red-team system prompt...
+    expect(systemContents(m2!).join("\n")).toContain("adversarial reviewer");
+    expect(systemContents(m2!).join("\n")).toMatch(/find what is wrong|steelman|edge cases/i);
+    // ...the other members did NOT.
+    for (const b of others) {
+      expect(systemContents(b).join("\n")).not.toContain("adversarial reviewer");
+    }
+    // Invariant untouched: no panel member carried real tools.
+    for (const b of panelBodies) {
+      expect(b.tools).toBeUndefined();
+      expect(b.tool_choice).toBeUndefined();
+    }
+  });
+
+  it("rejects an adversarial member that is not in the panel (config validation)", () => {
+    expect(() =>
+      parseConfig({
+        upstream: { base_url: "https://mock.test", api_key_env: "X" },
+        models: {
+          "bad-adv": {
+            strategy: "fusion",
+            panel: ["m1", "m2"],
+            judge: "j",
+            synth: "s",
+            adversarial: "m9", // not a panel member
+          },
+        },
+      }),
+    ).toThrow(/adversarial='m9'.*not listed in its panel/);
   });
 
   it("cancels other panel members early if min_panel_success is met", async () => {
@@ -440,6 +497,49 @@ describe("fusion strategy — panel/judge/synth", () => {
     const ctxText = systemContents(synthBody!).join("\n");
     expect(ctxText).toContain("JUDGE ANALYSIS"); // fence stripped -> analysis used
     expect(ctxText).toContain("they agree");
+  });
+
+  it("instructs the judge to emit calibrated confidence and fragile_claims", async () => {
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    expect(res.status).toBe(200);
+    const judgeBody = up.recorded.find((b) => b.model === "j");
+    const judgeSystem = systemContents(judgeBody!).join("\n");
+    // The judge must be told to calibrate, not just report consensus — agreement
+    // alone is not high confidence when models share a training lineage.
+    expect(judgeSystem).toContain("confidence");
+    expect(judgeSystem).toContain("fragile_claims");
+    expect(judgeSystem).toContain("high");
+    expect(judgeSystem).toMatch(/shared.*lineage|training lineage/i);
+  });
+
+  it("passes judge confidence + fragile_claims to synth and tells it to hedge them", async () => {
+    const analysis = {
+      consensus: "they agree",
+      disagreements: [],
+      unique_insights: [],
+      blind_spots: [],
+      confidence: "low",
+      fragile_claims: ["the redis lua claim from m2"],
+    };
+    const up = makeUpstream((body) => {
+      if (body.model === "j") {
+        return jsonResponse({
+          choices: [{ message: { content: JSON.stringify(analysis) } }],
+        });
+      }
+      return defaultChat()(body);
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    expect(res.status).toBe(200);
+    const synthBody = up.recorded.find((b) => b.model === "s");
+    const ctxText = systemContents(synthBody!).join("\n");
+    // The calibrated fields survive into the synth context (JSON-serialized)...
+    expect(ctxText).toContain("fragile_claims");
+    expect(ctxText).toContain("the redis lua claim from m2");
+    expect(ctxText).toContain('"low"');
+    // ...and the synth is explicitly told to hedge, not assert, fragile claims.
+    expect(ctxText).toMatch(/hedge|surface that uncertainty|false certainty/i);
   });
 
   it("streams synth SSE to the client when stream:true; returns JSON otherwise", async () => {
@@ -731,5 +831,207 @@ describe("fusion strategy — reasoning→content normalization", () => {
     expect(text).toContain("read_file");
     expect(text).toContain("finish_reason"); // finish_reason path preserved
     expect(streamedContents(text)).toEqual([]); // nothing promoted into content
+  });
+});
+
+describe("fusion strategy — web grounding (gated on TAVILY_API_KEY + web_search.enabled)", () => {
+  const TAVILY = "https://api.tavily.com/search";
+  let realFetch: typeof globalThis.fetch;
+  let savedKey: string | undefined;
+
+  beforeEach(() => {
+    realFetch = globalThis.fetch;
+    savedKey = process.env.TAVILY_API_KEY;
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    if (savedKey === undefined) delete process.env.TAVILY_API_KEY;
+    else process.env.TAVILY_API_KEY = savedKey;
+    vi.restoreAllMocks();
+  });
+
+  function stubTavily(results: { title: string; url: string; content: string }[]): void {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url === TAVILY) return jsonResponse({ results });
+      return new Response(JSON.stringify({ error: `no stub for ${url}` }), { status: 404 });
+    }) as typeof globalThis.fetch;
+  }
+
+  it("injects a WEB CONTEXT user message into every panel member when key is set", async () => {
+    process.env.TAVILY_API_KEY = "tvly-test";
+    stubTavily([{ title: "Fresh docs", url: "https://example.com/fresh", content: "the freshest fact" }]);
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(
+      ctx(up.client, req({ model: "fusion-web", messages: [{ role: "user", content: "latest redis lua API" }] }), "fusion-web"),
+    );
+    expect(res.status).toBe(200);
+    const panelBodies = up.recorded.filter((b) => b.model.startsWith("m"));
+    expect(panelBodies.length).toBeGreaterThan(0);
+    for (const b of panelBodies) {
+      const user = userContents(b).join("\n");
+      expect(user).toContain("WEB CONTEXT");
+      expect(user).toContain("the freshest fact");
+      expect(user).toContain("CURRENT DATE");
+    }
+    // Tavily was actually called once (shared single search).
+    // (We assert effect, not call count, to stay robust to the no-network mock.)
+    expect(panelBodies[0]?.tools).toBeUndefined(); // invariant untouched
+  });
+
+  it("stays fully OFF when TAVILY_API_KEY is unset, even if config opts in", async () => {
+    delete process.env.TAVILY_API_KEY;
+    let tavilyCalled = false;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url === TAVILY) {
+        tavilyCalled = true;
+        return jsonResponse({ results: [] });
+      }
+      return new Response("{}", { status: 404 });
+    }) as typeof globalThis.fetch;
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req(), "fusion-web"));
+    expect(res.status).toBe(200);
+    expect(tavilyCalled).toBe(false); // no key → no search call at all
+    for (const b of up.recorded.filter((x) => x.model.startsWith("m"))) {
+      expect(systemContents(b).join("\n")).not.toContain("WEB CONTEXT");
+      expect(userContents(b).join("\n")).not.toContain("WEB CONTEXT");
+    }
+  });
+
+  it("stays OFF when web_search is not enabled on the model", async () => {
+    process.env.TAVILY_API_KEY = "tvly-test";
+    let tavilyCalled = false;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url === TAVILY) {
+        tavilyCalled = true;
+        return jsonResponse({ results: [] });
+      }
+      return new Response("{}", { status: 404 });
+    }) as typeof globalThis.fetch;
+    // fusion-1 has no web_search block → grounding must not run.
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    expect(res.status).toBe(200);
+    expect(tavilyCalled).toBe(false);
+  });
+
+  it("degrades gracefully to an ungrounded panel when the search fails", async () => {
+    process.env.TAVILY_API_KEY = "tvly-test";
+    globalThis.fetch = (async () =>
+      jsonResponse({ error: "tavily down" }, 500)) as typeof globalThis.fetch;
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req(), "fusion-web"));
+    expect(res.status).toBe(200); // still succeeds, just ungrounded
+    for (const b of up.recorded.filter((x) => x.model.startsWith("m"))) {
+      expect(systemContents(b).join("\n")).not.toContain("WEB CONTEXT");
+      expect(userContents(b).join("\n")).not.toContain("WEB CONTEXT");
+    }
+  });
+
+  it("skips web grounding when the prompt is already large (size gate)", async () => {
+    process.env.TAVILY_API_KEY = "tvly-test";
+    let tavilyCalled = false;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url === TAVILY) {
+        tavilyCalled = true;
+        return jsonResponse({ results: [{ title: "x", url: "https://y", content: "fresh" }] });
+      }
+      return new Response("{}", { status: 404 });
+    }) as typeof globalThis.fetch;
+    // A long agent-loop history: well over the 80k-char default size gate.
+    const big = "x".repeat(120000);
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(
+      ctx(up.client, req({ model: "fusion-web", messages: [{ role: "user", content: "latest redis " + big }] }), "fusion-web"),
+    );
+    expect(res.status).toBe(200);
+    expect(tavilyCalled).toBe(false); // size gate skipped the search entirely
+    for (const b of up.recorded.filter((x) => x.model.startsWith("m"))) {
+      expect(systemContents(b).join("\n")).not.toContain("WEB CONTEXT");
+      expect(userContents(b).join("\n")).not.toContain("WEB CONTEXT");
+    }
+  });
+
+  it("preserves the one-tool-call invariant with web grounding AND tools (agent-loop safety)", async () => {
+    // The flagship safety property: only the synth may emit a tool call. Web
+    // grounding inserts an extra user message and CURRENT DATE into the panel
+    // prompt; this must NOT leak tools to the panel or break the synth's tools.
+    process.env.TAVILY_API_KEY = "tvly-test";
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url === TAVILY) {
+        return jsonResponse({ results: [{ title: "docs", url: "https://x", content: "fresh docs" }] });
+      }
+      return new Response("{}", { status: 404 });
+    }) as typeof globalThis.fetch;
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(
+      ctx(up.client, req({ model: "fusion-web", tools: TOOLS }), "fusion-web"),
+    );
+    expect(res.status).toBe(200);
+
+    // Web context IS injected (as a user message), so grounding ran with tools present.
+    const panelBodies = up.recorded.filter((b) => b.model.startsWith("m"));
+    expect(panelBodies.length).toBeGreaterThan(0);
+    for (const b of panelBodies) {
+      // Invariant: panel never carries the real tools schema / tool_choice.
+      expect(b.tools).toBeUndefined();
+      expect(b.tool_choice).toBeUndefined();
+      // Web context landed in a user turn, the tool list as a system (prose) note.
+      expect(userContents(b).join("\n")).toContain("WEB CONTEXT");
+      expect(systemContents(b).join("\n")).toContain("read_file");
+      // The web user message must not itself look like a tool result/tool call.
+      expect(userContents(b).join("\n")).not.toContain("tool_calls");
+    }
+
+    // Synth is the ONLY stage that received the real tools schema.
+    const synthBody = up.recorded.find((b) => b.model === "s");
+    expect(synthBody).toBeDefined();
+    expect(synthBody?.tools).toEqual(TOOLS);
+  });
+
+  // --- Issue 2: Panel context compression for long agent loops ---------------
+
+  it("compresses panel messages when total content exceeds threshold", async () => {
+    // Build a request with > 200k chars of message content to trigger compression.
+    // Each tool-result message is ~5000 chars; 50 of them = ~250k chars total.
+    const bigContent = "x".repeat(5000);
+    const messages: Array<Record<string, unknown>> = [
+      { role: "system", content: "You are a coding assistant." },
+      { role: "user", content: "Implement the adversarial panel slot feature." }, // original task
+    ];
+    // Add 50 tool-loop iterations (assistant + tool pairs).
+    for (let i = 0; i < 50; i++) {
+      messages.push({ role: "assistant", content: `calling tool step ${i}` });
+      messages.push({ role: "tool", content: `${bigContent} result-${i}` });
+    }
+    // Final user instruction.
+    messages.push({ role: "user", content: "Now write the tests for this feature." });
+
+    const up = makeUpstream(defaultChat());
+    const request: ChatCompletionRequest = {
+      model: "fusion-1",
+      messages: messages as ChatCompletionRequest["messages"],
+    };
+    const res = await fusionStrategy.execute(ctx(up.client, request, "fusion-1"));
+    expect(res.status).toBe(200);
+
+    // Check that panel members received COMPRESSED messages (fewer than original).
+    const panelBodies = up.recorded.filter((b) => b.model === "m1" || b.model === "m2" || b.model === "m3");
+    expect(panelBodies.length).toBeGreaterThanOrEqual(2); // at least min_panel_success
+
+    for (const pb of panelBodies) {
+      // Panel should have far fewer messages than the original 103.
+      expect(pb.messages.length).toBeLessThan(messages.length);
+      // Panel should still contain the system prompt.
+      const sysMsgs = systemContents(pb);
+      expect(sysMsgs.some((s) => s.includes("coding assistant"))).toBe(true);
+      // Panel should contain an omission marker.
+      expect(sysMsgs.some((s) => s.includes("earlier message"))).toBe(true);
+    }
   });
 });
