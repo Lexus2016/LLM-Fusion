@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.10] - 2026-06-28
+
+### Added
+
+- Fusion panel gains conditional abort: slow panel members are cancelled once enough survivors have answered, cutting tail latency while preserving `min_panel_success`.
+- Thinking/reasoning tags are stripped from panel answers before they reach the judge, keeping the analysis focused on substantive content.
+- Smart-router prompt tuning improves routing accuracy between `simple` and `fusion` strategies.
+- Anti-hallucination safeguards in the fusion pipeline:
+  - Judge now emits `hallucination_flags`, cross-referencing panel experts and flagging claims supported by only one member as suspect.
+  - Synth is instructed to omit or caveat flagged items and to acknowledge uncertainty when experts disagree irreconcilably.
+
 ## [0.1.9] - 2026-06-27
 
 ### Fixed
