@@ -260,4 +260,39 @@ describe("server", () => {
     expect(text.match(/\[DONE\]/g)?.length).toBe(1); // exactly one terminator
     expect(text.match(/fusion-usage/g)?.length).toBe(1); // exactly one usage chunk
   });
+
+  it("gracefully completes the stream with usage and [DONE] even when the upstream stream fails mid-way", async () => {
+    const errorStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"part1"}}]}\n\n'));
+        setTimeout(() => {
+          controller.error(new Error("upstream connection broken"));
+        }, 10);
+      },
+    });
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: async () =>
+        new Response(errorStream, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+    });
+    const capabilities = new CapabilityService({ client, getOverrides: () => config.overrides, logger });
+    const app = createApp({ getConfig: () => config, client, capabilities, getAuthToken: () => undefined, logger });
+    const res = await app.request("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "fast-glm", stream: true, messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    const text = await res.text();
+    expect(text).toContain("part1");
+    expect(text).toContain("fusion-usage");
+    expect(text).toContain("[DONE]");
+    expect(text.match(/\[DONE\]/g)?.length).toBe(1);
+    expect(text.match(/fusion-usage/g)?.length).toBe(1);
+  });
 });
+

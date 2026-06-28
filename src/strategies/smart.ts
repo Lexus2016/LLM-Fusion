@@ -202,17 +202,16 @@ async function executeFusionWithFallback(ctx: StrategyContext, cfg: SmartModelCo
   try {
     return await fusionStrategy.execute({ ...ctx, modelConfig });
   } catch (err) {
-    // AllMembersFailedError = panel could not produce enough answers (context
-    // overflow, all models down, etc.). Degrade to simple so the request still
-    // gets a response — a single-model answer is better than a 502.
-    if (err instanceof AllMembersFailedError) {
-      ctx.logger.warn(
-        { model: ctx.request.model, reason: err.message },
-        "smart: fusion panel failed; falling back to simple",
-      );
-      return executeSimple(ctx, cfg);
-    }
-    throw err;
+    // If fusion fails at any stage (panel failure, judge error, synth timeout,
+    // circuit open, etc.), degrade to simple so the request still gets a response.
+    ctx.logger.warn(
+      {
+        model: ctx.request.model,
+        reason: err instanceof Error ? err.message : String(err),
+      },
+      "smart: fusion stage failed; falling back to simple",
+    );
+    return executeSimple(ctx, cfg);
   }
 }
 
@@ -455,9 +454,12 @@ function resolveFusion(ctx: StrategyContext, cfg: SmartModelConfig): FusionModel
 function claimsImage(reason: string | undefined): boolean {
   if (!reason) return false;
   const lower = reason.toLowerCase();
-  // Negated/absence context: the router explicitly says there is NO image /
-  // the message is plain text. Treat as "not a claim" and trust the router.
-  if (
+  // If the router explicitly says "not plain-text" or "not text-only", it is
+  // affirmatively claiming a multimodal request — do not let the plain-text check
+  // trigger a false-negative return.
+  if (/\bnot (?:a |an )?(?:plain[- ]?text|text[- ]?only)\b/.test(lower)) {
+    // Skip plain-text checks, fall through to affirmative check
+  } else if (
     /no (?:actual )?(?:image|screenshot|photo|picture|attachment|multimodal)/.test(lower) ||
     /without (?:an? )?(?:image|screenshot|photo|picture|attachment|multimodal)/.test(lower) ||
     /not (?:a |an )?(?:image|screenshot|photo|picture|multimodal)/.test(lower) ||

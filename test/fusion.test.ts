@@ -384,7 +384,7 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(m3Aborted).toBe(true);
   });
 
-  it("does NOT cancel panel members early if they have started delivering tokens", async () => {
+  it("cancels panel members early even if they have started delivering tokens to free up concurrency slots", async () => {
     let m2Aborted = false;
     const chat = defaultChat();
     const up = makeUpstream((body, signal) => {
@@ -412,8 +412,8 @@ describe("fusion strategy — panel/judge/synth", () => {
     // Wait a brief moment for async promises to settle
     await new Promise((r) => setTimeout(r, 10));
 
-    // m2 has started delivering, so it should NOT be aborted!
-    expect(m2Aborted).toBe(false);
+    // m2 has started delivering, but should be aborted on early success to free up limit slots!
+    expect(m2Aborted).toBe(true);
   });
 
   it("times out a slow panel member and proceeds with the survivors", async () => {

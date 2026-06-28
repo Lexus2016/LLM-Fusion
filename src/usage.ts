@@ -111,8 +111,6 @@ export class UsageAccumulator {
   private callCount = 0;
   private readonly records: CallRecord[] = [];
   private readonly pendingStreams: Array<{ model: string; usage: Promise<Usage> }> = [];
-  /** Memoized finalize() result, so repeated calls don't re-fold pending streams. */
-  private finalizing: Promise<RequestUsage> | undefined;
 
   /** Record one completed upstream call (its model + result). */
   record(model: string, result: ChatCompletionResult): void {
@@ -145,26 +143,20 @@ export class UsageAccumulator {
 
   /** Aggregate including every streamed call's tokens (awaits each drain). */
   async finalize(pricing?: PricingMap): Promise<RequestUsage> {
-    // Memoized: callers may invoke finalize() more than once per request (e.g.
-    // once to inject the trailing usage chunk, once to log on stream completion).
-    // Without this the pending streams would be folded in — and double-counted —
-    // each time. The call count / records / pending list are snapshotted
-    // synchronously so a late record() cannot skew the aggregate (M-9).
-    if (this.finalizing === undefined) {
-      const callCount = this.callCount;
-      const records = [...this.records];
+    if (this.pendingStreams.length > 0) {
       const pending = [...this.pendingStreams];
-      this.finalizing = (async () => {
-        if (pending.length > 0) {
-          const drained = await Promise.all(
-            pending.map(async (p) => ({ model: p.model, usage: await p.usage })),
-          );
-          records.push(...drained);
-        }
-        return aggregate(callCount, records, pricing);
-      })();
+      await Promise.all(
+        pending.map(async (p) => {
+          const usageVal = await p.usage;
+          const idx = this.pendingStreams.indexOf(p);
+          if (idx !== -1) {
+            this.pendingStreams.splice(idx, 1);
+          }
+          this.records.push({ model: p.model, usage: usageVal });
+        }),
+      );
     }
-    return this.finalizing;
+    return aggregate(this.callCount, this.records, pricing);
   }
 }
 
@@ -226,36 +218,39 @@ export function tapStreamUsage(body: ReadableStream<Uint8Array> | null): {
     }
   };
 
-  // The cancel hook is invoked by the runtime when the writable side is aborted
-  // (upstream error) — Node 24 supports it, but the lib's Transformer type does
-  // not yet declare it, so widen the type locally instead of casting.
-  const tapTransformer: Transformer<Uint8Array, Uint8Array> & {
-    cancel?(reason?: unknown): void;
-  } = {
-    transform(chunk, controller) {
-      buffer += decoder.decode(chunk, { stream: true });
-      let nl: number;
-      while ((nl = buffer.indexOf("\n")) !== -1) {
-        scan(buffer.slice(0, nl));
-        buffer = buffer.slice(nl + 1);
+  const reader = body.getReader();
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          buffer += decoder.decode();
+          if (buffer.length > 0) scan(buffer);
+          resolveUsage(captured ?? { ...ZERO_USAGE });
+          controller.close();
+          return;
+        }
+        if (value) {
+          buffer += decoder.decode(value, { stream: true });
+          let nl: number;
+          while ((nl = buffer.indexOf("\n")) !== -1) {
+            scan(buffer.slice(0, nl));
+            buffer = buffer.slice(nl + 1);
+          }
+          controller.enqueue(value);
+        }
+      } catch (err) {
+        resolveUsage(captured ?? { ...ZERO_USAGE });
+        controller.error(err);
       }
-      controller.enqueue(chunk); // forward original bytes unchanged
     },
-    flush() {
-      buffer += decoder.decode();
-      if (buffer.length > 0) scan(buffer);
+    cancel(reason) {
       resolveUsage(captured ?? { ...ZERO_USAGE });
+      reader.cancel(reason).catch(() => {});
     },
-    cancel() {
-      // Upstream body errored (or the consumer cancelled) before a clean flush —
-      // settle the usage promise with whatever was captured so a downstream
-      // finalize() never hangs waiting on a stream that will not drain.
-      resolveUsage(captured ?? { ...ZERO_USAGE });
-    },
-  };
-  const tap = new TransformStream<Uint8Array, Uint8Array>(tapTransformer);
+  });
 
-  return { stream: body.pipeThrough(tap), usage };
+  return { stream, usage };
 }
 
 /** Metadata threaded into the stream usage-injection transform for logging. */

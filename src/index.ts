@@ -52,7 +52,17 @@ async function main(): Promise<void> {
     getOverrides: () => manager.config.overrides,
     logger,
   });
-  manager.onReload(() => capabilities.clear());
+  manager.onReload(() => {
+    capabilities.clear();
+    const newCfg = manager.config;
+    const newKey = process.env[newCfg.upstream.api_key_env];
+    client.updateConfig({
+      baseUrl: newCfg.upstream.base_url,
+      apiKey: newKey,
+      timeoutMs: newCfg.upstream.request_timeout_s * 1000,
+    });
+    logger.info("upstream configuration updated in client");
+  });
 
   const getAuthToken = (): string | undefined => {
     const envName = manager.config.server.auth_token_env;

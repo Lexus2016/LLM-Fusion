@@ -1,5 +1,5 @@
 import type { MiddlewareHandler } from "hono";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 
 /**
  * Constant-time client-token comparison. The length guard returns early on a
@@ -9,10 +9,9 @@ import { timingSafeEqual } from "node:crypto";
  * plain `===`/`!==` string compare.
  */
 function tokensMatch(provided: string, token: string): boolean {
-  const a = Buffer.from(provided);
-  const b = Buffer.from(token);
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+  const hashA = createHash("sha256").update(provided).digest();
+  const hashB = createHash("sha256").update(token).digest();
+  return timingSafeEqual(hashA, hashB);
 }
 
 /**

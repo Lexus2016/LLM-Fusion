@@ -526,6 +526,29 @@ describe("smart strategy", () => {
     for (const p of PANEL) expect(called).not.toContain(p); // no fallback to fusion
   });
 
+  it("router claims an image that is NOT present with 'not plain-text' reason -> treats as untrustworthy, falls back to default=simple", async () => {
+    __resetRouterCacheForTesting();
+    const routeNotPlainTextClaimingImage = (): Response =>
+      jsonResponse({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                route: "fusion",
+                reason: "The request is not a plain-text query, it has an image screenshot attached.",
+              }),
+            },
+          },
+        ],
+      });
+    const up = makeUpstream(chatWith(routeNotPlainTextClaimingImage));
+    const res = await smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+    expect(res.status).toBe(200);
+    const called = up.modelsCalled();
+    expect(called).toContain("deepseek");
+    for (const p of PANEL) expect(called).not.toContain(p);
+  });
+
   it("inline sub-configs route correctly for both simple and fusion", async () => {
     const upS = makeUpstream(chatWith(routeSimple));
     await smartStrategy.execute(ctx(upS.client, req("smart-inline"), "smart-inline"));
@@ -803,7 +826,7 @@ describe("smart config validation", () => {
           },
         },
       }),
-    ).toThrow(/must point to a 'single' model/);
+    ).toThrow(/must point to a 'single or failover' model/);
   });
 
   it("rejects a smart->smart self-reference", () => {
@@ -920,6 +943,45 @@ describe("smart config validation", () => {
     const text = await res.text();
     expect(text).toContain("fallback-answer");
     // Verify the simple model was called (the fallback path).
+    expect(up.modelsCalled()).toContain("deepseek");
+  });
+
+  it("auto-falls back to simple when fusion fails with a non-AllMembersFailedError (e.g. CircuitOpenError for synth)", async () => {
+    const up = makeUpstream((body) => {
+      if (body.model === "rt") return routeFusion(); // router picks fusion
+      if (body.model === "p1" || body.model === "p2" || body.model === "p3") {
+        return jsonResponse({ choices: [{ message: { content: "panel-ans" } }] });
+      }
+      if (body.model === "jdg") {
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  disagreements: [],
+                  consensus: "consensus",
+                  fragile_claims: [],
+                  confidence: "high",
+                }),
+              },
+            },
+          ],
+        });
+      }
+      if (body.model === "syn") {
+        return jsonResponse({ error: { message: "synth circuit open / network error" } }, 503);
+      }
+      if (body.model === "deepseek") {
+        return jsonResponse({ choices: [{ message: { content: "fallback-answer-from-synth-error" } }] });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await smartStrategy.execute(
+      ctx(up.client, req("smart-inline"), "smart-inline"),
+    );
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain("fallback-answer-from-synth-error");
     expect(up.modelsCalled()).toContain("deepseek");
   });
 });

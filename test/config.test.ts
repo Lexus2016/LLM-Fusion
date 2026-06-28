@@ -72,6 +72,26 @@ describe("config", () => {
     }
   });
 
+  it("accepts a smart model referencing a failover model as its simple branch", () => {
+    const cfg = parseConfig({
+      ...minimal,
+      models: {
+        "failover-model": { strategy: "failover", chain: ["a", "b"] },
+        "smart-model": {
+          strategy: "smart",
+          router: "r",
+          simple: "failover-model",
+          fusion: { panel: ["a"], judge: "a", synth: "b" },
+        },
+      },
+    });
+    const smart = cfg.models["smart-model"];
+    expect(smart?.strategy).toBe("smart");
+    if (smart?.strategy === "smart") {
+      expect(smart.simple).toBe("failover-model");
+    }
+  });
+
   it("rejects a smart model referencing an unknown sub-model name", () => {
     expect(() =>
       parseConfig({

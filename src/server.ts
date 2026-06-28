@@ -247,7 +247,30 @@ async function decorateUsage(res: Response, usage: UsageAccumulator, meta: Usage
         .catch(() => logUsage(meta, usage.snapshot(meta.pricing)));
     };
     if (res.body) {
-      void res.body.pipeTo(transform.writable).then(finishLog, finishLog);
+      const reader = res.body.getReader();
+      const writer = transform.writable.getWriter();
+      const pump = async () => {
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            await writer.write(value);
+          }
+          await writer.close();
+        } catch (err) {
+          meta.logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            "upstream stream connection failed mid-way; closing gracefully to client",
+          );
+          void reader.cancel().catch(() => {});
+          try {
+            await writer.close();
+          } catch {
+            // ignore
+          }
+        }
+      };
+      void pump().then(finishLog, finishLog);
       return new Response(transform.readable, { status: res.status, headers });
     }
     finishLog();

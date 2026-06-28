@@ -429,7 +429,7 @@ async function runPanel(
     const checkFinished = () => {
       const successfulCount = answers.length;
       if (successfulCount >= minSuccess) {
-        // Early cancellation: abort only members that have NOT started delivering yet!
+        // Early cancellation: abort ALL active members that have not finished yet!
         // EXCEPTION: the adversarial member is never early-cancelled — its red-team
         // contribution is the whole point of the slot, and red-team reasoning is
         // typically slower (it must steelman the opposite and hunt for flaws), so it
@@ -439,7 +439,7 @@ async function runPanel(
         // in-flight red-team answer on the floor, defeating the whole slot.
         let adversarialDone = adversarialIdx < 0 || completed[adversarialIdx];
         for (let i = 0; i < members.length; i++) {
-          if (!completed[i] && !hasStartedDelivering[i]) {
+          if (!completed[i]) {
             if (i === adversarialIdx) continue;
             memberControllers[i]?.abort();
           }
@@ -529,13 +529,55 @@ async function callPanelMember(
     adversarial: opts.adversarialModel !== null && member === opts.adversarialModel,
   });
   const startedAt = Date.now();
-  let result: ChatCompletionResult;
   const abort = new AbortController();
   const useStream = !opts.native;
+
+  interface PanelFetchOutcome {
+    result: ChatCompletionResult;
+    content: string;
+    toolCalls: unknown[];
+  }
+
+  const workPromise = (async (): Promise<PanelFetchOutcome> => {
+    const result = await invokeUpstream(ctx.client, body, {
+      stream: useStream,
+      native: opts.native,
+      signal: combineSignals(signal ?? ctx.signal, abort.signal),
+    });
+
+    if (result.status >= 400) {
+      return { result, content: "", toolCalls: [] };
+    }
+
+    let content = "";
+    let toolCalls: unknown[] = [];
+    if (result.kind === "stream" && result.body) {
+      const acc = await accumulateStreamAndTrack(
+        result.body,
+        onFirstToken ?? (() => {}),
+        combineSignals(signal ?? ctx.signal, abort.signal),
+      );
+      content = acc.content;
+      toolCalls = acc.toolCalls;
+    } else if (result.kind === "json") {
+      content = extractAnswer(result.data) ?? "";
+      toolCalls = extractToolCalls(result.data);
+      if ((content.length > 0 || toolCalls.length > 0) && onFirstToken) {
+        onFirstToken();
+      }
+    } else {
+      throw new Error("unexpected non-json/non-stream panel result");
+    }
+
+    return { result, content, toolCalls };
+  })();
+
+  let outcome: PanelFetchOutcome;
+
   try {
-    result = await resilience.limiter(() =>
+    outcome = await resilience.limiter(() =>
       withTimeout(
-        invokeUpstream(ctx.client, body, { stream: useStream, native: opts.native, signal: combineSignals(signal ?? ctx.signal, abort.signal) }),
+        workPromise,
         timeoutMs,
         timer,
         `panel member '${member}' timed out after ${timeoutMs}ms`,
@@ -557,6 +599,8 @@ async function callPanelMember(
     });
     throw err;
   }
+
+  const { result, content, toolCalls } = outcome;
   ctx.usage?.record(member, result);
 
   if (result.status >= 400) {
@@ -586,30 +630,6 @@ async function callPanelMember(
         "fusion: panel member dropped (client error response)",
       );
     }
-    return null;
-  }
-
-  let content = "";
-  let toolCalls: unknown[] = [];
-  if (result.kind === "stream" && result.body) {
-    const acc = await accumulateStreamAndTrack(result.body, onFirstToken ?? (() => {}), signal);
-    content = acc.content;
-    toolCalls = acc.toolCalls;
-  } else if (result.kind === "json") {
-    content = extractAnswer(result.data) ?? "";
-    toolCalls = extractToolCalls(result.data);
-    if ((content.length > 0 || toolCalls.length > 0) && onFirstToken) {
-      onFirstToken();
-    }
-  } else {
-    resilience.breaker.recordFailure(member);
-    logUpstreamFailure(ctx.logger, {
-      stage: "panel",
-      model: member,
-      kind: "error",
-      latencyMs: Date.now() - startedAt,
-      reason: "unexpected non-json/non-stream panel result",
-    });
     return null;
   }
 

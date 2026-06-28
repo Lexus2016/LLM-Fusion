@@ -270,13 +270,13 @@ function checkSmartReference(
     });
     return;
   }
-  // Referenced model must be strategy-compatible: simple -> single, fusion -> fusion.
-  const expected = role === "simple" ? "single" : "fusion";
-  if (target.strategy !== expected) {
+  // Referenced model must be strategy-compatible: simple -> single/failover, fusion -> fusion.
+  const allowed = role === "simple" ? ["single", "failover"] : ["fusion"];
+  if (!allowed.includes(target.strategy)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["models", modelName, role],
-      message: `smart model '${modelName}' references '${ref}' for '${role}', which must point to a '${expected}' model but '${ref}' has strategy '${target.strategy}'`,
+      message: `smart model '${modelName}' references '${ref}' for '${role}', which must point to a '${allowed.join(" or ")}' model but '${ref}' has strategy '${target.strategy}'`,
     });
   }
 }

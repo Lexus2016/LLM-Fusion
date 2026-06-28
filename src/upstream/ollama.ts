@@ -25,16 +25,24 @@ export interface OllamaClientOptions {
  * `NativeStreamingNotImplementedError` is thrown).
  */
 export class OllamaClient implements UpstreamClient {
-  private readonly baseUrl: string;
-  private readonly apiKey: string | undefined;
+  private baseUrl: string;
+  private apiKey: string | undefined;
   private readonly fetchFn: FetchFn;
-  private readonly timeoutMs: number;
+  private timeoutMs: number;
 
   constructor(opts: OllamaClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.apiKey = opts.apiKey;
     this.fetchFn = opts.fetchFn ?? globalThis.fetch;
     this.timeoutMs = opts.timeoutMs ?? 170_000;
+  }
+
+  updateConfig(opts: { baseUrl: string; apiKey?: string; timeoutMs?: number }): void {
+    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.apiKey = opts.apiKey;
+    if (opts.timeoutMs !== undefined) {
+      this.timeoutMs = opts.timeoutMs;
+    }
   }
 
   private headers(): Record<string, string> {
