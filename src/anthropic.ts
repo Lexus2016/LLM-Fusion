@@ -76,6 +76,16 @@ const ToolUseBlockSchema = z
   })
   .passthrough();
 
+// Catch-all for content blocks the proxy does not natively translate but which
+// Claude Code / the Anthropic API can emit in long agent loops (server_tool_use,
+// web_search_tool_result, code_execution_tool_*, document, container_upload, …).
+// The schema MUST accept them so the request is not rejected wholesale with 400
+// "invalid Anthropic messages request (messages.N.content: Invalid input)" —
+// which breaks the agent loop as soon as one such block appears. The translators
+// re-parse each block against the known schemas via safeParse, so unknown blocks
+// are silently ignored (best-effort), and adding this catch-all here is safe.
+const UnknownBlockSchema = z.object({ type: z.string() }).passthrough();
+
 const ToolResultBlockSchema = z
   .object({
     type: z.literal("tool_result"),
@@ -88,7 +98,15 @@ const ToolResultBlockSchema = z
       .union([
         z.string(),
         z.null(),
-        z.array(z.union([TextBlockSchema, ImageBlockSchema, ThinkingBlockSchema, RedactedThinkingBlockSchema])),
+        z.array(
+          z.union([
+            TextBlockSchema,
+            ImageBlockSchema,
+            ThinkingBlockSchema,
+            RedactedThinkingBlockSchema,
+            UnknownBlockSchema,
+          ]),
+        ),
       ])
       .default(""),
     is_error: z.boolean().optional(),
@@ -102,6 +120,7 @@ const ContentBlockSchema = z.union([
   ToolResultBlockSchema,
   ThinkingBlockSchema,
   RedactedThinkingBlockSchema,
+  UnknownBlockSchema,
 ]);
 
 const MessageSchema = z
@@ -233,16 +252,29 @@ function anthropicUserContentToOpenAi(
   };
 
   const blocks = Array.isArray(content) ? content : [content];
-  for (const block of blocks) {
-    if (block.type === "text") {
+  for (const raw of blocks) {
+    // Re-parse each block against the KNOWN schemas rather than narrowing on
+    // block.type: ContentBlockSchema also accepts unknown block types
+    // (server_tool_use, web_search_tool_result, document, …) so the request is
+    // not rejected, but those blocks carry no type-safe fields — safeParse lets
+    // us handle the known ones and silently ignore the rest.
+    const tb = TextBlockSchema.safeParse(raw);
+    if (tb.success) {
       if (!currentUser) currentUser = { role: "user", content: [] };
-      currentUser.content.push({ type: "text", text: block.text });
-    } else if (block.type === "image") {
+      currentUser.content.push({ type: "text", text: tb.data.text });
+      continue;
+    }
+    const ib = ImageBlockSchema.safeParse(raw);
+    if (ib.success) {
       if (!currentUser) currentUser = { role: "user", content: [] };
-      const url = anthropicImageUrl(block.source);
+      const url = anthropicImageUrl(ib.data.source);
       currentUser.content.push({ type: "image_url", image_url: { url } });
-    } else if (block.type === "tool_result") {
+      continue;
+    }
+    const tr = ToolResultBlockSchema.safeParse(raw);
+    if (tr.success) {
       flushUser();
+      const block = tr.data;
       const toolContent =
         block.content == null
           ? ""
@@ -250,15 +282,12 @@ function anthropicUserContentToOpenAi(
             ? block.content
             : block.content
                 .map((b) => {
-                  if (b.type === "image") {
-                    return anthropicImageUrl(b.source);
-                  }
-                  if (b.type === "text") {
-                    return b.text;
-                  }
-                  if (b.type === "thinking") {
-                    return b.thinking || "";
-                  }
+                  const itb = TextBlockSchema.safeParse(b);
+                  if (itb.success) return itb.data.text;
+                  const iib = ImageBlockSchema.safeParse(b);
+                  if (iib.success) return anthropicImageUrl(iib.data.source);
+                  const thb = ThinkingBlockSchema.safeParse(b);
+                  if (thb.success) return thb.data.thinking || "";
                   return "";
                 })
                 .filter(Boolean)
@@ -268,7 +297,9 @@ function anthropicUserContentToOpenAi(
         content: toolContent,
         tool_call_id: block.tool_use_id,
       });
+      continue;
     }
+    // Unknown block type — ignore (best-effort, keeps the agent loop alive).
   }
   flushUser();
   return result;
@@ -285,9 +316,10 @@ function anthropicSystemContentToOpenAi(
   }
   const blocks = Array.isArray(content) ? content : [content];
   let text = "";
-  for (const block of blocks) {
-    if (block.type === "text") {
-      text += (text.length > 0 ? "\n" : "") + block.text;
+  for (const raw of blocks) {
+    const tb = TextBlockSchema.safeParse(raw);
+    if (tb.success) {
+      text += (text.length > 0 ? "\n" : "") + tb.data.text;
     }
   }
   return { role: "system", content: text };
@@ -307,10 +339,17 @@ function anthropicAssistantContentToOpenAi(
   const toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
   const blocks = Array.isArray(content) ? content : [content];
 
-  for (const block of blocks) {
-    if (block.type === "text") {
-      textParts.push(block.text);
-    } else if (block.type === "tool_use") {
+  for (const raw of blocks) {
+    // Re-parse against the KNOWN schemas (see anthropicUserContentToOpenAi for
+    // why): thinking/redacted_thinking and any unknown block type are ignored.
+    const tb = TextBlockSchema.safeParse(raw);
+    if (tb.success) {
+      textParts.push(tb.data.text);
+      continue;
+    }
+    const tub = ToolUseBlockSchema.safeParse(raw);
+    if (tub.success) {
+      const block = tub.data;
       let args = "{}";
       if (block.input != null) {
         if (typeof block.input === "string") {
@@ -327,6 +366,7 @@ function anthropicAssistantContentToOpenAi(
           arguments: args,
         },
       });
+      continue;
     }
   }
 
@@ -758,6 +798,35 @@ export function createAnthropicApp(deps: AnthropicDeps): Hono {
     if (!parsed.success) {
       const first = parsed.error.issues[0];
       const detail = first ? `${first.path.join(".") || "<root>"}: ${first.message}` : "schema validation failed";
+      // DIAG (root-cause investigation): surface the exact shape of the rejected
+      // message so we can see WHICH content block type Claude Code emits that the
+      // schema does not accept. No message text is logged — only structural types
+      // and block type names, so no prompt/tool-result content leaks to the log.
+      try {
+        const isRecord = (v: unknown): v is Record<string, unknown> =>
+          v !== null && typeof v === "object";
+        const idx = first && typeof first.path[1] === "number" ? first.path[1] : -1;
+        const blockTypes: string[] = [];
+        let role: unknown;
+        if (isRecord(raw) && Array.isArray(raw.messages) && idx >= 0) {
+          const rejected = raw.messages[idx];
+          if (isRecord(rejected)) {
+            role = rejected.role;
+            const c = rejected.content;
+            const pushType = (b: unknown): void => {
+              if (isRecord(b) && typeof b.type === "string") blockTypes.push(b.type);
+            };
+            if (Array.isArray(c)) for (const b of c) pushType(b);
+            else pushType(c);
+          }
+        }
+        reqLogger.warn(
+          { idx, role, blockTypes, issuePath: first?.path, issueMsg: first?.message },
+          "anthropic: request rejected by schema (diagnostic)",
+        );
+      } catch {
+        // never let diagnostics mask the original error
+      }
       return toErrorResponse(new BadRequestError(`invalid Anthropic messages request (${detail})`));
     }
 

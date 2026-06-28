@@ -553,4 +553,67 @@ describe("anthropic route", () => {
     const combined = partials.join("");
     expect(JSON.parse(combined)).toEqual({ command: "ls" });
   });
+
+  // Regression: Claude Code (and the Anthropic API) can emit content blocks the
+  // proxy does not natively translate — e.g. server_tool_use, web_search_tool_result,
+  // document, container_upload, code_execution_tool_*. The schema MUST accept them
+  // best-effort instead of rejecting the whole request with 400, which breaks the
+  // agent loop mid-session as soon as one such block appears (root cause of
+  // "invalid Anthropic messages request (messages.N.content: Invalid input)").
+  it("accepts a request with an unknown content block type (best-effort)", async () => {
+    const res = await postMessages(makeApp(), {
+      model: "anthropic-fast",
+      messages: [
+        { role: "user", content: "search the web" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "let me search" },
+            // A server-side tool block the proxy does not model.
+            { type: "server_tool_use", id: "srv-1", name: "web_search", input: { query: "x" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "web_search_tool_result", tool_use_id: "srv-1", content: [{ type: "text", text: "result" }] },
+          ],
+        },
+        { role: "user", content: "now answer" },
+      ],
+    });
+    expect(res.status).toBe(200);
+  });
+
+  // Same regression as above, but routed through the FUSION strategy
+  // (model "anthropic-fusion": panel ["a","b"], judge "a", synth "b"). The
+  // schema-parse fix lives BEFORE dispatch, so it is route-independent; this
+  // test proves the END-TO-END fusion flow (panel -> judge -> synth) completes
+  // with 200 when the original Anthropic request carried unknown content blocks.
+  // defaultRoutes() answers every /v1/chat/completions call with "hello"; the
+  // judge stage gracefully degrades on non-JSON (parseJudgeAnalysis -> null ->
+  // raw panel fallback), so the synth still produces a final answer.
+  it("accepts an unknown content block type through the fusion route", async () => {
+    const res = await postMessages(makeApp(), {
+      model: "anthropic-fusion",
+      messages: [
+        { role: "user", content: "search the web" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "let me search" },
+            { type: "server_tool_use", id: "srv-1", name: "web_search", input: { query: "x" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "web_search_tool_result", tool_use_id: "srv-1", content: [{ type: "text", text: "result" }] },
+          ],
+        },
+        { role: "user", content: "now answer" },
+      ],
+    });
+    expect(res.status).toBe(200);
+  });
 });
