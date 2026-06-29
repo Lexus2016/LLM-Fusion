@@ -1,6 +1,5 @@
 import type { ChatCompletionResult, Strategy } from "../types";
 import { CircuitOpenError, FusionError } from "../errors";
-import { isAbortError } from "../headers";
 import {
   failureKindForError,
   failureKindForStatus,
@@ -53,8 +52,10 @@ export const singleStrategy: Strategy = {
     } catch (err) {
       // Client disconnect is not an upstream health failure: do not trip the
       // breaker. Still release any reserved half-open probe so the model can be
-      // probed again instead of sticking in half-open forever.
-      if (ctx.signal?.aborted || isAbortError(err)) {
+      // probed again instead of sticking in half-open forever. Detect it via the
+      // client signal (not the error name — a stage timeout also aborts the fetch
+      // and would otherwise be misclassified as a disconnect).
+      if (ctx.signal?.aborted) {
         resilience?.breaker.recordProbeAbandoned(target);
         throw err;
       }

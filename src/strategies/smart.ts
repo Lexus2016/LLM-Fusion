@@ -10,7 +10,6 @@ import type { FusionModelConfig, SingleModelConfig, SmartModelConfig } from "../
 import type { Resilience } from "../concurrency";
 import { createResilience } from "../concurrency";
 import { AllMembersFailedError, FusionError } from "../errors";
-import { isAbortError } from "../headers";
 import {
   failureKindForError,
   failureKindForStatus,
@@ -316,7 +315,9 @@ async function classifyUncached(
   } catch (err) {
     // Client disconnect is not a router health failure: do not trip the breaker.
     // Still release any reserved half-open probe so the router can be probed again.
-    if (ctx.signal?.aborted || isAbortError(err)) {
+    // Detect via the client signal, not the error name — a router stage timeout
+    // also aborts the fetch and must still count as a failure.
+    if (ctx.signal?.aborted) {
       resilience.breaker.recordProbeAbandoned(router);
       throw err;
     }

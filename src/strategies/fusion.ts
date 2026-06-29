@@ -28,7 +28,6 @@ import {
   logUpstreamFailure,
 } from "../attribution";
 import { withTimeout, realTimer, combineSignals } from "../timeout";
-import { isAbortError } from "../headers";
 import type { TimerFactory } from "../timeout";
 // Re-exported: the fusion strategy's timer-injection API (FusionDeps.timer) is
 // typed by TimerFactory, so tests that inject a deterministic timer import it here.
@@ -590,10 +589,11 @@ async function callPanelMember(
       );
     });
   } catch (err) {
-    if (signal?.aborted || isAbortError(err)) {
-      // Client disconnect / stage abort is not a model health failure. Release
-      // any reserved half-open probe so the model can be probed again instead of
-      // getting stuck in half-open forever.
+    // Client disconnect / early panel cancellation is not a model health failure.
+    // Detect via the passed combined signal (client + member controller), NOT the
+    // error name — a panel-member stage timeout also aborts the fetch via the
+    // separate `abort` controller and must still count as a failure.
+    if (signal?.aborted) {
       resilience.breaker.recordProbeAbandoned(member);
       throw err;
     }
@@ -988,7 +988,9 @@ async function runJudge(
   } catch (err) {
     // Client disconnect is not a judge health failure: do not trip the breaker.
     // Still release any reserved half-open probe so the model can be probed again.
-    if (ctx.signal?.aborted || isAbortError(err)) {
+    // Detect via the client signal, not the error name — a judge stage timeout
+    // also aborts the fetch and must still count as a failure.
+    if (ctx.signal?.aborted) {
       resilience.breaker.recordProbeAbandoned(judge);
       throw err;
     }
@@ -1077,7 +1079,9 @@ async function runSynth(
   } catch (err) {
     // Client disconnect is not a synth health failure: do not trip the breaker.
     // Still release any reserved half-open probe so the model can be probed again.
-    if (ctx.signal?.aborted || isAbortError(err)) {
+    // Detect via the client signal, not the error name — a synth stage timeout
+    // also aborts the fetch and must still count as a failure.
+    if (ctx.signal?.aborted) {
       resilience.breaker.recordProbeAbandoned(synth);
       throw err;
     }

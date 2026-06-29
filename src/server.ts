@@ -283,14 +283,14 @@ async function decorateUsage(res: Response, usage: UsageAccumulator, meta: Usage
 
   const aggregate = await usage.finalize(meta.pricing);
   const headers = new Headers(res.headers);
-  // A JSON body may be rewritten below (usage injection); strip upstream length/
-  // encoding headers so they cannot disagree with the new body.
-  stripHopByHopHeaders(headers);
   headers.set("x-fusion-usage", usageHeaderValue(aggregate));
   logUsage(meta, aggregate);
 
-  // Only inject `usage` into a successful JSON object body.
+  // Only inject `usage` into a successful JSON object body. Strip upstream
+  // length/encoding headers only when we actually rewrite the body — for
+  // pass-through/error bodies they still describe the untouched upstream body.
   if (contentType.includes("application/json") && res.status < 400) {
+    stripHopByHopHeaders(headers);
     const text = await res.text();
     return new Response(injectUsageIntoJson(text, aggregate), { status: res.status, headers });
   }

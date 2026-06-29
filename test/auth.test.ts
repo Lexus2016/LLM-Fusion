@@ -35,6 +35,10 @@ function post(a: ReturnType<typeof app>, headers: Record<string, string>) {
   });
 }
 
+function getModels(a: ReturnType<typeof app>, headers: Record<string, string>) {
+  return a.request("/v1/models", { method: "GET", headers });
+}
+
 describe("auth", () => {
   it("rejects a missing bearer when a token is configured", async () => {
     const res = await post(app("secret"), {});
@@ -60,6 +64,22 @@ describe("auth", () => {
 
   it("allows all requests when no token is configured", async () => {
     const res = await post(app(undefined), {});
+    expect(res.status).toBe(200);
+  });
+
+  it("rejects with 500 when the configured token is empty (no silent auth bypass)", async () => {
+    // An env var set to "" is a misconfiguration; the proxy must not run open.
+    const res = await post(app(""), {});
+    expect(res.status).toBe(500);
+  });
+
+  it("protects /v1/models behind auth (rejects missing bearer)", async () => {
+    const res = await getModels(app("secret"), {});
+    expect(res.status).toBe(401);
+  });
+
+  it("allows /v1/models with the correct bearer", async () => {
+    const res = await getModels(app("secret"), { authorization: "Bearer secret" });
     expect(res.status).toBe(200);
   });
 });

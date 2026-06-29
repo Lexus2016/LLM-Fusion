@@ -2,7 +2,6 @@ import type { ChatCompletionResult, Strategy, StrategyContext } from "../types";
 import type { Resilience } from "../concurrency";
 import { backoffDelay, createResilience } from "../concurrency";
 import { AllMembersFailedError, CircuitOpenError, FusionError, UpstreamNetworkError } from "../errors";
-import { isAbortError } from "../headers";
 import {
   failureKindForError,
   logUpstreamFailure,
@@ -123,8 +122,9 @@ async function attemptJsonMember(
     } catch (err) {
       // Client disconnect is not a member health failure: do not trip the breaker
       // and do not waste retries. Release any reserved half-open probe so the
-      // model can be probed again.
-      if (ctx.signal?.aborted || isAbortError(err)) {
+      // model can be probed again. Detect via the client signal, not the error
+      // name — a stage timeout also aborts the fetch and must still count.
+      if (ctx.signal?.aborted) {
         breaker.recordProbeAbandoned(member);
         throw err;
       }
@@ -212,8 +212,9 @@ async function attemptStreamMember(
     } catch (err) {
       // Client disconnect is not a member health failure: do not trip the breaker
       // and do not waste retries. Release any reserved half-open probe so the
-      // model can be probed again.
-      if (ctx.signal?.aborted || isAbortError(err)) {
+      // model can be probed again. Detect via the client signal, not the error
+      // name — a stage timeout also aborts the fetch and must still count.
+      if (ctx.signal?.aborted) {
         breaker.recordProbeAbandoned(member);
         throw err;
       }

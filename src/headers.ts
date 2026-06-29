@@ -11,13 +11,3 @@ export function stripHopByHopHeaders(headers: Headers): void {
   headers.delete("content-encoding");
   headers.delete("transfer-encoding");
 }
-
-/**
- * True when an error is an abort/cancellation (fetch throws `AbortError`,
- * `DOMException` with name `AbortError`, or our own thrown abort). Used to keep
- * client disconnects from being recorded as upstream failures and tripping the
- * circuit breaker.
- */
-export function isAbortError(err: unknown): boolean {
-  return err instanceof Error && err.name === "AbortError";
-}

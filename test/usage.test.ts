@@ -4,6 +4,7 @@ import type { Logger } from "pino";
 import { z } from "zod";
 import { createApp } from "../src/server";
 import { OllamaClient } from "../src/upstream/ollama";
+import { makeUsageInjectionTransform, UsageAccumulator } from "../src/usage";
 import { CapabilityService } from "../src/capabilities";
 import { parseConfig } from "../src/config";
 import type { Config } from "../src/config";
@@ -312,5 +313,46 @@ describe("usage accounting", () => {
     await post(app, { model: "single-m", messages: [{ role: "user", content: "hard" }] });
     expect(recorded.length).toBeGreaterThan(0);
     expect(recorded.every((r) => r.includeUsage === false)).toBe(true);
+  });
+});
+
+describe("makeUsageInjectionTransform — usage chunk keeps finish_reason", () => {
+  it("strips only the usage field and forwards finish_reason/content from the same chunk", async () => {
+    const acc = new UsageAccumulator();
+    const transform = makeUsageInjectionTransform(acc, { reqId: "r1", model: "m", created: 0 }, undefined);
+    const encoder = new TextEncoder();
+
+    // Read concurrently with writing — a TransformStream applies backpressure,
+    // so writes block until the reader drains them.
+    const readAll = async (): Promise<string> => {
+      const reader = transform.readable.getReader();
+      let text = "";
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        text += new TextDecoder().decode(value);
+      }
+      return text;
+    };
+
+    const writeAll = async (): Promise<void> => {
+      const writer = transform.writable.getWriter();
+      // Upstream sends usage AND finish_reason in the same final chunk.
+      await writer.write(
+        encoder.encode(
+          'data: {"id":"up-1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}\n\n',
+        ),
+      );
+      await writer.write(encoder.encode("data: [DONE]\n\n"));
+      await writer.close();
+    };
+
+    const text = await Promise.all([readAll(), writeAll()]).then(([t]) => t);
+    // finish_reason must survive; the upstream usage field must be dropped
+    // (replaced by our aggregate in flush).
+    expect(text).toContain('"finish_reason":"stop"');
+    expect(text).not.toContain('"prompt_tokens":1');
+    expect(text).toContain("data: [DONE]");
   });
 });

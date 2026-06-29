@@ -140,4 +140,14 @@ describe("web grounding — buildWebContext", () => {
     const out = await buildWebContext("query", cfg({ fetch: fetchFn }));
     expect(out).toBeNull();
   });
+
+  it("sends redirect:'error' so the Tavily API key cannot leak via 307/308", async () => {
+    let capturedRedirect: RequestInit["redirect"] | undefined;
+    const fetchFn: FetchFn = async (_input, init) => {
+      capturedRedirect = init?.redirect;
+      return tavilyResponse([{ title: "T", url: "https://example.com", content: "hello world" }]);
+    };
+    await tavilySearch("query", cfg({ fetch: fetchFn }));
+    expect(capturedRedirect).toBe("error");
+  });
 });

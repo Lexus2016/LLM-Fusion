@@ -83,6 +83,34 @@ describe("circuit breaker", () => {
     now += 10_000; // cooldown elapsed again
     expect(breaker.getState(model)).toBe("half-open");
   });
+
+  it("recordProbeAbandoned frees a reserved half-open probe without opening the breaker (client disconnect)", () => {
+    let now = 0;
+    const breaker = new CircuitBreaker({ failureThreshold: 1, cooldownMs: 10_000, now: () => now });
+    const model = "m";
+
+    breaker.recordFailure(model); // open
+    now += 10_000; // half-open
+    expect(breaker.canAttempt(model)).toBe(true); // probe reserved (probeInFlight=true)
+    expect(breaker.canAttempt(model)).toBe(false); // concurrent probe denied
+
+    // Client disconnects before the probe settles: release without recording a failure.
+    breaker.recordProbeAbandoned(model);
+    expect(breaker.getState(model)).toBe("half-open");
+    // The probe slot is free again, so a new probe is allowed.
+    expect(breaker.canAttempt(model)).toBe(true);
+    // Still half-open (not re-opened): a subsequent success closes normally.
+    breaker.recordSuccess(model);
+    expect(breaker.getState(model)).toBe("closed");
+  });
+
+  it("recordProbeAbandoned is a no-op outside half-open (does not corrupt closed/open state)", () => {
+    const breaker = new CircuitBreaker({ failureThreshold: 2, cooldownMs: 10_000, now: () => 0 });
+    const model = "m";
+    expect(breaker.canAttempt(model)).toBe(true); // closed
+    breaker.recordProbeAbandoned(model);
+    expect(breaker.getState(model)).toBe("closed");
+  });
 });
 
 describe("concurrency limiter", () => {
