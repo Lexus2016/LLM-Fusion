@@ -285,6 +285,13 @@ async function attemptStreamMember(
     // commit vs. advance. SSE keep-alive comments/blank lines do not commit.
     const peek = await peekFirstChunk(result.body);
     if (peek.kind === "error") {
+      // Client disconnect surfaces here as an AbortError from the peek read. It
+      // is NOT a member health failure: do not trip the breaker or waste retries.
+      // Release any reserved half-open probe so the model can be probed again.
+      if (ctx.signal?.aborted) {
+        breaker.recordProbeAbandoned(member);
+        throw new UpstreamNetworkError(`member '${member}' cancelled by client disconnect`);
+      }
       // Failure BEFORE any content forwarded — safe to retry/advance.
       breaker.recordFailure(member);
       logUpstreamFailure(ctx.logger, {

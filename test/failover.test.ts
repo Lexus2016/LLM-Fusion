@@ -65,6 +65,7 @@ function ctxWith(
   client: UpstreamClient,
   request: ChatCompletionRequest,
   resilience: Resilience,
+  signal?: AbortSignal,
 ): StrategyContext {
   const capabilities = new CapabilityService({
     client,
@@ -73,7 +74,7 @@ function ctxWith(
   });
   const entry = config.models["ha"];
   if (!entry) throw new Error("test config missing failover model 'ha'");
-  return { request, config, client, capabilities, logger, modelConfig: entry, resilience };
+  return { request, config, client, capabilities, logger, modelConfig: entry, resilience, signal };
 }
 
 function clientWith(fetchFn: FetchFn): OllamaClient {
@@ -317,5 +318,33 @@ describe("failover wired through the server", () => {
     expect(res.status).toBe(200);
     const body = JSON.parse(await res.text());
     expect(body.choices[0].message.content).toBe("served");
+  });
+
+  it("streaming: a client disconnect during the pre-content peek does NOT trip the breaker", async () => {
+    const controller = new AbortController();
+    // A stream that errors on the first read, after we abort the client signal —
+    // simulates a client disconnect surfacing as an AbortError during the peek.
+    function abortingStream(): Response {
+      const stream = new ReadableStream<Uint8Array>({
+        start(c) {
+          // Abort the client signal, then error the upstream read.
+          controller.abort();
+          c.error(new DOMException("aborted", "AbortError"));
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    const { fetchFn, counts } = chatMock(() => abortingStream());
+    const { resilience } = makeResilience({ maxServerRetries: 0 }, { failureThreshold: 1 });
+
+    await expect(
+      failoverStrategy.execute(
+        ctxWith(clientWith(fetchFn), { model: "ha", stream: true, messages: [] }, resilience, controller.signal),
+      ),
+    ).rejects.toThrow();
+
+    // The member was attempted (peek ran) but the disconnect did NOT count as a failure.
+    expect(counts["m1"]).toBe(1);
+    expect(resilience.breaker.getState("m1")).toBe("closed");
   });
 });
