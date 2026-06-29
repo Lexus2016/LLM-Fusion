@@ -69,6 +69,20 @@ function postMessages(app: ReturnType<typeof makeApp>, body: unknown, headers?: 
   });
 }
 
+describe("anthropic error shape", () => {
+  it("returns Anthropic-shaped errors for invalid JSON body", async () => {
+    const app = makeApp();
+    const res = await app.request("/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "not-json",
+    });
+    expect(res.status).toBe(400);
+    const body = JSON.parse(await res.text());
+    expect(body).toEqual({ type: "error", error: { type: "invalid_request_error", message: "request body must be valid JSON" } });
+  });
+});
+
 describe("anthropic translation", () => {
   it("maps a simple user + system prompt to OpenAI messages", () => {
     const req: AnthropicRequest = {

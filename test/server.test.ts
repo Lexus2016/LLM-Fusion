@@ -173,6 +173,33 @@ describe("server", () => {
     expect(text).toContain("[DONE]");
   });
 
+  it("does not forward stale upstream content-length / content-encoding on a rewritten body", async () => {
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          new Response(
+            JSON.stringify({
+              choices: [{ message: { role: "assistant", content: "x" } }],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }),
+            {
+              status: 200,
+              headers: {
+                "content-type": "application/json",
+                "content-length": "999", // stale — the body will be rewritten for usage injection
+                "content-encoding": "gzip", // stale
+              },
+            },
+          ),
+      },
+    ];
+    const res = await postChat(makeApp(routes), { model: "fast-glm", stream: false, messages: [] });
+    expect(res.headers.get("content-length")).toBeNull();
+    expect(res.headers.get("content-encoding")).toBeNull();
+    expect(res.headers.get("content-type")).toContain("application/json");
+  });
+
   it("logs `request usage` even when the upstream stream errors mid-stream (H-2)", async () => {
     const lines: Array<Record<string, unknown>> = [];
     const capLogger = pino({ level: "info", base: undefined }, { write(s: string) { lines.push(JSON.parse(s)); } });
