@@ -132,6 +132,19 @@ export class CircuitBreaker {
     }
   }
 
+  /**
+   * Release a reserved half-open probe without recording a failure. Called when
+   * a probe is cancelled by the client (abort) before it could succeed or fail:
+   * the model's health is unchanged, but `probeInFlight` must be freed so the
+   * next call can probe again. Without this, a cancelled probe leaves the
+   * breaker stuck in half-open forever.
+   */
+  recordProbeAbandoned(model: string): void {
+    const s = this.get(model);
+    this.refresh(s);
+    if (s.state === "half-open") s.probeInFlight = false;
+  }
+
   /** Reset all breaker state (test helper). */
   reset(): void {
     this.states.clear();

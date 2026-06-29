@@ -279,7 +279,17 @@ export function makeUsageInjectionTransform(
   const handleLine = (line: string, controller: TransformStreamDefaultController<Uint8Array>): void => {
     const c = classifyDataLine(line);
     if (c.kind === "done") return; // re-emitted in flush, after our usage chunk
-    if (c.kind === "data" && chunkHasUsage(c.obj)) return; // replaced by our aggregate
+    if (c.kind === "data" && chunkHasUsage(c.obj)) {
+      // Upstream sometimes sends `usage` in the same chunk as `finish_reason` /
+      // `choices`. Drop only the `usage` field and forward the rest so the client
+      // does not lose `finish_reason` or final content.
+      const obj = c.obj as Record<string, unknown>;
+      const { usage: _, ...rest } = obj;
+      if (Object.keys(rest).length > 0) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(rest)}\n`));
+      }
+      return;
+    }
     controller.enqueue(encoder.encode(line + "\n"));
   };
 

@@ -86,6 +86,10 @@ export async function tavilySearch(
     res = await fetchFn(TAVILY_URL, {
       method: "POST",
       headers: { "content-type": "application/json" },
+      // The POST body carries the Tavily API key; never follow redirects
+      // (a 307/308 would resend this body, with the key, to an attacker-controlled
+      // host). Treat a redirect as a hard error instead.
+      redirect: "error",
       body: JSON.stringify({
         api_key: cfg.apiKey,
         query,

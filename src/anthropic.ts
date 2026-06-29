@@ -16,8 +16,9 @@ import type { Resilience } from "./concurrency";
 import { dispatch } from "./router";
 import { UsageAccumulator, usageHeaderValue, toOpenAiUsage } from "./usage";
 import { createAuthMiddleware } from "./auth";
-import { BadRequestError, FusionError, toErrorResponse } from "./errors";
+import { BadRequestError, FusionError, toAnthropicErrorResponse } from "./errors";
 import { stripThinkingTags } from "./reasoning";
+import { stripHopByHopHeaders } from "./headers";
 
 /**
  * Anthropic Messages API compatibility layer.
@@ -791,7 +792,7 @@ export function createAnthropicApp(deps: AnthropicDeps): Hono {
     try {
       raw = await c.req.json();
     } catch {
-      return toErrorResponse(new BadRequestError("request body must be valid JSON"));
+      return toAnthropicErrorResponse(new BadRequestError("request body must be valid JSON"));
     }
 
     const parsed = AnthropicRequestSchema.safeParse(raw);
@@ -827,7 +828,7 @@ export function createAnthropicApp(deps: AnthropicDeps): Hono {
       } catch {
         // never let diagnostics mask the original error
       }
-      return toErrorResponse(new BadRequestError(`invalid Anthropic messages request (${detail})`));
+      return toAnthropicErrorResponse(new BadRequestError(`invalid Anthropic messages request (${detail})`));
     }
 
     const request = parsed.data;
@@ -865,6 +866,9 @@ export function createAnthropicApp(deps: AnthropicDeps): Hono {
           pricing: config.pricing,
           logger: reqLogger,
         });
+        // The SSE body is our transform stream, not the upstream body — drop
+        // upstream length/encoding headers so they cannot disagree.
+        stripHopByHopHeaders(headers);
         const sseHeaders: Record<string, string> = {
           "content-type": "text/event-stream",
           "cache-control": "no-cache",
@@ -885,6 +889,8 @@ export function createAnthropicApp(deps: AnthropicDeps): Hono {
       const openAiData = await res.json();
       const finalUsage = await usage.finalize(config.pricing);
       const anthropicBody = openAiToAnthropicResponse(openAiData, model, finalUsage);
+      // The body is re-serialized below — drop upstream length/encoding headers.
+      stripHopByHopHeaders(headers);
       headers.set("content-type", "application/json");
       reqLogger.info(
         { model, status: res.status, ms: Date.now() - startedAt, stream },
@@ -899,7 +905,7 @@ export function createAnthropicApp(deps: AnthropicDeps): Hono {
       } else {
         reqLogger.info({ model, status, ms }, "request rejected");
       }
-      return toErrorResponse(err);
+      return toAnthropicErrorResponse(err);
     }
   });
 

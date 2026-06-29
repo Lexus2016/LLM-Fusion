@@ -1,5 +1,6 @@
 import type { ChatCompletionResult, Strategy } from "../types";
 import { CircuitOpenError, FusionError } from "../errors";
+import { isAbortError } from "../headers";
 import {
   failureKindForError,
   failureKindForStatus,
@@ -50,6 +51,13 @@ export const singleStrategy: Strategy = {
         ? await resilience.limiter(() => ctx.client.chatCompletions(body, { stream, signal: ctx.signal }))
         : await ctx.client.chatCompletions(body, { stream, signal: ctx.signal });
     } catch (err) {
+      // Client disconnect is not an upstream health failure: do not trip the
+      // breaker. Still release any reserved half-open probe so the model can be
+      // probed again instead of sticking in half-open forever.
+      if (ctx.signal?.aborted || isAbortError(err)) {
+        resilience?.breaker.recordProbeAbandoned(target);
+        throw err;
+      }
       resilience?.breaker.recordFailure(target);
       ctx.usage?.recordError(target);
       logUpstreamFailure(ctx.logger, {

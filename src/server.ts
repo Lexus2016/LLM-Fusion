@@ -18,6 +18,7 @@ import { createAuthMiddleware } from "./auth";
 import { createAnthropicApp } from "./anthropic";
 import { dispatch, entryMembers, representativeMember } from "./router";
 import { BadRequestError, FusionError, toErrorResponse } from "./errors";
+import { stripHopByHopHeaders } from "./headers";
 
 /**
  * Hono application factory. Tests build the app with a mock client + in-memory
@@ -82,7 +83,7 @@ export function createApp(deps: AppDeps): Hono {
     }
   });
 
-  app.get("/v1/models", async (c) => {
+  app.get("/v1/models", auth, async (c) => {
     const config = deps.getConfig();
     // Discover capabilities in PARALLEL, bounded by the shared upstream limiter
     // (respects max_concurrency, competes fairly with in-flight chat calls).
@@ -226,6 +227,9 @@ async function decorateUsage(res: Response, usage: UsageAccumulator, meta: Usage
 
   if (contentType.includes("text/event-stream")) {
     const headers = new Headers(res.headers);
+    // The body below is a transform stream (usage injected in flush), not the
+    // upstream body — drop upstream length/encoding headers or clients truncate.
+    stripHopByHopHeaders(headers);
     headers.set("x-fusion-usage", usageHeaderValue(usage.snapshot(meta.pricing)));
     const transform = makeUsageInjectionTransform(usage, {
       reqId: meta.reqId,
@@ -279,6 +283,9 @@ async function decorateUsage(res: Response, usage: UsageAccumulator, meta: Usage
 
   const aggregate = await usage.finalize(meta.pricing);
   const headers = new Headers(res.headers);
+  // A JSON body may be rewritten below (usage injection); strip upstream length/
+  // encoding headers so they cannot disagree with the new body.
+  stripHopByHopHeaders(headers);
   headers.set("x-fusion-usage", usageHeaderValue(aggregate));
   logUsage(meta, aggregate);
 

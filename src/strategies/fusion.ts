@@ -28,6 +28,7 @@ import {
   logUpstreamFailure,
 } from "../attribution";
 import { withTimeout, realTimer, combineSignals } from "../timeout";
+import { isAbortError } from "../headers";
 import type { TimerFactory } from "../timeout";
 // Re-exported: the fusion strategy's timer-injection API (FusionDeps.timer) is
 // typed by TimerFactory, so tests that inject a deterministic timer import it here.
@@ -538,54 +539,62 @@ async function callPanelMember(
     toolCalls: unknown[];
   }
 
-  const workPromise = (async (): Promise<PanelFetchOutcome> => {
-    const result = await invokeUpstream(ctx.client, body, {
-      stream: useStream,
-      native: opts.native,
-      signal: combineSignals(signal ?? ctx.signal, abort.signal),
-    });
-
-    if (result.status >= 400) {
-      return { result, content: "", toolCalls: [] };
-    }
-
-    let content = "";
-    let toolCalls: unknown[] = [];
-    if (result.kind === "stream" && result.body) {
-      const acc = await accumulateStreamAndTrack(
-        result.body,
-        onFirstToken ?? (() => {}),
-        combineSignals(signal ?? ctx.signal, abort.signal),
-      );
-      content = acc.content;
-      toolCalls = acc.toolCalls;
-    } else if (result.kind === "json") {
-      content = extractAnswer(result.data) ?? "";
-      toolCalls = extractToolCalls(result.data);
-      if ((content.length > 0 || toolCalls.length > 0) && onFirstToken) {
-        onFirstToken();
-      }
-    } else {
-      throw new Error("unexpected non-json/non-stream panel result");
-    }
-
-    return { result, content, toolCalls };
-  })();
-
   let outcome: PanelFetchOutcome;
 
   try {
-    outcome = await resilience.limiter(() =>
-      withTimeout(
+    // Create the upstream work promise INSIDE the limiter callback so the
+    // concurrency slot is acquired BEFORE the HTTP request starts. The previous
+    // code created the promise early, which meant `max_concurrency` only gated
+    // awaiting completion — all panel members started fetching simultaneously.
+    outcome = await resilience.limiter(() => {
+      const workPromise = (async (): Promise<PanelFetchOutcome> => {
+        const result = await invokeUpstream(ctx.client, body, {
+          stream: useStream,
+          native: opts.native,
+          signal: combineSignals(signal ?? ctx.signal, abort.signal),
+        });
+
+        if (result.status >= 400) {
+          return { result, content: "", toolCalls: [] };
+        }
+
+        let content = "";
+        let toolCalls: unknown[] = [];
+        if (result.kind === "stream" && result.body) {
+          const acc = await accumulateStreamAndTrack(
+            result.body,
+            onFirstToken ?? (() => {}),
+            combineSignals(signal ?? ctx.signal, abort.signal),
+          );
+          content = acc.content;
+          toolCalls = acc.toolCalls;
+        } else if (result.kind === "json") {
+          content = extractAnswer(result.data) ?? "";
+          toolCalls = extractToolCalls(result.data);
+          if ((content.length > 0 || toolCalls.length > 0) && onFirstToken) {
+            onFirstToken();
+          }
+        } else {
+          throw new Error("unexpected non-json/non-stream panel result");
+        }
+
+        return { result, content, toolCalls };
+      })();
+
+      return withTimeout(
         workPromise,
         timeoutMs,
         timer,
         `panel member '${member}' timed out after ${timeoutMs}ms`,
         () => abort.abort(),
-      ),
-    );
+      );
+    });
   } catch (err) {
-    if (signal?.aborted) {
+    if (signal?.aborted || isAbortError(err)) {
+      // Client disconnect / stage abort is not a model health failure. Release
+      // any reserved half-open probe so the model can be probed again instead of
+      // getting stuck in half-open forever.
+      resilience.breaker.recordProbeAbandoned(member);
       throw err;
     }
     resilience.breaker.recordFailure(member);
@@ -977,6 +986,12 @@ async function runJudge(
       ),
     );
   } catch (err) {
+    // Client disconnect is not a judge health failure: do not trip the breaker.
+    // Still release any reserved half-open probe so the model can be probed again.
+    if (ctx.signal?.aborted || isAbortError(err)) {
+      resilience.breaker.recordProbeAbandoned(judge);
+      throw err;
+    }
     resilience.breaker.recordFailure(judge);
     ctx.usage?.recordError(judge);
     logUpstreamFailure(ctx.logger, {
@@ -1060,6 +1075,12 @@ async function runSynth(
       invokeUpstream(ctx.client, body, { stream: opts.stream, native: opts.native, signal: ctx.signal }),
     );
   } catch (err) {
+    // Client disconnect is not a synth health failure: do not trip the breaker.
+    // Still release any reserved half-open probe so the model can be probed again.
+    if (ctx.signal?.aborted || isAbortError(err)) {
+      resilience.breaker.recordProbeAbandoned(synth);
+      throw err;
+    }
     resilience.breaker.recordFailure(synth);
     ctx.usage?.recordError(synth);
     logUpstreamFailure(ctx.logger, {

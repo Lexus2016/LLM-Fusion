@@ -28,9 +28,20 @@ function tokensMatch(provided: string, token: string): boolean {
 export function createAuthMiddleware(getToken: () => string | undefined): MiddlewareHandler {
   return async (c, next) => {
     const token = getToken();
-    if (!token) {
+    if (token === undefined) {
+      // No token configured (localhost single-user) — the startup warning is
+      // emitted by the entrypoint.
       await next();
       return;
+    }
+    if (token === "") {
+      // A configured-but-empty token is a misconfiguration (e.g. an env var set
+      // to "" in CI/Docker). Treat it as a hard error rather than silently
+      // disabling auth — otherwise the proxy would run open with no startup sign.
+      return c.json(
+        { error: { message: "client auth token configured but empty", type: "configuration_error", code: null } },
+        500,
+      );
     }
     let provided: string | undefined;
     const authHeader = c.req.header("authorization") ?? "";

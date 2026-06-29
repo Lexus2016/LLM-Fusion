@@ -2,6 +2,7 @@ import type { ChatCompletionResult, Strategy, StrategyContext } from "../types";
 import type { Resilience } from "../concurrency";
 import { backoffDelay, createResilience } from "../concurrency";
 import { AllMembersFailedError, CircuitOpenError, FusionError, UpstreamNetworkError } from "../errors";
+import { isAbortError } from "../headers";
 import {
   failureKindForError,
   logUpstreamFailure,
@@ -120,6 +121,13 @@ async function attemptJsonMember(
     try {
       result = await resilience.limiter(() => ctx.client.chatCompletions(body, { stream: false, signal: ctx.signal }));
     } catch (err) {
+      // Client disconnect is not a member health failure: do not trip the breaker
+      // and do not waste retries. Release any reserved half-open probe so the
+      // model can be probed again.
+      if (ctx.signal?.aborted || isAbortError(err)) {
+        breaker.recordProbeAbandoned(member);
+        throw err;
+      }
       breaker.recordFailure(member);
       ctx.usage?.recordError(member);
       logUpstreamFailure(ctx.logger, {
@@ -202,6 +210,13 @@ async function attemptStreamMember(
     try {
       result = await resilience.limiter(() => ctx.client.chatCompletions(body, { stream: true, signal: ctx.signal }));
     } catch (err) {
+      // Client disconnect is not a member health failure: do not trip the breaker
+      // and do not waste retries. Release any reserved half-open probe so the
+      // model can be probed again.
+      if (ctx.signal?.aborted || isAbortError(err)) {
+        breaker.recordProbeAbandoned(member);
+        throw err;
+      }
       breaker.recordFailure(member);
       ctx.usage?.recordError(member);
       logUpstreamFailure(ctx.logger, {

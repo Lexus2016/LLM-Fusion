@@ -51,11 +51,46 @@ export class OllamaClient implements UpstreamClient {
     return h;
   }
 
-  private async doFetch(url: string, init: RequestInit): Promise<Response> {
-    // Per-call timeout via an UNREF'd signal (AbortSignal.timeout does not keep
-    // the event loop alive — fixes the old ref'd setTimeout that blocked shutdown),
-    // combined with any caller-provided signal so a stage timeout or shutdown can
-    // cancel the in-flight request and free its concurrency slot promptly.
+  private async doFetch(
+    url: string,
+    init: RequestInit,
+    opts: { phaseTimeoutOnly?: boolean } = {},
+  ): Promise<Response> {
+    // Per-call timeout. Two shapes:
+    //  - default (non-stream): the timeout covers the whole request incl. body
+    //    read, via `AbortSignal.timeout` (unref'd, does not keep the event loop
+    //    alive). Combined with any caller signal so a stage timeout/shutdown can
+    //    cancel the in-flight request and free its concurrency slot promptly.
+    //  - phaseTimeoutOnly (stream): the timeout is a CONNECTION/first-response
+    //    timeout only. It is cleared the instant `fetch()` resolves (the headers
+    //    are back), so a slow-but-progressing stream is NOT hard-cut mid-delivery
+    //    — the model already produced its answer and is delivering it. The stream
+    //    is still cancellable by the caller's signal (client disconnect / stage
+    //    abort). This turns the hard request_timeout_s into a dynamic one: it
+    //    bounds time-to-first-response, not total response time.
+    if (opts.phaseTimeoutOnly) {
+      const phaseAbort = new AbortController();
+      const handle = setTimeout(() => phaseAbort.abort(), this.timeoutMs);
+      handle.unref?.();
+      const signal = init.signal ? AbortSignal.any([init.signal, phaseAbort.signal]) : phaseAbort.signal;
+      try {
+        const res = await this.fetchFn(url, { ...init, signal });
+        // Headers received — stop the hard timeout so the streaming body is not
+        // truncated once the model starts delivering.
+        clearTimeout(handle);
+        return res;
+      } catch (err) {
+        clearTimeout(handle);
+        if (phaseAbort.signal.aborted) {
+          throw new UpstreamTimeoutError(`upstream request to ${url} timed out after ${this.timeoutMs}ms`);
+        }
+        if (init.signal?.aborted) {
+          throw new UpstreamTimeoutError(`upstream request to ${url} was cancelled by the caller`);
+        }
+        const message = err instanceof Error ? err.message : "upstream request failed";
+        throw new UpstreamNetworkError(`upstream request to ${url} failed: ${message}`);
+      }
+    }
     const timeout = AbortSignal.timeout(this.timeoutMs);
     const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
     try {
@@ -78,12 +113,18 @@ export class OllamaClient implements UpstreamClient {
   ): Promise<ChatCompletionResult> {
     const url = `${this.baseUrl}/v1/chat/completions`;
     const payload = withIncludeUsage({ ...body, stream: opts.stream }, opts.stream);
-    const res = await this.doFetch(url, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify(payload),
-      signal: opts.signal,
-    });
+    const res = await this.doFetch(
+      url,
+      {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify(payload),
+        signal: opts.signal,
+      },
+      // Stream: hard timeout is connection/first-response only — once the model
+      // starts delivering, do not cut it. See doFetch.
+      { phaseTimeoutOnly: opts.stream },
+    );
     // Stream only when the upstream actually succeeded; an error before the
     // first byte is surfaced as a JSON body with the upstream status.
     if (opts.stream && res.ok) {

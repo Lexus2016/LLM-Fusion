@@ -110,3 +110,17 @@ export function toErrorResponse(err: unknown): Response {
   // gets a generic message.
   return jsonError(500, "internal server error", "internal_error");
 }
+
+/**
+ * Anthropic-shaped error response: `{"type":"error","error":{...}}`. Anthropic
+ * clients (incl. Claude Code) parse this shape, not OpenAI's `{"error":{}}`; the
+ * OpenAI-shaped `toErrorResponse` would surface as an unparseable body on the
+ * `/v1/messages` route. Reuses the same status/message/type as the OpenAI shape.
+ */
+export function toAnthropicErrorResponse(err: unknown): Response {
+  const status = err instanceof FusionError ? err.httpStatus : 500;
+  const message = err instanceof FusionError ? err.message : "internal server error";
+  const type = err instanceof FusionError ? err.errorType : "internal_error";
+  const body = JSON.stringify({ type: "error", error: { type, message } });
+  return new Response(body, { status, headers: { "content-type": "application/json" } });
+}
