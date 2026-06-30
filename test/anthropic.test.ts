@@ -510,6 +510,31 @@ describe("anthropic route", () => {
     expect(res.headers.get("x-fusion-usage")).toContain('"calls":1');
   });
 
+  it("streamed tool_calls with finish_reason:stop still yield stop_reason:tool_use", async () => {
+    // Regression: a deviant upstream that emits tool_calls but finish_reason "stop"
+    // (or null) must not produce stop_reason:"end_turn" — Claude Code keys its agent
+    // loop on stop_reason:"tool_use" and would otherwise never run the tool.
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          sseResponse([
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: "tu-1", function: { name: "bash", arguments: "{}" } }] } }] },
+            { choices: [{ delta: {}, finish_reason: "stop" }] },
+          ]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-fast",
+      stream: true,
+      messages: [{ role: "user", content: "run ls" }],
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"type":"tool_use"'); // tool block was emitted
+    expect(text).toContain('"stop_reason":"tool_use"'); // and reflected despite finish:stop
+  });
+
   it("authenticates with x-api-key header", async () => {
     const app = makeApp(defaultRoutes(), "secret");
     const ok = await postMessages(

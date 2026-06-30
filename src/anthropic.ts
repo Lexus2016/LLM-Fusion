@@ -487,11 +487,15 @@ function finishReasonToAnthropic(
   reason: string | null | undefined,
   contentBlocks: Array<Record<string, unknown>>,
 ): string | null {
-  if (reason === "stop") return "end_turn";
-  if (reason === "length") return "max_tokens";
+  // tool_use DOMINATES: if the turn produced a tool call, it ended to run that tool,
+  // regardless of the upstream finish_reason. Some upstreams send "stop" (or null on a
+  // truncated stream) alongside tool_calls; checking tool presence first keeps the
+  // Anthropic stop_reason correct so the Claude Code agent loop actually runs the tool.
   if (reason === "tool_calls" || contentBlocks.some((b) => b.type === "tool_use")) {
     return "tool_use";
   }
+  if (reason === "stop") return "end_turn";
+  if (reason === "length") return "max_tokens";
   return null;
 }
 
@@ -729,7 +733,14 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
 
       stopActiveBlock(controller);
       const finalUsage = await opts.usage.finalize(opts.pricing);
-      const stopReason = finishReasonToAnthropic(finishReason, []);
+      // Pass the tool-block presence (not []): the stream emits tool_use blocks as it
+      // converts tool_calls deltas, so the final stop_reason must reflect them even when
+      // the upstream finish_reason is "stop"/null — otherwise Claude Code sees tool_use
+      // content but stop_reason:"end_turn" and never runs the tool.
+      const stopReason = finishReasonToAnthropic(
+        finishReason,
+        toolBlockIndex.size > 0 ? [{ type: "tool_use" }] : [],
+      );
       emit(controller, "message_delta", {
         type: "message_delta",
         delta: { stop_reason: stopReason, stop_sequence: null },
