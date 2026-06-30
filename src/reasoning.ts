@@ -33,9 +33,18 @@ const CompletionSchema = z
   })
   .passthrough();
 
-/** Strips <think> and </think> tags and trims the result. */
+/**
+ * Removes inline thinking from assistant text. First strips complete
+ * `<think>…</think>` blocks (models like DeepSeek-R/QwQ inline their reasoning in
+ * `content` this way — without this, the whole reasoning leaks into the answer),
+ * then strips any orphan opening/closing tag left over (some Ollama "thinking"
+ * models put reasoning in a separate field and leave a bare `</think>` marker in
+ * `content`). Block removal must run first so the inline case is handled, with the
+ * orphan-tag pass preserved for the separate-field case.
+ */
 export function stripThinkingTags(text: string): string {
   return text
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
     .replace(/<think>/gi, "")
     .replace(/<\/think>/gi, "");
 }
