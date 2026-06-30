@@ -69,6 +69,41 @@ function postMessages(app: ReturnType<typeof makeApp>, body: unknown, headers?: 
   });
 }
 
+describe("anthropic abort propagation", () => {
+  it("wires the client abort signal into upstream calls (/v1/messages)", async () => {
+    let upstreamSignal: AbortSignal | undefined;
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: (_u, init) => {
+          upstreamSignal = init?.signal ?? undefined;
+          return jsonResponse({
+            id: "up-1",
+            choices: [{ message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          });
+        },
+      },
+      { match: (u) => u.endsWith("/api/show"), respond: () => jsonResponse({ capabilities: ["completion"], model_info: {} }) },
+    ];
+    const app = makeApp(routes);
+    const controller = new AbortController();
+    const res = await app.request("/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "anthropic-fast", max_tokens: 10, messages: [{ role: "user", content: "hi" }] }),
+      signal: controller.signal,
+    });
+    await res.text();
+    // Without the wiring ctx.signal is undefined and single forwards undefined upstream.
+    expect(upstreamSignal).toBeDefined();
+    expect(upstreamSignal?.aborted).toBe(false);
+    // Aborting the CLIENT must abort the captured UPSTREAM signal -> proves propagation.
+    controller.abort();
+    expect(upstreamSignal?.aborted).toBe(true);
+  });
+});
+
 describe("anthropic error shape", () => {
   it("returns Anthropic-shaped errors for invalid JSON body", async () => {
     const app = makeApp();

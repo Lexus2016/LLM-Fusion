@@ -847,6 +847,9 @@ export function createAnthropicApp(deps: AnthropicDeps): Hono {
         logger: reqLogger,
         resilience: deps.resilience,
         usage,
+        // Client abort signal: a disconnect (Esc in Claude Code) cancels in-flight
+        // upstream work instead of running a whole fusion fan-out for a gone client.
+        signal: c.req.raw.signal,
       });
 
       const headers = new Headers(res.headers);
