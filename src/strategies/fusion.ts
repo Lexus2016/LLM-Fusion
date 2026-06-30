@@ -1193,7 +1193,13 @@ const SynthCompletionSchema = z
         z
           .object({
             finish_reason: z.union([z.string(), z.null()]).optional(),
-            message: z.object({ tool_calls: z.unknown().optional() }).passthrough().optional(),
+            message: z
+              .object({
+                content: z.union([z.string(), z.null()]).optional(),
+                tool_calls: z.unknown().optional(),
+              })
+              .passthrough()
+              .optional(),
           })
           .passthrough(),
       )
@@ -1207,6 +1213,12 @@ const SynthCompletionSchema = z
  * response carrying tool_calls (a tool call is a valid final action, never an
  * incomplete plan). Only `finish_reason:"stop"` is judged: a `length` cutoff is a
  * different failure (token budget), and tool-call finish reasons are complete.
+ *
+ * `planning_tail` deliberately fires ONLY when the real `content` is empty and the
+ * whole answer lives in `reasoning` — i.e. a thinking model that never emitted a
+ * final artifact and trailed off on a planning promise. A NON-EMPTY `content` is a
+ * real answer and is never second-guessed, even if it happens to end on a phrase
+ * like "let's write": that prevents the heuristic from replacing a good answer.
  */
 function detectIncompleteSynth(data: unknown): "empty" | "planning_tail" | null {
   const parsed = SynthCompletionSchema.safeParse(data);
@@ -1217,6 +1229,10 @@ function detectIncompleteSynth(data: unknown): "empty" | "planning_tail" | null 
   if (Array.isArray(toolCalls) && toolCalls.length > 0) return null;
   const answer = (extractAnswer(data) ?? "").trim();
   if (answer.length === 0) return "empty";
+  // A real `content` answer is authoritative — leave it alone regardless of its tail.
+  const rawContent = typeof choice.message?.content === "string" ? choice.message.content : "";
+  if (rawContent.trim().length > 0) return null;
+  // Reasoning-only answer that trails off on planning narration -> incomplete.
   const tail = answer.slice(-80).toLowerCase();
   if (SYNTH_PLANNING_TAIL_MARKERS.some((m) => tail.includes(m))) return "planning_tail";
   return null;

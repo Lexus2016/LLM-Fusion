@@ -985,6 +985,27 @@ describe("fusion strategy — synth completeness guard", () => {
     await res.text();
     expect(synthCalls).toBe(2); // one original + exactly one retry, then give up
   });
+
+  it("does NOT retry a complete content answer that ends on a planning-like phrase", async () => {
+    // Regression: a real `content` answer must never be second-guessed, even if its
+    // tail matches a planning marker — only reasoning-only answers are suspect.
+    let synthCalls = 0;
+    const finalText = "Here is the cover letter. Finally, let's write a warm closing.";
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        return jsonResponse({ choices: [{ message: { content: finalText }, finish_reason: "stop" }] });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    const parsed = z
+      .object({ choices: z.array(z.object({ message: z.object({ content: z.string() }) })) })
+      .parse(await res.json());
+    expect(synthCalls).toBe(1);
+    expect(parsed.choices[0]?.message.content).toBe(finalText);
+  });
 });
 
 describe("fusion strategy — web grounding (gated on TAVILY_API_KEY + web_search.enabled)", () => {
