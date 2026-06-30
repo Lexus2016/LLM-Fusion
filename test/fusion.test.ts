@@ -873,6 +873,120 @@ describe("fusion strategy — reasoning→content normalization", () => {
   });
 });
 
+describe("fusion strategy — synth completeness guard", () => {
+  const judgeOk = { choices: [{ message: { content: JSON.stringify({ consensus: "ok" }) } }] };
+
+  it("retries a synth that stopped mid-plan and adopts the completed answer", async () => {
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        const nudged = systemContents(body).some((c) => c.includes("stopped while still planning"));
+        if (nudged) {
+          return jsonResponse({ choices: [{ message: { content: "FINAL ARTIFACT" }, finish_reason: "stop" }] });
+        }
+        // Thinking model: deep plan in `reasoning`, empty content, declared done mid-plan.
+        return jsonResponse({
+          choices: [
+            {
+              message: { content: "", reasoning: "step 1 ... step 2 ... Let's produce the final answer." },
+              finish_reason: "stop",
+            },
+          ],
+        });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    const parsed = z
+      .object({ choices: z.array(z.object({ message: z.object({ content: z.string() }) })) })
+      .parse(await res.json());
+    expect(synthCalls).toBe(2);
+    expect(parsed.choices[0]?.message.content).toBe("FINAL ARTIFACT");
+  });
+
+  it("retries when the synth stops with an empty answer (no content, no reasoning)", async () => {
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        const nudged = systemContents(body).some((c) => c.includes("stopped while still planning"));
+        if (nudged) return jsonResponse({ choices: [{ message: { content: "recovered" }, finish_reason: "stop" }] });
+        return jsonResponse({ choices: [{ message: { content: "" }, finish_reason: "stop" }] });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    const parsed = z
+      .object({ choices: z.array(z.object({ message: z.object({ content: z.string() }) })) })
+      .parse(await res.json());
+    expect(synthCalls).toBe(2);
+    expect(parsed.choices[0]?.message.content).toBe("recovered");
+  });
+
+  it("does NOT retry when the synth stops with tool_calls (a complete final action)", async () => {
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                content: "",
+                tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: "{}" } }],
+              },
+              finish_reason: "stop",
+            },
+          ],
+        });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ tools: TOOLS })));
+    await res.text();
+    expect(synthCalls).toBe(1);
+  });
+
+  it("does NOT retry a complete answer that happens to carry finish_reason:stop", async () => {
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        return jsonResponse({
+          choices: [{ message: { content: "here is the complete, real final answer" }, finish_reason: "stop" }],
+        });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    await res.text();
+    expect(synthCalls).toBe(1);
+  });
+
+  it("keeps the original answer when the retry is also incomplete (no infinite loop)", async () => {
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        // Always stops mid-plan, even after the nudge.
+        return jsonResponse({
+          choices: [{ message: { content: "", reasoning: "still planning... let's write the code." }, finish_reason: "stop" }],
+        });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    await res.text();
+    expect(synthCalls).toBe(2); // one original + exactly one retry, then give up
+  });
+});
+
 describe("fusion strategy — web grounding (gated on TAVILY_API_KEY + web_search.enabled)", () => {
   const TAVILY = "https://api.tavily.com/search";
   let realFetch: typeof globalThis.fetch;

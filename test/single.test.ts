@@ -224,4 +224,36 @@ describe("single strategy — circuit breaker availability semantics", () => {
     await singleStrategy.execute(ctxRes(client, resilience));
     expect(resilience.breaker.getState("glm-5.2")).toBe("open");
   });
+
+  it("releases the half-open probe on a 4xx response so the model is not jammed until restart (HIGH)", async () => {
+    // Open the breaker with availability failures, then probe with a 4xx.
+    // Before the fix the 4xx neither recorded success nor failure, so the
+    // half-open probe stuck and every subsequent call fast-failed as open.
+    let now = 1_000_000;
+    const resilience = createResilience({
+      maxConcurrency: 4,
+      failureThreshold: 2,
+      cooldownMs: 30_000,
+      now: () => now,
+      sleep: async () => {},
+    });
+    const failClient = statusClient(503);
+    const cFail = ctxRes(failClient, resilience);
+    await singleStrategy.execute(cFail); // 1st 5xx
+    await singleStrategy.execute(cFail); // 2nd 5xx -> open
+    expect(resilience.breaker.getState("glm-5.2")).toBe("open");
+
+    // Cooldown elapses -> half-open. The next call is the probe.
+    now += 30_000;
+    expect(resilience.breaker.getState("glm-5.2")).toBe("half-open");
+
+    // Probe returns a 4xx (client/request error, NOT a health failure).
+    const probeClient = statusClient(400);
+    const out = await singleStrategy.execute(ctxRes(probeClient, resilience));
+    expect(out.status).toBe(400);
+
+    // The probe MUST be released: a fresh call is allowed again (not circuit-open).
+    expect(resilience.breaker.getState("glm-5.2")).not.toBe("open");
+    expect(resilience.breaker.canAttempt("glm-5.2")).toBe(true);
+  });
 });

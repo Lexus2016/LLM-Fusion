@@ -355,6 +355,10 @@ async function classifyUncached(
         ...(result.kind === "json" ? { status: result.status } : {}),
         latencyMs: Date.now() - startedAt,
       });
+    } else {
+      // JSON 4xx non-availability: the router answered, so it is healthy.
+      // Release any half-open probe so it is not jammed until restart.
+      resilience.breaker.recordSuccess(router);
     }
     ctx.logger.warn(
       { router, model: ctx.request.model, route: fallback, status: result.kind === "json" ? result.status : undefined },

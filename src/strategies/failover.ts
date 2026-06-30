@@ -188,6 +188,9 @@ async function attemptJsonMember(
       };
     }
     // 4xx other than 429 — client/request error: surface immediately (passthrough).
+    // The model answered, so it is healthy — release any half-open probe so the
+    // model is not jammed open until restart.
+    breaker.recordSuccess(member);
     return { kind: "return", response: buildResponse(result, promote) };
   }
 }
@@ -275,6 +278,9 @@ async function attemptStreamMember(
         };
       }
       if (status >= 400) {
+        // The model answered (client/request error), so it is healthy — release
+        // any half-open probe so the model is not jammed open until restart.
+        breaker.recordSuccess(member);
         return { kind: "return", response: buildResponse(result, promote) };
       }
       breaker.recordSuccess(member);

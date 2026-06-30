@@ -628,6 +628,10 @@ async function callPanelMember(
       // A 4xx used to drop the member SILENTLY — e.g. a Gemini panel member
       // returning 400 "missing a thought_signature" on foreign tool-call history,
       // which surfaced only as an unexplained 2/3 panel. Always log it.
+      // A 4xx means the model answered, so it is reachable/healthy — release any
+      // half-open probe (recordFailure above only fires for availability failures;
+      // without this the probe sticks and the model is jammed until restart).
+      resilience.breaker.recordSuccess(member);
       ctx.logger.warn(
         {
           stage: "panel",
@@ -1022,6 +1026,10 @@ async function runJudge(
         ...(result.kind === "json" ? { status: result.status } : {}),
         latencyMs: Date.now() - startedAt,
       });
+    } else {
+      // JSON 4xx (non-availability): the judge model answered, so it is healthy.
+      // Release any half-open probe so it is not jammed until restart.
+      resilience.breaker.recordSuccess(judge);
     }
     ctx.logger.warn(
       { judge, status: result.kind === "json" ? result.status : undefined },
@@ -1108,6 +1116,10 @@ async function runSynth(
       status: result.status,
       latencyMs: Date.now() - startedAt,
     });
+  } else {
+    // 4xx non-availability: the synth answered, so it is reachable/healthy.
+    // Release any half-open probe so it is not jammed until restart.
+    resilience.breaker.recordSuccess(synth);
   }
 
   if (result.kind === "stream") {
@@ -1123,12 +1135,160 @@ async function runSynth(
         : result.body;
     return new Response(streamBody, { status: result.status, headers });
   }
+  // COMPLETENESS GUARD (non-stream, OpenAI-shape only) — a "thinking" synth can
+  // declare itself done (finish_reason:"stop") while still mid-plan: an empty answer,
+  // or one trailing off in planning narration ("...let's produce the final answer."),
+  // with NO tool_calls (a tool call IS a complete final action). That is the
+  // kimi-k2.7-code failure mode behind the low coding score. One stricter retry
+  // recovers the artifact. Streaming can't be guarded without buffering the whole
+  // body (which defeats streaming), and the native /api/chat reshape is out of scope,
+  // so this covers the non-stream / benchmark / bineval path only.
+  let synthData = result.data;
+  if (result.status < 400 && !opts.native) {
+    const incomplete = detectIncompleteSynth(result.data);
+    if (incomplete !== null) {
+      const recovered = await retrySynthForCompletion(ctx, resilience, synth, body, opts, incomplete);
+      if (recovered !== null) synthData = recovered;
+    }
+  }
   const data =
-    opts.promote && result.status < 400 ? promoteReasoningNonStream(result.data) : result.data;
+    opts.promote && result.status < 400 ? promoteReasoningNonStream(synthData) : synthData;
   return new Response(JSON.stringify(data ?? null), {
     status: result.status,
     headers: { "content-type": "application/json" },
   });
+}
+
+/**
+ * Tail markers that betray a "thinking" synth which stopped on planning narration
+ * instead of emitting the final artifact. Matched case-insensitively within the LAST
+ * stretch of the answer — a complete answer ends on its result, not on a promise to
+ * write one. Kept deliberately narrow: this only fires together with
+ * finish_reason:"stop" AND no tool_calls, so a stray match merely costs one retry.
+ */
+const SYNTH_PLANNING_TAIL_MARKERS = [
+  "let's produce",
+  "let's now produce",
+  "now let's produce",
+  "let me produce",
+  "let's write",
+  "let me write",
+  "let's now write",
+  "now i'll write",
+  "now i will write",
+  "let's finalize",
+  "let's craft",
+  "let me craft",
+  "let's output",
+  "now final answer",
+  "let's give the final",
+  "let me now write",
+  "let's compose",
+] as const;
+
+const SynthCompletionSchema = z
+  .object({
+    choices: z
+      .array(
+        z
+          .object({
+            finish_reason: z.union([z.string(), z.null()]).optional(),
+            message: z.object({ tool_calls: z.unknown().optional() }).passthrough().optional(),
+          })
+          .passthrough(),
+      )
+      .optional(),
+  })
+  .passthrough();
+
+/**
+ * Detect a synth completion that "stopped" yet delivered no usable artifact. Returns
+ * the failure reason, or null when the answer is complete — which INCLUDES any
+ * response carrying tool_calls (a tool call is a valid final action, never an
+ * incomplete plan). Only `finish_reason:"stop"` is judged: a `length` cutoff is a
+ * different failure (token budget), and tool-call finish reasons are complete.
+ */
+function detectIncompleteSynth(data: unknown): "empty" | "planning_tail" | null {
+  const parsed = SynthCompletionSchema.safeParse(data);
+  if (!parsed.success) return null;
+  const choice = parsed.data.choices?.[0];
+  if (!choice || choice.finish_reason !== "stop") return null;
+  const toolCalls = choice.message?.tool_calls;
+  if (Array.isArray(toolCalls) && toolCalls.length > 0) return null;
+  const answer = (extractAnswer(data) ?? "").trim();
+  if (answer.length === 0) return "empty";
+  const tail = answer.slice(-80).toLowerCase();
+  if (SYNTH_PLANNING_TAIL_MARKERS.some((m) => tail.includes(m))) return "planning_tail";
+  return null;
+}
+
+const SYNTH_COMPLETION_NUDGE =
+  "Your previous attempt stopped while still planning and never produced the final result. " +
+  "Output ONLY the complete final answer now — the actual artifact (code, text, or direct " +
+  "answer) the user asked for, or the appropriate tool call. Do NOT restate your plan and do " +
+  'NOT write narration such as "let\'s produce the final answer" or "now I\'ll write". ' +
+  "Begin the final answer immediately.";
+
+/** Append the strict completion nudge as a trailing system turn; never stream. */
+function appendSynthCompletionNudge(body: Record<string, unknown>): Record<string, unknown> {
+  const messages = Array.isArray(body.messages) ? [...body.messages] : [];
+  messages.push({ role: "system", content: SYNTH_COMPLETION_NUDGE });
+  return { ...body, messages, stream: false };
+}
+
+/**
+ * One stricter, non-streamed synth retry to recover a final answer after the first
+ * attempt stopped mid-plan. Returns the recovered completion data, or null if the
+ * retry failed, errored, or is STILL incomplete — in which case the caller keeps the
+ * original (a partial plan beats nothing, and we never loop more than once). The
+ * retry does not touch the circuit breaker (same model, already counted), but its
+ * token usage IS recorded so cost accounting stays honest.
+ */
+async function retrySynthForCompletion(
+  ctx: StrategyContext,
+  resilience: Resilience,
+  synth: string,
+  originalBody: Record<string, unknown>,
+  opts: { native: boolean },
+  reason: "empty" | "planning_tail",
+): Promise<unknown | null> {
+  ctx.logger.warn(
+    { stage: "synth", model: synth, reason },
+    "fusion: synth stopped mid-plan; one stricter retry for the final answer",
+  );
+  const retryBody = appendSynthCompletionNudge(originalBody);
+  let result: ChatCompletionResult;
+  try {
+    result = await resilience.limiter(() =>
+      invokeUpstream(ctx.client, retryBody, { stream: false, native: opts.native, signal: ctx.signal }),
+    );
+  } catch (err) {
+    ctx.logger.warn(
+      { stage: "synth", model: synth, err: err instanceof Error ? err.message : String(err) },
+      "fusion: synth completion retry threw; keeping original answer",
+    );
+    return null;
+  }
+  ctx.usage?.record(synth, result);
+  if (result.kind !== "json" || result.status >= 400) {
+    ctx.logger.warn(
+      { stage: "synth", model: synth },
+      "fusion: synth completion retry not usable; keeping original answer",
+    );
+    return null;
+  }
+  if (detectIncompleteSynth(result.data) !== null) {
+    ctx.logger.warn(
+      { stage: "synth", model: synth },
+      "fusion: synth completion retry still incomplete; keeping original answer",
+    );
+    return null;
+  }
+  ctx.logger.info(
+    { stage: "synth", model: synth, reason },
+    "fusion: synth completion retry recovered the final answer",
+  );
+  return result.data;
 }
 
 async function attachBinevalHeaders(

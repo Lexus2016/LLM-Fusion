@@ -77,6 +77,9 @@ export const singleStrategy: Strategy = {
       // Only availability failures (429/5xx) count against the model's health; a
       // 4xx client/request error is passed through without tripping the breaker.
       else if (isAvailabilityFailureStatus(result.status)) resilience.breaker.recordFailure(target);
+      // A 4xx non-availability means the model answered, so it is healthy — release
+      // any half-open probe so it is not jammed open until process restart.
+      else resilience.breaker.recordSuccess(target);
     }
     if (result.status >= 400 && isAvailabilityFailureStatus(result.status)) {
       logUpstreamFailure(ctx.logger, {
