@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { z } from "zod";
-import { createFusionStrategy, fusionStrategy } from "../src/strategies/fusion";
+import { createFusionStrategy, fusionStrategy, compressPanelMessages } from "../src/strategies/fusion";
 import type { TimerFactory } from "../src/strategies/fusion";
 import { OllamaClient } from "../src/upstream/ollama";
 import { CapabilityService } from "../src/capabilities";
@@ -1005,6 +1005,57 @@ describe("fusion strategy — synth completeness guard", () => {
       .parse(await res.json());
     expect(synthCalls).toBe(1);
     expect(parsed.choices[0]?.message.content).toBe(finalText);
+  });
+});
+
+describe("fusion strategy — panel compression tool-pairing", () => {
+  // A long agent loop big enough to force compression. The trailing assistant makes
+  // the non-system count even, so recentStart (= count - 30) lands on a `tool` result
+  // — the orphaning case: without the fix, the recent window opens on a tool whose
+  // parent assistant(tool_calls) is dropped, leaving an omission marker before it.
+  function longLoop(pairs: number): unknown[] {
+    const big = "x".repeat(6000);
+    const msgs: unknown[] = [{ role: "user", content: "original task " + big }];
+    for (let k = 0; k < pairs; k++) {
+      msgs.push({ role: "assistant", content: "", tool_calls: [{ id: `c${k}`, type: "function", function: { name: "f", arguments: "{}" } }] });
+      msgs.push({ role: "tool", tool_call_id: `c${k}`, content: "result " + big });
+    }
+    msgs.push({ role: "assistant", content: "", tool_calls: [{ id: "cT", type: "function", function: { name: "f", arguments: "{}" } }] });
+    return msgs;
+  }
+
+  function roleOf(m: unknown): string | undefined {
+    return typeof m === "object" && m !== null ? (m as Record<string, unknown>).role as string | undefined : undefined;
+  }
+
+  function assertNoOrphanTool(out: unknown[]): void {
+    for (let i = 0; i < out.length; i++) {
+      if (roleOf(out[i]) === "tool") {
+        // A tool result must be immediately preceded by the assistant that owns it,
+        // never by an omission marker (system) or a user turn.
+        expect(roleOf(out[i - 1])).toBe("assistant");
+      }
+    }
+  }
+
+  it("never orphans a tool message when the recent window would start on a tool result", () => {
+    for (const pairs of [40, 41, 42]) {
+      const input = longLoop(pairs);
+      const out = compressPanelMessages(input);
+      expect(out.length).toBeLessThan(input.length); // compression actually ran
+      assertNoOrphanTool(out);
+    }
+  });
+
+  it("leaves a short tool-using history untouched and valid", () => {
+    const msgs: unknown[] = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "", tool_calls: [{ id: "c0", type: "function", function: { name: "f", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c0", content: "ok" },
+    ];
+    const out = compressPanelMessages(msgs);
+    expect(out.length).toBe(3); // under cap -> unchanged length
+    assertNoOrphanTool(out);
   });
 });
 

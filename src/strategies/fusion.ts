@@ -779,6 +779,14 @@ function capPanelMessageContent(content: unknown): unknown {
   return content;
 }
 
+/** Role of the non-system entry at index `i`, or undefined if not a typed message. */
+function roleOfNonSystem(entries: Array<{ idx: number; msg: unknown }>, i: number): string | undefined {
+  const m = entries[i]?.msg;
+  if (typeof m !== "object" || m === null) return undefined;
+  const r = (m as Record<string, unknown>).role;
+  return typeof r === "string" ? r : undefined;
+}
+
 /**
  * Compress the panel message array when total content exceeds PANEL_MAX_CHARS.
  * Strategy: keep system messages intact, keep the first non-system message
@@ -786,8 +794,13 @@ function capPanelMessageContent(content: unknown): unknown {
  * recent window, and keep the last PANEL_RECENT_WINDOW non-system messages.
  * The middle is replaced with an omission marker. Each kept message is also
  * content-capped to prevent a single huge tool result from dominating.
+ *
+ * The recent-window start is walked back past any leading `tool` results so the
+ * window never opens on an orphaned tool message (which strict upstreams reject).
+ *
+ * Exported for direct unit testing of the tool-pairing invariant.
  */
-function compressPanelMessages(msgs: unknown[]): unknown[] {
+export function compressPanelMessages(msgs: unknown[]): unknown[] {
   if (approxTotalChars(msgs) <= PANEL_MAX_CHARS) return msgs;
 
   // Separate system messages (kept in full) from non-system.
@@ -816,7 +829,16 @@ function compressPanelMessages(msgs: unknown[]): unknown[] {
   // Build the set of non-system indices to keep.
   const keep = new Set<number>();
   keep.add(0); // first non-system message = original task
-  const recentStart = nonSystems.length - PANEL_RECENT_WINDOW;
+  let recentStart = nonSystems.length - PANEL_RECENT_WINDOW;
+  // Never start the recent window on a `tool` result: it would be orphaned from the
+  // assistant(tool_calls) that owns it (that parent sits at recentStart-1, which the
+  // pre-window scan below skips because it looks only for a `user` role). Strict
+  // upstreams (e.g. Gemini) 400 on an orphaned tool message, thinning the panel below
+  // min_panel_success → 502 — the exact long-loop case compression exists to prevent.
+  // Walk the window start back past leading tool results so it begins on their owner.
+  while (recentStart > 1 && roleOfNonSystem(nonSystems, recentStart) === "tool") {
+    recentStart--;
+  }
   for (let i = recentStart; i < nonSystems.length; i++) keep.add(i);
   // Keep the most recent user instruction before the window.
   for (let i = recentStart - 1; i > 0; i--) {
