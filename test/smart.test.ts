@@ -1,10 +1,11 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { z } from "zod";
 import { smartStrategy, __resetRouterCacheForTesting } from "../src/strategies/smart";
 import { OllamaClient } from "../src/upstream/ollama";
 import { CapabilityService } from "../src/capabilities";
 import { parseConfig } from "../src/config";
 import { createLogger } from "../src/logging";
+import { createResilience } from "../src/concurrency";
 import { jsonResponse, sseResponse } from "./helpers";
 import type { ChatCompletionRequest, FetchFn, StrategyContext, UpstreamClient } from "../src/types";
 
@@ -182,6 +183,26 @@ describe("smart strategy", () => {
   // prior test's cached decision does not short-circuit the router call the
   // next test asserts on.
   beforeEach(() => __resetRouterCacheForTesting());
+
+  it("a router cache hit never consults the circuit breaker (no half-open probe leak)", async () => {
+    // Regression for the half-open probe leak: canAttempt() reserves the probe slot
+    // as a side effect, so consulting it before the cache short-circuit would leak the
+    // probe on every cache hit and wedge the router breaker half-open forever. The
+    // cache must be checked BEFORE the breaker. (single-path also calls canAttempt for
+    // its target, so we count only router-model "rt" calls.)
+    const up = makeUpstream(chatWith(routeSimple));
+    const resilience = createResilience({ maxConcurrency: 4 });
+    const spy = vi.spyOn(resilience.breaker, "canAttempt");
+    const routerProbes = (): number => spy.mock.calls.filter((c) => c[0] === "rt").length;
+
+    const first = { ...ctx(up.client, req("smart-inline"), "smart-inline"), resilience };
+    await smartStrategy.execute(first);
+    expect(routerProbes()).toBe(1); // uncached -> one real router attempt
+
+    const second = { ...ctx(up.client, req("smart-inline"), "smart-inline"), resilience };
+    await smartStrategy.execute(second);
+    expect(routerProbes()).toBe(1); // cache hit -> breaker NOT consulted again
+  });
 
   it("route=simple runs only the simple path; router called once, non-streamed", async () => {
     const up = makeUpstream(chatWith(routeSimple));

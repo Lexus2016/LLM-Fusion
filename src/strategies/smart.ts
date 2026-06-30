@@ -226,15 +226,6 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
   const resilience: Resilience =
     ctx.resilience ?? createResilience({ maxConcurrency: ctx.config.upstream.max_concurrency });
 
-  if (!resilience.breaker.canAttempt(router)) {
-    logUpstreamFailure(ctx.logger, { stage: "router", model: router, kind: "circuit_open", latencyMs: 0 });
-    ctx.logger.warn(
-      { router, model: ctx.request.model, route: fallback },
-      "smart: router circuit open; using default route",
-    );
-    return fallback;
-  }
-
   const body: Record<string, unknown> = {
     model: router,
     temperature: 0,
@@ -246,6 +237,12 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
     ],
   };
 
+  // Cache + in-flight coalescing are consulted BEFORE the circuit breaker: a cache
+  // hit or a coalesced wait issues no upstream call, so it must not touch the breaker.
+  // `canAttempt` RESERVES the half-open probe slot as a side effect; consulting it
+  // before an early cache-hit return would leak that probe (the early return records
+  // no outcome), wedging the breaker half-open forever and collapsing ALL routing to
+  // the default. The breaker is therefore checked only on the real-call path below.
   const key = routerCacheKey(body);
   const cached = routerCache.get(key);
   if (cached !== undefined) {
@@ -265,6 +262,15 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
       "smart: router cache coalesce; awaiting in-flight classifier",
     );
     return inFlight;
+  }
+
+  if (!resilience.breaker.canAttempt(router)) {
+    logUpstreamFailure(ctx.logger, { stage: "router", model: router, kind: "circuit_open", latencyMs: 0 });
+    ctx.logger.warn(
+      { router, model: ctx.request.model, route: fallback },
+      "smart: router circuit open; using default route",
+    );
+    return fallback;
   }
 
   const promise = classifyUncached(ctx, cfg, resilience, body, key).finally(() => {
