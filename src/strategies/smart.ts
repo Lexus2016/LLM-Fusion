@@ -487,8 +487,15 @@ function claimsImage(reason: string | undefined): boolean {
   ) {
     return false;
   }
-  // Affirmative claim that an image/screenshot/etc. is present.
-  return /\b(image|screenshot|photo|picture|figure|diagram|chart|scan|attachment|multimodal)\b/i.test(reason);
+  // Affirmative claim that the request CARRIES visual input. Bare output-artifact
+  // nouns ("design an architecture diagram", "generate a chart") must NOT trigger the
+  // guard — that would downgrade a legitimately-complex request from fusion to simple.
+  // Strong standalone signals (screenshot/multimodal) almost always denote real input;
+  // otherwise require a verb of receipt/presence adjacent to a visual noun.
+  if (/\b(?:screenshot|multimodal)\b/i.test(reason)) return true;
+  return /\b(?:attach\w*|sent|sends?|provid\w*|includ\w*|upload\w*|past\w*|shar\w*|post\w*|gave|given|receiv\w*|contain\w*|has an?|have an?|with an?)\b[\s\S]{0,24}\b(?:image|screenshot|photo|picture|figure|diagram|chart|scan|attachment)\b/i.test(
+    reason,
+  );
 }
 
 function parseRouteDecision(content: string | null): RouteDecision | null {

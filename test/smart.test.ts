@@ -478,6 +478,30 @@ describe("smart strategy", () => {
     for (const p of PANEL) expect(called).not.toContain(p);
   });
 
+  it("router reason naming a diagram as OUTPUT (no image) -> NOT flagged, fusion trusted", async () => {
+    __resetRouterCacheForTesting();
+    // "architecture diagram" is the artifact to PRODUCE, not visual input received.
+    // The guard must not fire on a bare output-artifact noun and downgrade fusion.
+    const routeFusionDiagram = (): Response =>
+      jsonResponse({
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                route: "fusion",
+                reason: "Complex architecture diagram design; needs multi-model deliberation.",
+              }),
+            },
+          },
+        ],
+      });
+    const up = makeUpstream(chatWith(routeFusionDiagram));
+    const res = await smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+    expect(res.status).toBe(200);
+    const called = up.modelsCalled();
+    for (const p of PANEL) expect(called).toContain(p); // fusion route stood; panel ran
+  });
+
   it("router claims an image that IS present -> decision is trusted (no fallback)", async () => {
     __resetRouterCacheForTesting();
     // smart-vision has default=fusion, so a guard fallback would run the PANEL.
