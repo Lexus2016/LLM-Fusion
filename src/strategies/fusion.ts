@@ -1370,6 +1370,28 @@ const RecoveredToolCallSchema = z
   .passthrough();
 
 /** Build the single replacement SSE chunk line carrying a recovered synth answer. */
+/**
+ * Normalize one recovered tool call into the OpenAI streaming delta shape
+ * (`{ index, id, type, function: { name, arguments } }`). `extractToolCalls`
+ * also surfaces the legacy `function_call` shape (`{ name, arguments }`, no
+ * `function` wrapper) — without this, spreading it straight into `delta.tool_calls`
+ * would put `name`/`arguments` at the root, which client SDKs do not expect.
+ */
+function normalizeRecoveredToolCall(tc: unknown, index: number): Record<string, unknown> {
+  const parsed = RecoveredToolCallSchema.safeParse(tc);
+  if (!parsed.success) return { index };
+  if (parsed.data.function) return { ...parsed.data, index };
+  const legacy = z
+    .object({ name: z.string().optional(), arguments: z.string().optional() })
+    .passthrough()
+    .safeParse(tc);
+  if (legacy.success && (legacy.data.name !== undefined || legacy.data.arguments !== undefined)) {
+    const { name, arguments: args, ...rest } = legacy.data;
+    return { ...rest, type: "function", function: { name, arguments: args }, index };
+  }
+  return { ...parsed.data, index };
+}
+
 function synthRecoveredChunkLine(recovered: unknown, meta: { id: string; created: number; model: string }): string {
   const parsed = SynthCompletionSchema.safeParse(recovered);
   const finishReason = parsed.success ? (parsed.data.choices?.[0]?.finish_reason ?? "stop") : "stop";
@@ -1378,10 +1400,7 @@ function synthRecoveredChunkLine(recovered: unknown, meta: { id: string; created
   const delta: Record<string, unknown> = {};
   if (answer.length > 0) delta.content = answer;
   if (toolCalls.length > 0) {
-    delta.tool_calls = toolCalls.map((tc, index) => {
-      const parsedTc = RecoveredToolCallSchema.safeParse(tc);
-      return { ...(parsedTc.success ? parsedTc.data : {}), index };
-    });
+    delta.tool_calls = toolCalls.map((tc, index) => normalizeRecoveredToolCall(tc, index));
   }
   const chunk = {
     id: meta.id,
@@ -1485,13 +1504,16 @@ function makeSynthStreamCompletenessGuard(
       };
       const incomplete = detectIncompleteSynth(reconstructed);
       if (incomplete === null) {
-        controller.enqueue(encoder.encode(terminalLine + "\n"));
+        // SSE events are blank-line delimited: terminalLine is a single split line
+        // with its trailing "\n" already stripped, so it needs "\n\n" (not "\n")
+        // to close its own event before [DONE] opens the next one.
+        controller.enqueue(encoder.encode(terminalLine + "\n\n"));
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         return;
       }
       const recovered = await retrySynthForCompletion(ctx, resilience, synth, originalBody, opts, incomplete);
       const replacementLine = recovered !== null ? synthRecoveredChunkLine(recovered, meta) : terminalLine;
-      controller.enqueue(encoder.encode(replacementLine + "\n"));
+      controller.enqueue(encoder.encode(replacementLine + "\n\n"));
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
     },
   });

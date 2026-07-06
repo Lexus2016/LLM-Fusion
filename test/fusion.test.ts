@@ -1049,6 +1049,16 @@ describe("fusion strategy — synth completeness guard", () => {
     expect(text).toContain("read_file");
     expect(text).toContain("tool_calls");
     expect(text).toContain("[DONE]");
+    // SSE events are blank-line delimited; the recovered chunk and [DONE] must be
+    // separate events, not merged into one (regression check for the framing bug
+    // an adversarial review caught: the terminal chunk was emitted with only a
+    // single trailing "\n" instead of "\n\n", concatenating it with [DONE]).
+    const events = text.trimEnd().split("\n\n");
+    const lastDataEvent = events.find((e) => e.includes("read_file"));
+    if (lastDataEvent === undefined) throw new Error("no SSE event contained the recovered tool call");
+    const payload = JSON.parse(lastDataEvent.replace(/^data:\s*/, ""));
+    expect(payload.choices[0].delta.tool_calls[0].function.name).toBe("read_file");
+    expect(events.at(-1)).toBe("data: [DONE]");
   });
 });
 
