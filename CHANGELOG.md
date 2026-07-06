@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.15] - 2026-07-06
+
+### Fixed
+
+- **Streaming synth completeness guard.** Tool-call requests over `stream: true` could hang indefinitely: the synth model would emit `finish_reason: "stop"` with no real content/tool_calls (stalled mid-plan) and, unlike the non-streaming path, nothing detected or retried it on the streaming path. `makeSynthStreamCompletenessGuard` now mirrors the existing non-stream completeness guard on the streaming path — non-terminal chunks pass through live (no added latency), only the terminal chunk is buffered and checked, and a single strict non-stream retry recovers the answer/tool call if the synth stalled.
+- SSE framing: the terminal/replacement chunk emitted by the streaming completeness guard now correctly closes its own event with a blank line (`\n\n`) before `data: [DONE]` opens the next one; the prior single `\n` merged both into one SSE event and broke client-side `JSON.parse`.
+- Recovered legacy `function_call` tool calls (`{name, arguments}`, no `function` wrapper) are now normalized into the OpenAI streaming `delta.tool_calls` shape (`{type: "function", function: {name, arguments}}`) instead of being spread at the root, and any other passthrough fields (e.g. `id`) are preserved rather than discarded.
+
 ## [0.1.12] - 2026-06-28
 
 ### Added
