@@ -18,8 +18,15 @@
 #   FUSION_PROXY_TOKEN  if your proxy requires a client token, it is used as the apiKey
 set -euo pipefail
 
-MODEL="${1:-fusion-1}"
-[ "$#" -gt 0 ] && shift
+# The first positional arg selects the model, but ONLY when it is not a flag.
+# Otherwise `fusion-opencode --some-flag` would swallow `--some-flag` as the
+# model name and drop the flag; a leading `-...` means "no model given — use
+# the default and pass every arg straight through to opencode".
+MODEL="fusion-1"
+if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
+  MODEL="$1"
+  shift
+fi
 
 # Resolve the script's real location even when invoked through a symlink
 # (e.g. ~/.local/bin/fusion-opencode -> .../llm-fusion/bin/fusion-opencode) —

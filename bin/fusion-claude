@@ -18,8 +18,15 @@
 #   ANTHROPIC_SMALL_FAST_MODEL override the fast model Claude uses for light tasks (default fast-kimi)
 set -euo pipefail
 
-MODEL="${1:-fusion-agents}"
-[ "$#" -gt 0 ] && shift
+# The first positional arg selects the model, but ONLY when it is not a flag.
+# Otherwise `fusion-claude --mcp-config <file>` would swallow `--mcp-config` as
+# the model name and drop the flag; a leading `-...` means "no model given —
+# use the default and pass every arg straight through to claude".
+MODEL="fusion-agents"
+if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
+  MODEL="$1"
+  shift
+fi
 
 # Resolve the script's real location even when invoked through a symlink
 # (e.g. ~/.local/bin/fusion-claude -> .../llm-fusion/bin/fusion-claude) —
