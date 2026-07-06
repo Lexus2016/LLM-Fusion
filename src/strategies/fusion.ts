@@ -1149,12 +1149,18 @@ async function runSynth(
       ...STREAM_HEADERS_BASE,
       "content-type": result.contentType ?? "text/event-stream",
     };
+    // Completeness guard first (mirrors the non-stream gate below): a synth
+    // that stalls mid-plan needs the SAME detectIncompleteSynth/retry recovery
+    // whether it streamed or not — the client always streams in practice, so
+    // this is the path that actually matters.
+    const guardedBody =
+      result.status < 400 && !opts.native && result.body !== null
+        ? result.body.pipeThrough(makeSynthStreamCompletenessGuard(ctx, resilience, synth, body, opts))
+        : result.body;
     // Streaming reasoning->content promotion (the body is a successful upstream
     // stream; ollama only returns `kind:"stream"` when res.ok).
     const streamBody =
-      opts.promote && result.body !== null
-        ? result.body.pipeThrough(makeReasoningPromotionTransform())
-        : result.body;
+      opts.promote && guardedBody !== null ? guardedBody.pipeThrough(makeReasoningPromotionTransform()) : guardedBody;
     return new Response(streamBody, { status: result.status, headers });
   }
   // COMPLETENESS GUARD (non-stream, OpenAI-shape only) — a "thinking" synth can
@@ -1327,6 +1333,168 @@ async function retrySynthForCompletion(
     "fusion: synth completion retry recovered the final answer",
   );
   return result.data;
+}
+
+const SynthStreamChunkSchema = z
+  .object({
+    id: z.string().optional(),
+    created: z.number().optional(),
+    model: z.string().optional(),
+    choices: z
+      .array(
+        z
+          .object({
+            delta: z
+              .object({
+                content: z.union([z.string(), z.null()]).optional(),
+                reasoning: z.union([z.string(), z.null()]).optional(),
+                reasoning_content: z.union([z.string(), z.null()]).optional(),
+                tool_calls: z.array(z.unknown()).optional(),
+              })
+              .passthrough()
+              .optional(),
+            finish_reason: z.union([z.string(), z.null()]).optional(),
+          })
+          .passthrough(),
+      )
+      .optional(),
+  })
+  .passthrough();
+
+const RecoveredToolCallSchema = z
+  .object({
+    id: z.string().optional(),
+    type: z.string().optional(),
+    function: z.object({ name: z.string().optional(), arguments: z.string().optional() }).passthrough().optional(),
+  })
+  .passthrough();
+
+/** Build the single replacement SSE chunk line carrying a recovered synth answer. */
+function synthRecoveredChunkLine(recovered: unknown, meta: { id: string; created: number; model: string }): string {
+  const parsed = SynthCompletionSchema.safeParse(recovered);
+  const finishReason = parsed.success ? (parsed.data.choices?.[0]?.finish_reason ?? "stop") : "stop";
+  const toolCalls = extractToolCalls(recovered);
+  const answer = extractAnswer(recovered) ?? "";
+  const delta: Record<string, unknown> = {};
+  if (answer.length > 0) delta.content = answer;
+  if (toolCalls.length > 0) {
+    delta.tool_calls = toolCalls.map((tc, index) => {
+      const parsedTc = RecoveredToolCallSchema.safeParse(tc);
+      return { ...(parsedTc.success ? parsedTc.data : {}), index };
+    });
+  }
+  const chunk = {
+    id: meta.id,
+    object: "chat.completion.chunk",
+    created: meta.created,
+    model: meta.model,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  };
+  return `data: ${JSON.stringify(chunk)}`;
+}
+
+/**
+ * Streaming counterpart of the completeness guard above. Every chunk before the
+ * terminal (finish_reason-carrying) one is forwarded live and unchanged — a
+ * healthy stream is byte-identical to plain passthrough, so first-token latency
+ * is untouched. Only the terminal chunk and the trailing [DONE] are held back
+ * until the accumulated answer is checked with the SAME
+ * detectIncompleteSynth/retrySynthForCompletion the non-stream path uses; a
+ * recovered answer replaces the held-back chunk before [DONE] is finally sent.
+ */
+function makeSynthStreamCompletenessGuard(
+  ctx: StrategyContext,
+  resilience: Resilience,
+  synth: string,
+  originalBody: Record<string, unknown>,
+  opts: { native: boolean },
+): TransformStream<Uint8Array, Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = "";
+  let content = "";
+  let reasoning = "";
+  let toolCallsSeen = false;
+  let terminalFinishReason: string | null = null;
+  let terminalLine: string | null = null;
+  const meta = { id: `fusion-synth-${synth}`, created: Math.floor(Date.now() / 1000), model: synth };
+
+  const handleLine = (line: string, controller: TransformStreamDefaultController<Uint8Array>): void => {
+    if (terminalLine !== null) return; // holding everything after the terminal chunk (incl. [DONE])
+    const trimmed = line.trimStart();
+    if (!trimmed.startsWith("data:")) {
+      controller.enqueue(encoder.encode(line + "\n"));
+      return;
+    }
+    const payload = trimmed.slice("data:".length).trim();
+    if (payload.length === 0 || payload === "[DONE]") {
+      controller.enqueue(encoder.encode(line + "\n"));
+      return;
+    }
+    let obj: unknown;
+    try {
+      obj = JSON.parse(payload);
+    } catch {
+      controller.enqueue(encoder.encode(line + "\n"));
+      return;
+    }
+    const parsed = SynthStreamChunkSchema.safeParse(obj);
+    if (!parsed.success) {
+      controller.enqueue(encoder.encode(line + "\n"));
+      return;
+    }
+    if (parsed.data.id) meta.id = parsed.data.id;
+    if (parsed.data.created) meta.created = parsed.data.created;
+    if (parsed.data.model) meta.model = parsed.data.model;
+    const choice = parsed.data.choices?.[0];
+    const delta = choice?.delta;
+    if (delta) {
+      if (typeof delta.content === "string") content += delta.content;
+      if (typeof delta.reasoning === "string") reasoning += delta.reasoning;
+      if (typeof delta.reasoning_content === "string") reasoning += delta.reasoning_content;
+      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) toolCallsSeen = true;
+    }
+    if (choice?.finish_reason != null) {
+      terminalFinishReason = choice.finish_reason;
+      terminalLine = line;
+      return;
+    }
+    controller.enqueue(encoder.encode(line + "\n"));
+  };
+
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) !== -1) {
+        handleLine(buffer.slice(0, nl), controller);
+        buffer = buffer.slice(nl + 1);
+      }
+    },
+    async flush(controller) {
+      buffer += decoder.decode();
+      if (buffer.length > 0) handleLine(buffer, controller);
+      if (terminalLine === null) return; // stream ended without a terminal chunk — nothing to reconcile
+      const reconstructed = {
+        choices: [
+          {
+            finish_reason: terminalFinishReason,
+            message: { content, reasoning, tool_calls: toolCallsSeen ? [{}] : undefined },
+          },
+        ],
+      };
+      const incomplete = detectIncompleteSynth(reconstructed);
+      if (incomplete === null) {
+        controller.enqueue(encoder.encode(terminalLine + "\n"));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        return;
+      }
+      const recovered = await retrySynthForCompletion(ctx, resilience, synth, originalBody, opts, incomplete);
+      const replacementLine = recovered !== null ? synthRecoveredChunkLine(recovered, meta) : terminalLine;
+      controller.enqueue(encoder.encode(replacementLine + "\n"));
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+    },
+  });
 }
 
 async function attachBinevalHeaders(

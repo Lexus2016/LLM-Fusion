@@ -1006,6 +1006,50 @@ describe("fusion strategy — synth completeness guard", () => {
     expect(synthCalls).toBe(1);
     expect(parsed.choices[0]?.message.content).toBe(finalText);
   });
+
+  it("streaming: retries a synth that stalls mid-plan and delivers the recovered tool call", async () => {
+    // Same failure mode as the non-stream tests above, but the client asked for
+    // `stream: true` (the normal shape for an interactive agent client). Before the
+    // fix, streaming synth has no completeness guard at all: the client would just
+    // receive the stalled, empty stream and the retry would never fire.
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        const nudged = systemContents(body).some((c) => c.includes("stopped while still planning"));
+        if (nudged) {
+          expect(body.stream).toBe(false); // the recovery retry is always non-streamed
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  content: "",
+                  tool_calls: [
+                    { id: "c1", type: "function", function: { name: "read_file", arguments: '{"path":"a.txt"}' } },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+        // Thinking model: deep plan in `reasoning`, empty content, no tool_calls,
+        // declares itself done mid-plan — streamed, not a single JSON body.
+        return sseResponse([
+          { choices: [{ delta: { reasoning: "step 1 ... let's write the file." } }] },
+          { choices: [{ delta: {}, finish_reason: "stop" }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    expect(synthCalls).toBe(2);
+    expect(text).toContain("read_file");
+    expect(text).toContain("tool_calls");
+    expect(text).toContain("[DONE]");
+  });
 });
 
 describe("fusion strategy — panel compression tool-pairing", () => {
