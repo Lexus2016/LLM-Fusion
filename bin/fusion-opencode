@@ -20,7 +20,18 @@ set -euo pipefail
 
 MODEL="${1:-fusion-1}"
 [ "$#" -gt 0 ] && shift
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Resolve the script's real location even when invoked through a symlink
+# (e.g. ~/.local/bin/fusion-opencode -> .../llm-fusion/bin/fusion-opencode) —
+# BASH_SOURCE alone points at the symlink, not the target, and dirname on
+# that yields the wrong REPO.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+REPO="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 PROXY_URL="${FUSION_PROXY_URL:-http://127.0.0.1:8080}"
 
 # 1. ensure the proxy is up ---------------------------------------------------
