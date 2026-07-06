@@ -58,18 +58,26 @@ export ANTHROPIC_AUTH_TOKEN="${FUSION_PROXY_TOKEN:-local-no-auth}"
 # A user-level ~/.claude/settings.json `env` block (e.g. a personal
 # secrets-redaction proxy pinned via ANTHROPIC_BASE_URL) wins over plain
 # exported env vars, so exporting alone does not reliably point Claude Code
-# at the Fusion Proxy. `--settings` loads an extra settings layer for just
-# this invocation (nothing written to disk) that overrides that env block.
-FUSION_CLAUDE_SETTINGS="$(python3 -c '
+# at the Fusion Proxy. `--settings <file>` loads an extra settings layer for
+# just this invocation that overrides that env block. The JSON is written to
+# a 0600 temp file (not passed inline) and removed on exit — passing it as a
+# CLI arg instead would leak ANTHROPIC_AUTH_TOKEN to any local user via
+# `ps`/procfs, unlike an env var of the same process.
+FUSION_CLAUDE_SETTINGS="$(mktemp -t fusion-claude-settings.XXXXXX)"
+chmod 600 "$FUSION_CLAUDE_SETTINGS"
+trap 'rm -f "$FUSION_CLAUDE_SETTINGS"' EXIT INT TERM
+python3 -c '
 import json, sys
-print(json.dumps({"env": {
-    "ANTHROPIC_BASE_URL": sys.argv[1],
-    "ANTHROPIC_MODEL": sys.argv[2],
-    "ANTHROPIC_SMALL_FAST_MODEL": sys.argv[3],
-    "ANTHROPIC_AUTH_TOKEN": sys.argv[4],
-}}))
-' "$ANTHROPIC_BASE_URL" "$ANTHROPIC_MODEL" "$ANTHROPIC_SMALL_FAST_MODEL" "$ANTHROPIC_AUTH_TOKEN")"
+with open(sys.argv[5], "w") as f:
+    json.dump({"env": {
+        "ANTHROPIC_BASE_URL": sys.argv[1],
+        "ANTHROPIC_MODEL": sys.argv[2],
+        "ANTHROPIC_SMALL_FAST_MODEL": sys.argv[3],
+        "ANTHROPIC_AUTH_TOKEN": sys.argv[4],
+    }}, f)
+' "$ANTHROPIC_BASE_URL" "$ANTHROPIC_MODEL" "$ANTHROPIC_SMALL_FAST_MODEL" "$ANTHROPIC_AUTH_TOKEN" "$FUSION_CLAUDE_SETTINGS"
 
-# 3. launch Claude Code ------------------------------------------------------
+# 3. launch Claude Code (not exec'd, so the EXIT trap still runs afterwards
+# to delete the temp settings file) -------------------------------------------
 echo "[fusion-claude] launching: claude $* (model=$ANTHROPIC_MODEL, fast=$ANTHROPIC_SMALL_FAST_MODEL)" >&2
-exec claude --settings "$FUSION_CLAUDE_SETTINGS" "$@"
+claude --settings "$FUSION_CLAUDE_SETTINGS" "$@"
