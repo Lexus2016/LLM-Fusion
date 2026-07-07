@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.25] - 2026-07-07
+
+### Changed
+
+- **`fusion-coder` BinEval evaluator: `glm-5.2` → `deepseek-v4-pro`.** After v0.1.23 glm-5.2 became the coder synth, so a glm evaluator would grade its own answers. deepseek-v4-pro sits outside the coder pipeline entirely; BinEval runs rarely (non-streaming responses only), so sharing the concurrency-capped background-traffic model is fine. `fusion-researcher` keeps glm (its synth is kimi — independent).
+- README (en/ru/ua): the recovery-fallback description now reflects the v0.1.24 behavior (judge, or a panel member when the judge IS the synth). Pilot/smoke benchmark result files committed for provenance.
+
 ## [0.1.24] - 2026-07-07
 
 ### Fixed

@@ -109,7 +109,11 @@ models:
     # Useful for factual consistency checks on research / report outputs.
     bineval:
       enabled: true
-      model: glm-5.2          # evaluator model; defaults to the fusion judge model
+      model: deepseek-v4-pro  # CHANGED 2026-07-07: glm-5.2 became the coder SYNTH (v0.1.23),
+                              # so a glm evaluator would self-grade its own answers.
+                              # deepseek-v4-pro sits outside this pipeline entirely
+                              # (bineval runs rarely — non-streaming responses only —
+                              # so sharing the capped background-traffic model is fine).
       threshold: 0.7          # overall score below this marks the output as low-quality
       timeout_s: 60           # per-evaluation timeout; defaults to defaults.judge_timeout_s
       # Custom binary questions (optional; omit to use the built-in defaults):
