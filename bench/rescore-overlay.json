@@ -1,0 +1,134 @@
+{
+  "T04": [
+    {
+      "cond": "fusion-agents",
+      "accuracy": 10,
+      "completeness": 10,
+      "truthfulness": 10,
+      "note": "Correct 12x, explains interplay, two concrete fixes."
+    },
+    {
+      "cond": "fusion",
+      "accuracy": 2,
+      "completeness": 1,
+      "truthfulness": 2,
+      "note": "Incomplete draft, not a proper answer."
+    },
+    {
+      "cond": "solo-gptoss",
+      "accuracy": 3,
+      "completeness": 4,
+      "truthfulness": 4,
+      "note": "Wrong amplification (6x), misinterprets retry counts."
+    },
+    {
+      "cond": "self-kimi",
+      "accuracy": 10,
+      "completeness": 10,
+      "truthfulness": 10,
+      "note": "Correct 12x, clear interplay, two concrete fixes."
+    },
+    {
+      "cond": "solo-kimi",
+      "accuracy": 2,
+      "completeness": 1,
+      "truthfulness": 2,
+      "note": "Incomplete draft, not a proper answer."
+    },
+    {
+      "cond": "solo-glm",
+      "accuracy": 10,
+      "completeness": 10,
+      "truthfulness": 10,
+      "note": "Correct 12x, concise interplay, two fixes."
+    }
+  ],
+  "T05": [
+    {
+      "cond": "solo-glm",
+      "accuracy": 10,
+      "completeness": 9,
+      "truthfulness": 10,
+      "note": "Missed mention that some proxies/LBs need config for WS Upgrade."
+    },
+    {
+      "cond": "solo-kimi",
+      "accuracy": 10,
+      "completeness": 10,
+      "truthfulness": 10,
+      "note": "Thorough, accurate, and covers all required aspects concretely."
+    },
+    {
+      "cond": "solo-gptoss",
+      "accuracy": 9,
+      "completeness": 7,
+      "truthfulness": 10,
+      "note": "Missed EventSource custom header limitation and WS-over-h2 poor support; no mention of X-Accel-Buffering/comment ping keepalive."
+    },
+    {
+      "cond": "fusion",
+      "accuracy": 9,
+      "completeness": 8,
+      "truthfulness": 10,
+      "note": "Covers all dimensions, minor omission on SSE keepalive pings."
+    },
+    {
+      "cond": "fusion-agents",
+      "accuracy": 9,
+      "completeness": 3,
+      "truthfulness": 10,
+      "note": "Covers transport, proxy, reconnection; missing backpressure, HTTP/2, auth; cut off."
+    },
+    {
+      "cond": "self-kimi",
+      "accuracy": 10,
+      "completeness": 9,
+      "truthfulness": 10,
+      "note": "Covers all required aspects, minor omission of comment ping keepalive."
+    }
+  ],
+  "T09": [
+    {
+      "cond": "solo-glm",
+      "accuracy": 10,
+      "completeness": 8,
+      "truthfulness": 10,
+      "note": "Accurate, but omitted Safari support and preconnect hint."
+    },
+    {
+      "cond": "solo-kimi",
+      "accuracy": 10,
+      "completeness": 9,
+      "truthfulness": 10,
+      "note": "Accurate, complete, no fabrication."
+    },
+    {
+      "cond": "solo-gptoss",
+      "accuracy": 8,
+      "completeness": 10,
+      "truthfulness": 8,
+      "note": "Misquotes RFC 7230 §6.2 on proxy forwarding of 1xx responses."
+    },
+    {
+      "cond": "fusion",
+      "accuracy": 7,
+      "completeness": 5,
+      "truthfulness": 9,
+      "note": "Draft answer, accurate but incomplete and cut off."
+    },
+    {
+      "cond": "fusion-agents",
+      "accuracy": 8,
+      "completeness": 8,
+      "truthfulness": 10,
+      "note": "Accurate, complete; minor hedging on Firefox support."
+    },
+    {
+      "cond": "self-kimi",
+      "accuracy": 10,
+      "completeness": 10,
+      "truthfulness": 10,
+      "note": "Comprehensive and accurate answer."
+    }
+  ]
+}

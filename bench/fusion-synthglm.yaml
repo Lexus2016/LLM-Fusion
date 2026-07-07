@@ -1,0 +1,190 @@
+# llm-fusion — active config (loaded by default; override the path with FUSION_CONFIG).
+# Minimal, working setup against Ollama Cloud using real library models.
+# See fusion.example.yaml for the fully annotated reference (every option + defaults).
+
+upstream:
+  base_url: https://ollama.com        # Ollama Cloud root
+  api_key_env: OLLAMA_API_KEY         # env var holding the Bearer key (never inline the key)
+  api_mode: openai                    # Phase 0 confirmed: /v1 chat + SSE + tool_calls all work (auto | openai | native)
+  max_concurrency: 8                  # global p-limit across all in-flight calls (default: 4)
+  per_model_concurrency:              # per-model gates INSIDE the global limit: a burst on one
+    deepseek-v4-pro: 2                # model queues at its own gate instead of head-of-line
+                                      # blocking interactive turns. deepseek-v4-pro carries the
+                                      # Claude Code background small-model bursts (80-130/min);
+                                      # 2 slots keep them flowing without occupying the queue.
+  request_timeout_s: 170              # per upstream call; MUST be < 182 (default: 170).
+                                      # Raised from 120 -> 170: a full fusion-coder/researcher path
+                                      # (panel -> judge -> synth -> bineval) on a heavy prompt can
+                                      # exceed 120s at the synth stage and 504 before bineval attaches
+                                      # its headers. 170 leaves a safety margin under the ~182s upstream
+                                      # ceiling and lets the synth + bineval stages finish.
+
+server:
+  bind: 127.0.0.1                     # localhost only. For Docker set 0.0.0.0 here
+                                      # (or run with FUSION_BIND=0.0.0.0) so the host can reach it.
+  port: 8081
+  # auth_token_env: FUSION_PROXY_TOKEN  # optional: when set, clients must send
+                                        # Authorization: Bearer <value-of-that-env-var>.
+                                        # Unset = unauthenticated (localhost single-user) + startup warning.
+
+defaults:                             # applied to every model unless overridden per-model
+  panel_member_timeout_s: 90          # per panel member (default: 90)
+  judge_timeout_s: 120                # judge stage (default: 60)
+  min_panel_success: 2                # min successful panel answers, else 502 (default: 1)
+
+models:
+  # single — 1:1 passthrough to one fast model.
+  fast-glm:
+    strategy: single
+    target: glm-5.2
+
+  # single — 1:1 passthrough to one fast model.
+  fast-kimi:
+    strategy: single
+    target: kimi-k2.7-code
+
+  # single — 1:1 passthrough to one fast model.
+  fast-deepseek:
+    strategy: single
+    target: deepseek-v4-pro
+
+  # fusion — panel -> judge -> synth across three models (the deliberate path).
+  fusion-1:
+    strategy: fusion
+    panel: [glm-5.2, kimi-k2.7-code, deepseek-v4-flash]
+    judge: glm-5.2
+    synth: kimi-k2.7-code
+
+  # smart — an LLM router decides per request: cheap single vs deep fusion.
+  smart-1:
+    strategy: smart
+    router: glm-5.2                   # fast classifier: empirically fastest (~1.3s) + only reliable-JSON small/mid model
+                                      # (router shoot-out 2026-06-27). nemotron-3-ultra was ~2.4x slower + timed out under load.
+    default: simple                   # route used when the router is unsure / errors
+    simple: fast-kimi                 # string ref to the single model above
+    fusion: fusion-1                  # string ref to the fusion model above
+
+  # =========================================================================
+  # Task-specialized virtual models — assembled from an empirical model shoot-out
+  # (8 models x 3 probes: coding, research, tool-calling — 2026-06-27). Quality scored /15.
+  # Panels MIX MODEL LINEAGES on purpose: 3 models from the same lab share
+  # training blind spots, which defeats the point of a panel. glm/kimi/
+  # deepseek/minimax/qwen are all Chinese labs; gemini=Google, gpt-oss=OpenAI
+  # are added as Western decorrelators.
+  # =========================================================================
+
+  # fusion-coder — programming, planning, audit. Fusion = multiple viewpoints
+  #   (coding/architecture decisions genuinely benefit from diverse takes).
+  #   P1: glm-5.2 14 (best JS-concurrency reasoning) | kimi 13 (most complete
+  #   impl) | gpt-oss:120b (OpenAI lineage — Western decorrelator). gemini-3-flash
+  #   was the original 3rd member, but it returns 400 "Function call is missing a
+  #   thought_signature in functionCall parts" on every panel request carrying
+  #   tool-call history from other models (i.e. every agent-loop step), and the
+  #   panel drops it SILENTLY (extractAnswer -> null) — so fusion-coder ran at 2/3.
+  #   gpt-oss handles foreign tool-call history cleanly (verified 3/3 panel-shaped).
+  fusion-coder:
+    strategy: fusion
+    panel: [glm-5.2, kimi-k2.7-code, gpt-oss:120b]   # OpenAI lineage (Western decorrelator).
+                                      # Previously minimax-m3 (3rd Chinese lab — shared blind-spot class).
+                                      # gpt-oss:120b streams its deliberation in delta.reasoning then may
+                                      # emit a tool_calls chunk (finish_reason tool_calls); the panel
+                                      # extractor now serialises that to prose instead of dropping it,
+                                      # and buildPanelBody strips response_format/max_tokens/etc. so the
+                                      # panel gets a clean deliberation request.
+    judge: glm-5.2                    # most reliable structured-JSON (router shoot-out) -> fewer judge-parse failures
+    synth: glm-5.2                     # coding specialist; produced the most complete, compilable implementation
+    tool_mode: deliberate
+    fusion_planning_turn_only: false  # full panel on EVERY fresh user instruction (a new task /
+                                      # refinement / module — even days into one chat); synth-only
+                                      # only on mid-loop tool-result continuations (cost knob)
+    # Optional BinEval post-synth quality evaluation (non-streaming responses only).
+    # Adds one extra evaluator call after the synth stage and returns per-dimension
+    # scores in response headers: X-Fusion-Bineval-Score, X-Fusion-Bineval-Dimensions,
+    # and X-Fusion-Bineval-Low-Score when the overall score is below threshold.
+    # Useful for factual consistency checks on research / report outputs.
+    bineval:
+      enabled: true
+      model: glm-5.2          # evaluator model; defaults to the fusion judge model
+      threshold: 0.7          # overall score below this marks the output as low-quality
+      timeout_s: 60           # per-evaluation timeout; defaults to defaults.judge_timeout_s
+      # Custom binary questions (optional; omit to use the built-in defaults):
+      dimensions:
+        - dimension: factual_consistency
+          question: "Does the answer contain only claims well-supported by the request and accepted facts?"
+
+    # Optional web grounding for the panel (research freshness). The proxy runs
+    # ONE Tavily search before the panel fans out and injects the cleaned results
+    # as prose context into every panel member — no member receives real tools,
+    # so the one-tool_calls-per-step invariant is preserved.
+    # Gated TWO ways (both required, else fully OFF, no latency/cost):
+    #   1. TAVILY_API_KEY must be set in the environment (.env).
+    #   2. web_search.enabled must be true here.
+    # A failed search degrades silently to an ungrounded panel. Respects
+    # fusion_planning_turn_only (no web search on mid-loop tool-result turns).
+    web_search:
+      enabled: false           # OFF for the coder (2026-07-07): agent tool-loops route here, and
+                               # grounding added ~12s of pre-panel silence per deliberate turn
+                               # (measured 12.7s of a 28.7s time-to-first-byte) while searching
+                               # for things like "create page.html" — pure latency, no value.
+                               # fusion-researcher keeps grounding ON (freshness matters there).
+      max_results: 3           # Tavily results to fetch (1-10)
+      timeout_s: 20            # per-search timeout (< 60)
+      max_context_chars: 4000  # cap on the injected context block
+
+  # fusion-researcher — research, analysis, reports. Fusion for breadth.
+  #   P2: kimi 15 (flawless, BEST WRITER) | glm-5.2 14 (fast, best framing) |
+  #   gpt-oss:120b 13 (most exhaustive coverage + Western lineage).
+  fusion-researcher:
+    strategy: fusion
+    panel: [kimi-k2.7-code, glm-5.2, gpt-oss:120b]
+    judge: glm-5.2
+    synth: kimi-k2.7-code             # scored 15/15; cleanest report-ready prose
+    tool_mode: deliberate
+    fusion_planning_turn_only: false  # research isn't a mechanical loop — full deliberation each step is the value
+    # Optional BinEval post-synth quality evaluation (non-streaming responses only).
+    # Adds one extra evaluator call after the synth stage and returns per-dimension
+    # scores in response headers: X-Fusion-Bineval-Score, X-Fusion-Bineval-Dimensions,
+    # and X-Fusion-Bineval-Low-Score when the overall score is below threshold.
+    # Useful for factual consistency checks on research / report outputs.
+    bineval:
+      enabled: true
+      model: glm-5.2          # evaluator model; defaults to the fusion judge model
+      threshold: 0.7          # overall score below this marks the output as low-quality
+      timeout_s: 60           # per-evaluation timeout; defaults to defaults.judge_timeout_s
+      # Custom binary questions (optional; omit to use the built-in defaults):
+      dimensions:
+        - dimension: factual_consistency
+          question: "Does the answer contain only claims well-supported by the request and accepted facts?"
+
+    # Optional web grounding for the panel (research freshness). The proxy runs
+    # ONE Tavily search before the panel fans out and injects the cleaned results
+    # as prose context into every panel member — no member receives real tools,
+    # so the one-tool_calls-per-step invariant is preserved.
+    # Gated TWO ways (both required, else fully OFF, no latency/cost):
+    #   1. TAVILY_API_KEY must be set in the environment (.env).
+    #   2. web_search.enabled must be true here.
+    # A failed search degrades silently to an ungrounded panel. Respects
+    # fusion_planning_turn_only (no web search on mid-loop tool-result turns).
+    web_search:
+      enabled: true
+      max_results: 3           # Tavily results to fetch (1-10)
+      timeout_s: 20            # per-search timeout (< 60)
+      max_context_chars: 4000  # cap on the injected context block
+  # fusion-agents — autonomous agent loops. Smart routing: keep the cheap 80%
+  #   cheap, escalate the hard 20%. P3 tool-calling was reliable on ALL models
+  #   (<2s, correct first action) -> agent choice = planning quality + cost,
+  #   NOT tool-calling.
+  fusion-agents:
+    strategy: smart
+    router: glm-5.2                   # router shoot-out winner (fast + reliable JSON classifier)
+    default: simple
+    escalate_on_tool_error: true      # a failing tool result (test failure / error / exception) -> straight to
+                                      # fusion: error-recovery is exactly where multiple viewpoints earn their cost
+    simple: { target: glm-5.2 }       # mechanical steps (read / grep / run). MUST be a model that accepts
+                                         # tool-call history produced by OTHER models in the loop: gemini-3-flash-preview
+                                         # rejects it with 400 "Function call is missing a thought_signature in
+                                         # functionCall parts" — a Gemini-only requirement. The loop's tool_calls come
+                                         # from the kimi synth (not Gemini), so a Gemini passthrough breaks the session.
+                                         # kimi accepts its own tool history cleanly (it is also the fusion synth).
+    fusion: fusion-coder              # substantive steps -> the coder panel. The router's decision to deliberate
+                                      # forces the FULL panel here (planning_turn_only is overridden mid-loop)
