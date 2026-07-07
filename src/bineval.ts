@@ -189,7 +189,7 @@ export async function runBineval(
   const startedAt = Date.now();
   let result: ChatCompletionResult;
   try {
-    result = await resilience.limiter(() =>
+    result = await resilience.limiterFor(model)(() =>
       withTimeout(
         ctx.client.chatCompletions(body, { stream: false, signal: combineSignals(ctx.signal, abort.signal) }),
         timeoutMs,

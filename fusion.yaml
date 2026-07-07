@@ -7,6 +7,11 @@ upstream:
   api_key_env: OLLAMA_API_KEY         # env var holding the Bearer key (never inline the key)
   api_mode: openai                    # Phase 0 confirmed: /v1 chat + SSE + tool_calls all work (auto | openai | native)
   max_concurrency: 8                  # global p-limit across all in-flight calls (default: 4)
+  per_model_concurrency:              # per-model gates INSIDE the global limit: a burst on one
+    deepseek-v4-pro: 2                # model queues at its own gate instead of head-of-line
+                                      # blocking interactive turns. deepseek-v4-pro carries the
+                                      # Claude Code background small-model bursts (80-130/min);
+                                      # 2 slots keep them flowing without occupying the queue.
   request_timeout_s: 170              # per upstream call; MUST be < 182 (default: 170).
                                       # Raised from 120 -> 170: a full fusion-coder/researcher path
                                       # (panel -> judge -> synth -> bineval) on a heavy prompt can

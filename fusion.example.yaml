@@ -3,6 +3,15 @@ upstream:
   api_key_env: OLLAMA_API_KEY         # env var holding the Bearer key (never inline)
   api_mode: auto                      # auto | openai | native   (default: auto)
   max_concurrency: 4                  # global p-limit across all in-flight calls (default: 4)
+  # Per-model concurrency budgets (optional), keyed by REAL upstream model name.
+  # Each model gets its own gate IN FRONT of the global limiter, so a burst on
+  # one model (e.g. an agent client's background small-model calls) queues at
+  # its own gate instead of head-of-line blocking every other model. A model
+  # without an override may use the full global budget (identical to a single
+  # global limiter — the default behavior when both keys are unset).
+  # per_model_concurrency_default: 4  # budget for models without an override
+  # per_model_concurrency:
+  #   deepseek-v4-pro: 2              # cap a background-traffic carrier
   request_timeout_s: 170              # per upstream call; MUST be < 182 (default: 170)
 
 server:

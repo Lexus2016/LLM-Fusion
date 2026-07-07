@@ -9,7 +9,7 @@ import type {
 } from "../types";
 import type { FusionModelConfig } from "../config";
 import type { Resilience } from "../concurrency";
-import { createResilience } from "../concurrency";
+import { resilienceForUpstream } from "../concurrency";
 import {
   AllMembersFailedError,
   CapabilityError,
@@ -124,7 +124,7 @@ async function runFusion(
   const { request, logger } = ctx;
   const stream = request.stream === true;
   const resilience =
-    ctx.resilience ?? createResilience({ maxConcurrency: ctx.config.upstream.max_concurrency });
+    ctx.resilience ?? resilienceForUpstream(ctx.config.upstream);
   const defaults = ctx.config.defaults;
   const hasImages = requestHasImages(request);
   const hasTools = Array.isArray(request.tools) && request.tools.length > 0;
@@ -559,7 +559,7 @@ async function callPanelMember(
     // concurrency slot is acquired BEFORE the HTTP request starts. The previous
     // code created the promise early, which meant `max_concurrency` only gated
     // awaiting completion — all panel members started fetching simultaneously.
-    outcome = await resilience.limiter(() => {
+    outcome = await resilience.limiterFor(member)(() => {
       const workPromise = (async (): Promise<PanelFetchOutcome> => {
         const result = await invokeUpstream(ctx.client, body, {
           stream: useStream,
@@ -1016,7 +1016,7 @@ async function runJudge(
   let result: ChatCompletionResult;
   const abort = new AbortController();
   try {
-    result = await resilience.limiter(() =>
+    result = await resilience.limiterFor(judge)(() =>
       withTimeout(
         ctx.client.chatCompletions(body, { stream: false, signal: combineSignals(ctx.signal, abort.signal) }),
         timeoutMs,
@@ -1124,7 +1124,7 @@ async function runSynth(
   const startedAt = Date.now();
   let result: ChatCompletionResult;
   try {
-    result = await resilience.limiter(() =>
+    result = await resilience.limiterFor(synth)(() =>
       invokeUpstream(ctx.client, body, { stream: opts.stream, native: opts.native, signal: ctx.signal }),
     );
   } catch (err) {
@@ -1361,7 +1361,7 @@ async function retrySynthForCompletion(
   const attempt = async (model: string, body: Record<string, unknown>): Promise<unknown | null> => {
     let result: ChatCompletionResult;
     try {
-      result = await resilience.limiter(() =>
+      result = await resilience.limiterFor(model)(() =>
         invokeUpstream(ctx.client, body, { stream: false, native: opts.native, signal: ctx.signal }),
       );
     } catch (err) {

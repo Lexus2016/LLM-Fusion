@@ -165,6 +165,12 @@ const UpstreamSchema = z
     api_key_env: z.string().min(1),
     api_mode: z.enum(["auto", "openai", "native"]).default("auto"),
     max_concurrency: z.number().int().min(1).default(4),
+    // Per-model concurrency budgets (keyed by REAL upstream model name): a
+    // burst on one model queues at its own gate instead of head-of-line
+    // blocking every other model in the global queue. Unset = a model may use
+    // the full global budget (behavior identical to a single global limiter).
+    per_model_concurrency: z.record(z.number().int().min(1)).optional(),
+    per_model_concurrency_default: z.number().int().min(1).optional(),
     // Strictly below the ~182 s Ollama Cloud server-side ceiling (A-6).
     request_timeout_s: z.number().int().positive().lt(182).default(170),
   })

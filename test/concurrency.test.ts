@@ -3,6 +3,7 @@ import {
   CircuitBreaker,
   backoffDelay,
   createLimiter,
+  createResilience,
 } from "../src/concurrency";
 import { OllamaClient } from "../src/upstream/ollama";
 import type { FetchFn } from "../src/types";
@@ -138,5 +139,81 @@ describe("concurrency limiter", () => {
     expect(results).toHaveLength(8);
     expect(maxInFlight).toBeGreaterThanOrEqual(2);
     expect(maxInFlight).toBeLessThanOrEqual(2);
+  });
+});
+
+describe("per-model keyed limiter (limiterFor)", () => {
+  /** A tracked job factory: records per-model and global in-flight peaks. */
+  function makeProbe() {
+    const inFlight = new Map<string, number>();
+    const peak = new Map<string, number>();
+    let globalInFlight = 0;
+    let globalPeak = 0;
+    const job = (model: string, ms = 10) => async () => {
+      inFlight.set(model, (inFlight.get(model) ?? 0) + 1);
+      peak.set(model, Math.max(peak.get(model) ?? 0, inFlight.get(model)!));
+      globalInFlight += 1;
+      globalPeak = Math.max(globalPeak, globalInFlight);
+      await new Promise((r) => setTimeout(r, ms));
+      inFlight.set(model, inFlight.get(model)! - 1);
+      globalInFlight -= 1;
+    };
+    return { job, peak: (m: string) => peak.get(m) ?? 0, globalPeak: () => globalPeak };
+  }
+
+  it("caps an overridden model at its own budget while global slots remain free", async () => {
+    const r = createResilience({
+      maxConcurrency: 8,
+      perModel: { overrides: { "deepseek-v4-pro": 2 } },
+    });
+    const probe = makeProbe();
+    await Promise.all(
+      Array.from({ length: 6 }, () => r.limiterFor("deepseek-v4-pro")(probe.job("deepseek-v4-pro"))),
+    );
+    expect(probe.peak("deepseek-v4-pro")).toBe(2);
+  });
+
+  it("a saturated model queues at its own gate and does not block another model", async () => {
+    const r = createResilience({ maxConcurrency: 8, perModel: { overrides: { slow: 1 } } });
+    let release!: () => void;
+    const blocked = new Promise<void>((res) => (release = res));
+    // Saturate `slow`: one call running (holding a global slot), many queued at
+    // ITS OWN gate — those queued calls must hold no global slots.
+    const slowJobs = [
+      r.limiterFor("slow")(() => blocked),
+      ...Array.from({ length: 20 }, () => r.limiterFor("slow")(() => Promise.resolve())),
+    ];
+    let fastRan = false;
+    await r.limiterFor("fast")(async () => {
+      fastRan = true;
+    });
+    expect(fastRan).toBe(true);
+    release();
+    await Promise.all(slowJobs);
+  });
+
+  it("defaults to the global budget when unconfigured (behavior unchanged)", async () => {
+    const r = createResilience({ maxConcurrency: 3 });
+    const probe = makeProbe();
+    await Promise.all(Array.from({ length: 9 }, () => r.limiterFor("m")(probe.job("m"))));
+    expect(probe.peak("m")).toBe(3); // bounded by the global cap, not tighter
+  });
+
+  it("the global cap still bounds the SUM across models", async () => {
+    const r = createResilience({ maxConcurrency: 3 });
+    const probe = makeProbe();
+    await Promise.all(
+      ["a", "b", "c"].flatMap((m) => Array.from({ length: 3 }, () => r.limiterFor(m)(probe.job(m)))),
+    );
+    expect(probe.globalPeak()).toBeLessThanOrEqual(3);
+  });
+
+  it("applies perModel.defaultPerModel to models without an explicit override", async () => {
+    const r = createResilience({ maxConcurrency: 8, perModel: { defaultPerModel: 2 } });
+    const probe = makeProbe();
+    await Promise.all(
+      Array.from({ length: 6 }, () => r.limiterFor("any-model")(probe.job("any-model"))),
+    );
+    expect(probe.peak("any-model")).toBe(2);
   });
 });

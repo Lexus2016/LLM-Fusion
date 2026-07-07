@@ -46,6 +46,22 @@ describe("config", () => {
     ).toThrow();
   });
 
+  it("accepts per-model concurrency budgets and rejects non-positive values", () => {
+    const cfg = parseConfig({
+      ...minimal,
+      upstream: {
+        ...minimal.upstream,
+        per_model_concurrency: { "deepseek-v4-pro": 2 },
+        per_model_concurrency_default: 4,
+      },
+    });
+    expect(cfg.upstream.per_model_concurrency).toEqual({ "deepseek-v4-pro": 2 });
+    expect(cfg.upstream.per_model_concurrency_default).toBe(4);
+    expect(() =>
+      parseConfig({ ...minimal, upstream: { ...minimal.upstream, per_model_concurrency: { m: 0 } } }),
+    ).toThrow();
+  });
+
   it("rejects unknown top-level keys", () => {
     expect(() => parseConfig({ ...minimal, surprise: true })).toThrow();
   });

@@ -8,7 +8,7 @@ import type {
 } from "../types";
 import type { FusionModelConfig, SingleModelConfig, SmartModelConfig } from "../config";
 import type { Resilience } from "../concurrency";
-import { createResilience } from "../concurrency";
+import { resilienceForUpstream } from "../concurrency";
 import { AllMembersFailedError, FusionError } from "../errors";
 import {
   failureKindForError,
@@ -224,7 +224,7 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
   const router = cfg.router;
   const fallback = cfg.default;
   const resilience: Resilience =
-    ctx.resilience ?? createResilience({ maxConcurrency: ctx.config.upstream.max_concurrency });
+    ctx.resilience ?? resilienceForUpstream(ctx.config.upstream);
 
   const body: Record<string, unknown> = {
     model: router,
@@ -309,7 +309,7 @@ async function classifyUncached(
   const stageAbort = new AbortController();
   const signal = ctx.signal ? AbortSignal.any([ctx.signal, stageAbort.signal]) : stageAbort.signal;
   try {
-    result = await resilience.limiter(() =>
+    result = await resilience.limiterFor(router)(() =>
       withTimeout(
         ctx.client.chatCompletions(body, { stream: false, signal }),
         timeoutMs,

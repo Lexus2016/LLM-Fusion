@@ -25,6 +25,42 @@ export function createLimiter(maxConcurrency: number): Limiter {
   return pLimit(Math.max(1, maxConcurrency));
 }
 
+/** Per-model concurrency budgets, keyed by REAL upstream model name. */
+export interface PerModelConcurrency {
+  /** Budget for models without an explicit override. Default: the global cap
+   *  (i.e. no extra gate — behavior identical to a single global limiter). */
+  defaultPerModel?: number;
+  /** Explicit per-model budgets (e.g. cap a background small model at 2). */
+  overrides?: Record<string, number>;
+}
+
+/**
+ * Keyed limiter: every real upstream model gets its own gate IN FRONT of the
+ * global limiter. Acquisition order is strictly model-gate -> global-slot, so
+ * a saturated model queues at its OWN gate and can occupy at most its budget
+ * of global-queue positions — a burst of background small-model calls can no
+ * longer head-of-line-block interactive fusion turns. Uniform ordering across
+ * all callers means no lock cycle is possible.
+ */
+export function createKeyedLimiter(
+  global: Limiter,
+  maxConcurrency: number,
+  perModel: PerModelConcurrency = {},
+): (model: string) => <T>(fn: () => Promise<T> | T) => Promise<T> {
+  const gates = new Map<string, Limiter>();
+  const sizeFor = (model: string): number =>
+    Math.max(1, perModel.overrides?.[model] ?? perModel.defaultPerModel ?? maxConcurrency);
+  return (model: string) => {
+    let gate = gates.get(model);
+    if (!gate) {
+      gate = pLimit(sizeFor(model));
+      gates.set(model, gate);
+    }
+    const g = gate;
+    return <T>(fn: () => Promise<T> | T): Promise<T> => g(() => global(fn));
+  };
+}
+
 // --- Circuit breaker ------------------------------------------------------
 
 /** Injectable wall-clock seam (epoch ms). */
@@ -214,7 +250,10 @@ const DEFAULT_POLICY: FailoverPolicy = {
 
 /** Everything the strategies need to be resilient, built once per process. */
 export interface Resilience {
+  /** Global limiter — for calls with no specific upstream model (e.g. capability discovery). */
   limiter: Limiter;
+  /** Per-model gate composed with the global limiter — the default for model-bound upstream calls. */
+  limiterFor: (model: string) => <T>(fn: () => Promise<T> | T) => Promise<T>;
   breaker: CircuitBreaker;
   sleep: Sleeper;
   backoff: BackoffOptions;
@@ -223,6 +262,7 @@ export interface Resilience {
 
 export interface ResilienceOptions {
   maxConcurrency: number;
+  perModel?: PerModelConcurrency;
   failureThreshold?: number;
   cooldownMs?: number;
   now?: Clock;
@@ -233,8 +273,10 @@ export interface ResilienceOptions {
 
 /** Compose a `Resilience` bundle with sane defaults. */
 export function createResilience(opts: ResilienceOptions): Resilience {
+  const limiter = createLimiter(opts.maxConcurrency);
   return {
-    limiter: createLimiter(opts.maxConcurrency),
+    limiter,
+    limiterFor: createKeyedLimiter(limiter, opts.maxConcurrency, opts.perModel),
     breaker: new CircuitBreaker({
       failureThreshold: opts.failureThreshold,
       cooldownMs: opts.cooldownMs,
@@ -247,6 +289,26 @@ export function createResilience(opts: ResilienceOptions): Resilience {
       maxServerRetries: opts.policy?.maxServerRetries ?? DEFAULT_POLICY.maxServerRetries,
     },
   };
+}
+
+/**
+ * Build a `Resilience` bundle straight from an `upstream` config block, so the
+ * server and every strategy fallback wire the SAME per-model budgets — a
+ * fallback that silently dropped them would disable the keyed gating on any
+ * non-server call path.
+ */
+export function resilienceForUpstream(upstream: {
+  max_concurrency: number;
+  per_model_concurrency?: Record<string, number>;
+  per_model_concurrency_default?: number;
+}): Resilience {
+  return createResilience({
+    maxConcurrency: upstream.max_concurrency,
+    perModel: {
+      defaultPerModel: upstream.per_model_concurrency_default,
+      overrides: upstream.per_model_concurrency,
+    },
+  });
 }
 
 // Re-export so callers can construct the typed fast-fail error without reaching

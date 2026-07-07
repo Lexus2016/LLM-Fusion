@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { Config } from "./config";
 import type { CapabilityProvider, RequestUsage, UpstreamClient } from "./types";
 import type { Resilience } from "./concurrency";
-import { createResilience } from "./concurrency";
+import { resilienceForUpstream } from "./concurrency";
 import { ChatCompletionRequestSchema } from "./types";
 import {
   makeUsageInjectionTransform,
@@ -63,8 +63,7 @@ export function createApp(deps: AppDeps): Hono {
   const auth = createAuthMiddleware(deps.getAuthToken);
   // Process-lifetime resilience: the limiter is sized from the boot config's
   // max_concurrency (an upstream change needs a restart, like base_url/key).
-  const resilience =
-    deps.resilience ?? createResilience({ maxConcurrency: deps.getConfig().upstream.max_concurrency });
+  const resilience = deps.resilience ?? resilienceForUpstream(deps.getConfig().upstream);
 
   app.get("/health", (c) => c.json({ status: "ok" }));
 
@@ -97,7 +96,7 @@ export function createApp(deps: AppDeps): Hono {
         const discovered = await Promise.all(
           members.map(async (member) => ({
             member,
-            ...(await resilience.limiter(() => deps.capabilities.discover(member))),
+            ...(await resilience.limiterFor(member)(() => deps.capabilities.discover(member))),
           })),
         );
 

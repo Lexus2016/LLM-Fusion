@@ -1,6 +1,6 @@
 import type { ChatCompletionResult, Strategy, StrategyContext } from "../types";
 import type { Resilience } from "../concurrency";
-import { backoffDelay, createResilience } from "../concurrency";
+import { backoffDelay, resilienceForUpstream } from "../concurrency";
 import { AllMembersFailedError, CircuitOpenError, FusionError, UpstreamNetworkError } from "../errors";
 import {
   failureKindForError,
@@ -57,7 +57,7 @@ export const failoverStrategy: Strategy = {
     const chain = ctx.modelConfig.chain;
     const stream = ctx.request.stream === true;
     const resilience =
-      ctx.resilience ?? createResilience({ maxConcurrency: ctx.config.upstream.max_concurrency });
+      ctx.resilience ?? resilienceForUpstream(ctx.config.upstream);
     // Reasoning->content promotion flag, threaded into the response builders so a
     // "thinking" chain member returning reasoning-only content is normalized too.
     const promote =
@@ -118,7 +118,7 @@ async function attemptJsonMember(
     const startedAt = Date.now();
     let result: ChatCompletionResult;
     try {
-      result = await resilience.limiter(() => ctx.client.chatCompletions(body, { stream: false, signal: ctx.signal }));
+      result = await resilience.limiterFor(member)(() => ctx.client.chatCompletions(body, { stream: false, signal: ctx.signal }));
     } catch (err) {
       // Client disconnect is not a member health failure: do not trip the breaker
       // and do not waste retries. Release any reserved half-open probe so the
@@ -211,7 +211,7 @@ async function attemptStreamMember(
     const startedAt = Date.now();
     let result: ChatCompletionResult;
     try {
-      result = await resilience.limiter(() => ctx.client.chatCompletions(body, { stream: true, signal: ctx.signal }));
+      result = await resilience.limiterFor(member)(() => ctx.client.chatCompletions(body, { stream: true, signal: ctx.signal }));
     } catch (err) {
       // Client disconnect is not a member health failure: do not trip the breaker
       // and do not waste retries. Release any reserved half-open probe so the

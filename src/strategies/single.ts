@@ -47,7 +47,7 @@ export const singleStrategy: Strategy = {
     let result: ChatCompletionResult;
     try {
       result = resilience
-        ? await resilience.limiter(() => ctx.client.chatCompletions(body, { stream, signal: ctx.signal }))
+        ? await resilience.limiterFor(target)(() => ctx.client.chatCompletions(body, { stream, signal: ctx.signal }))
         : await ctx.client.chatCompletions(body, { stream, signal: ctx.signal });
     } catch (err) {
       // Client disconnect is not an upstream health failure: do not trip the
