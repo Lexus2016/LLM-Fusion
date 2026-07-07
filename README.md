@@ -71,7 +71,7 @@ Three **task-specialized** presets ship in `fusion.yaml`, each assembled from an
 
 | Call this model | For | Strategy | How it is built |
 |---|---|---|---|
-| **`fusion-coder`** | programming, planning, code audit | `fusion` | panel `glm-5.2` + `kimi-k2.7-code` + `gpt-oss:120b` → judge `glm-5.2` → synth `kimi-k2.7-code` |
+| **`fusion-coder`** | programming, planning, code audit | `fusion` | panel `glm-5.2` + `kimi-k2.7-code` + `gpt-oss:120b` → judge `glm-5.2` → synth `glm-5.2` |
 | **`fusion-researcher`** | research, analysis, reports | `fusion` | panel `kimi-k2.7-code` + `glm-5.2` + `gpt-oss:120b` → judge `glm-5.2` → synth `kimi-k2.7-code` |
 | **`fusion-agents`** | autonomous agent loops | `smart` | router `glm-5.2`; easy steps → `glm-5.2`, hard / error-recovery steps → the `fusion-coder` panel |
 

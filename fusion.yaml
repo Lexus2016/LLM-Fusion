@@ -92,7 +92,12 @@ models:
                                       # and buildPanelBody strips response_format/max_tokens/etc. so the
                                       # panel gets a clean deliberation request.
     judge: glm-5.2                    # most reliable structured-JSON (router shoot-out) -> fewer judge-parse failures
-    synth: kimi-k2.7-code             # coding specialist; produced the most complete, compilable implementation
+    synth: glm-5.2                    # CHANGED 2026-07-07 (fusion-lift bench, docs/llm-fusion-audit.md):
+                                      # as synth, kimi emitted 17-19k-char draft-style output on factual/
+                                      # reasoning tasks and dragged fusion to 0.71 (below every solo);
+                                      # with glm-5.2 as synth the same pipeline scored 0.99 vs 0.89 for
+                                      # the best solo — the fused model finally EXCEEDS every member.
+                                      # kimi stays on the panel (its material remains valuable input).
     tool_mode: deliberate
     fusion_planning_turn_only: false  # full panel on EVERY fresh user instruction (a new task /
                                       # refinement / module — even days into one chat); synth-only

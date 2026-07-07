@@ -1,0 +1,147 @@
+[
+  {
+    "id": "T01",
+    "cat": "coding",
+    "accuracy": 9,
+    "completeness": 9,
+    "truthfulness": 9,
+    "note": "Accurate, complete, handles ambiguity well. Leading mode matches literal spec.",
+    "chars": 8699,
+    "ms": 206052
+  },
+  {
+    "id": "T02",
+    "cat": "debugging",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10,
+    "note": "Comprehensive, correct, includes error handling and caveats.",
+    "chars": 3245,
+    "ms": 57415
+  },
+  {
+    "id": "T03",
+    "cat": "factual",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10,
+    "note": "Answer is precise, covers all required points, correctly identifies options, and explicitly flags unverified claims.",
+    "chars": 6240,
+    "ms": 112365
+  },
+  {
+    "id": "T04",
+    "cat": "reasoning",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10,
+    "note": "Excellent explanation, covers all points with precise math and concrete fixes.",
+    "chars": 6613,
+    "ms": 120386
+  },
+  {
+    "id": "T05",
+    "cat": "report",
+    "accuracy": 9,
+    "completeness": 8,
+    "truthfulness": 10,
+    "note": "Misses SSE keepalive pings to prevent proxy timeouts; otherwise thorough and correct.",
+    "chars": 9778,
+    "ms": 127282
+  },
+  {
+    "id": "T06",
+    "cat": "coding",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10,
+    "note": "Perfectly meets all criteria with clear O(1) reasoning and correct implementations.",
+    "chars": 7666,
+    "ms": 123453
+  },
+  {
+    "id": "T07",
+    "cat": "coding",
+    "error": "Error: HTTP 502: {\"error\":{\"message\":\"fusion panel produced 1 usable answer(s); need >= 2 for 'fusion-coder'\",\"type\":\"upstream_unavailable\",\"code\":nul"
+  },
+  {
+    "id": "T08",
+    "cat": "debugging",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10,
+    "note": "Comprehensive, accurate, and truthful; all fixes included.",
+    "chars": 7363,
+    "ms": 103405
+  },
+  {
+    "id": "T09",
+    "cat": "factual",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10,
+    "note": "Accurate, complete, no fabrications; covers all required points and caveats.",
+    "chars": 11785,
+    "ms": 159354
+  },
+  {
+    "id": "T10",
+    "cat": "coding",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10,
+    "note": "Perfectly meets all criteria, no fabrication, thorough tests and explanation.",
+    "chars": 13382,
+    "ms": 170786
+  },
+  {
+    "id": "T11",
+    "cat": "debugging",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10,
+    "note": "Perfectly explains both bugs, mechanisms, and fixes; no errors.",
+    "chars": 4526,
+    "ms": 88112
+  },
+  {
+    "id": "T12",
+    "cat": "factual",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10,
+    "note": "Perfect: correct anomalies, example, SQLSTATE 40001, and PG RR prevents phantoms.",
+    "chars": 7312,
+    "ms": 125287
+  },
+  {
+    "id": "T13",
+    "cat": "reasoning",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10,
+    "note": "Thorough, accurate comparison with nuanced trade-offs and no hallucinations.",
+    "chars": 12001,
+    "ms": 213206
+  },
+  {
+    "id": "T14",
+    "cat": "coding",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10,
+    "note": "Accurate formula, complete retry with abort, no fabrication.",
+    "chars": 10157,
+    "ms": 103113
+  },
+  {
+    "id": "T15",
+    "cat": "factual",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10,
+    "note": "Perfectly matches criteria; all methods correct, explanations clear, practical consequence covered.",
+    "chars": 4578,
+    "ms": 171515
+  }
+]

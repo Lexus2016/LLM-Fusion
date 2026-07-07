@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.23] - 2026-07-07
+
+### Changed
+
+- **`fusion-coder` synth: `kimi-k2.7-code` → `glm-5.2`** — the first configuration change driven by the project's own fusion-lift benchmark (`bench/`, analysis in `docs/llm-fusion-audit.md`). As synth, kimi emitted 17–19k-char draft-style output on factual/reasoning tasks and dragged the always-on fusion composite to 0.71 — below every solo panel member. With glm-5.2 as synth the same pipeline scored **0.99 vs 0.89 for the best solo member** (n=14, blind 3-axis scoring by a model outside all conditions; per-answer methodology control kept solo-glm at 0.89). The fused model now exceeds every individual member — the project's core promise, measured. kimi stays on the panel; `fusion-agents` inherits the change via its `fusion-coder` reference.
+
 ## [0.1.22] - 2026-07-07
 
 ### Added

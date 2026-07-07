@@ -1,0 +1,92 @@
+[
+  {
+    "id": "T01",
+    "accuracy": 2,
+    "completeness": 4,
+    "truthfulness": 2
+  },
+  {
+    "id": "T02",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10
+  },
+  {
+    "id": "T03",
+    "accuracy": 8,
+    "completeness": 7,
+    "truthfulness": 9
+  },
+  {
+    "id": "T04",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10
+  },
+  {
+    "id": "T05",
+    "accuracy": 7,
+    "completeness": 7,
+    "truthfulness": 7
+  },
+  {
+    "id": "T06",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10
+  },
+  {
+    "id": "T07",
+    "accuracy": 6,
+    "completeness": 8,
+    "truthfulness": 10
+  },
+  {
+    "id": "T08",
+    "accuracy": 10,
+    "completeness": 9,
+    "truthfulness": 10
+  },
+  {
+    "id": "T09",
+    "accuracy": 8,
+    "completeness": 8,
+    "truthfulness": 10
+  },
+  {
+    "id": "T10",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10
+  },
+  {
+    "id": "T11",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10
+  },
+  {
+    "id": "T12",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10
+  },
+  {
+    "id": "T13",
+    "accuracy": 9,
+    "completeness": 10,
+    "truthfulness": 10
+  },
+  {
+    "id": "T14",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10
+  },
+  {
+    "id": "T15",
+    "accuracy": 10,
+    "completeness": 10,
+    "truthfulness": 10
+  }
+]
