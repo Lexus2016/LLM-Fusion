@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.18] - 2026-07-07
+
+### Fixed
+
+- **Inline `<think>` stall detection.** `detectIncompleteSynth` judged the RAW `content`, so an R1/QwQ-style synth answer consisting of one inline `<think>…</think>` block (narration, no artifact) sailed through as complete and the completeness guard never fired. Both the answer and the raw-content checks now judge the think-stripped text. Documented trade-off: an answer that legitimately consists entirely of literal think markup costs one wasted recovery attempt (the original is kept when recovery fails) — never content loss.
+- **Length-cut recovery retries are no longer adopted.** The strict recovery retry can itself hit the token cap mid tool call (`finish_reason: "length"`, truncated/non-string `arguments`); such a result was accepted as "recovered". It now yields to the fallback-model attempt instead.
+- **SSE keepalive during recovery.** The recovery retry runs synchronously inside the stream flush — previously the client saw total silence (up to two full upstream call latencies) and could time out. SSE comment lines (`: keepalive`) now flow every 5s (override via `FUSION_SYNTH_RECOVERY_PING_MS`), and an unexpected throw inside recovery fails open to the original terminal chunk instead of breaking the stream.
+
+Source: a three-provider consilium panel review (kimi / deepseek / Gemini) of the v0.1.16-17 fixes, plus a pre-tag adversarial re-review of this diff.
+
 ## [0.1.17] - 2026-07-07
 
 ### Fixed
