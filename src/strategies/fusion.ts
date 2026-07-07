@@ -1348,9 +1348,9 @@ function appendSynthCompletionNudge(body: Record<string, unknown>): Record<strin
 /**
  * Recover a final answer after the synth stopped mid-plan: one stricter,
  * non-streamed retry on the SAME synth model, and — if that is also empty /
- * unusable — one attempt on `opts.fallbackSynth` (the judge model: a different
- * lineage, empirically the most reliable structured-output model in the
- * panel). Returns the recovered completion data, or null when every attempt
+ * unusable — one attempt on `opts.fallbackSynth` (the judge model, or a panel
+ * member when the judge IS the synth: either way a DIFFERENT model, so no
+ * single model can stall the loop). Returns the recovered completion data, or null when every attempt
  * failed — in which case the caller keeps the original (a partial plan beats
  * nothing). At most two recovery calls, never more (no loops). The retries do
  * not touch the circuit breaker (already counted for the stage), but their
@@ -1410,7 +1410,7 @@ async function retrySynthForCompletion(
   if (fallback === null || fallback === synth) return null;
   ctx.logger.warn(
     { stage: "synth", model: synth, fallback_model: fallback, reason },
-    "fusion: synth retry failed; one fallback attempt on the judge model",
+    "fusion: synth retry failed; one attempt on the fallback model",
   );
   return attempt(fallback, { ...nudgedBody, model: fallback });
 }
