@@ -649,6 +649,34 @@ describe("anthropic route", () => {
     expect(text).toContain('"stop_reason":"tool_use"');
   });
 
+  it("streamed <think> tag split across deltas leaks neither the tag nor the block body", async () => {
+    // Regression: stripThinkingTags ran per fragment, so "<th" + "ink>" crossed
+    // the SSE boundary untouched and the private block body streamed as text.
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          sseResponse([
+            { choices: [{ delta: { content: "Hello <th" } }] },
+            { choices: [{ delta: { content: "ink>secret plan</think> world" } }] },
+            { choices: [{ delta: {}, finish_reason: "stop" }] },
+          ]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-fast",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain("secret plan");
+    expect(text).not.toContain("ink>");
+    expect(text).not.toContain("<th"); // no partial tag either
+    expect(text).toContain("Hello");
+    expect(text).toContain("world");
+  });
+
   it("authenticates with x-api-key header", async () => {
     const app = makeApp(defaultRoutes(), "secret");
     const ok = await postMessages(

@@ -17,7 +17,7 @@ import { dispatch } from "./router";
 import { UsageAccumulator, usageHeaderValue, toOpenAiUsage } from "./usage";
 import { createAuthMiddleware } from "./auth";
 import { BadRequestError, FusionError, toAnthropicErrorResponse } from "./errors";
-import { stripThinkingTags } from "./reasoning";
+import { stripThinkingTags, createThinkTagStreamFilter } from "./reasoning";
 import { stripHopByHopHeaders } from "./headers";
 
 /**
@@ -542,6 +542,11 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
   // Accumulated tool-call argument JSON per OpenAI tool index — only consulted
   // on a length-cut stream to decide whether the call is complete and runnable.
   const toolArgs = new Map<number, string>();
+  // Stateful <think>-tag filters (a tag can be split across SSE deltas); one
+  // per source so an unterminated block in `reasoning` cannot suppress `content`.
+  const contentThinkFilter = createThinkTagStreamFilter();
+  const reasoningThinkFilter = createThinkTagStreamFilter();
+  let reasoningTailMerged = false;
   let finishReason: string | null = null;
   let started = false;
 
@@ -642,9 +647,23 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
     const delta = choice.delta;
     if (!delta) return;
 
-    const rawText = delta.content ?? delta.reasoning;
+    const rawContent = typeof delta.content === "string" ? delta.content : undefined;
+    const rawReasoning = typeof delta.reasoning === "string" ? delta.reasoning : undefined;
+    const rawText = rawContent ?? rawReasoning;
     if (typeof rawText === "string" && rawText.length > 0) {
-      const text = stripThinkingTags(rawText);
+      let text: string;
+      if (rawContent !== undefined) {
+        text = contentThinkFilter.push(rawText);
+        // The reasoning phase is over: a false-partial tag carried at its end
+        // is literal narration and belongs before the first content fragment,
+        // not reordered to the end of the stream.
+        if (!reasoningTailMerged) {
+          reasoningTailMerged = true;
+          text = reasoningThinkFilter.flush() + text;
+        }
+      } else {
+        text = reasoningThinkFilter.push(rawText);
+      }
       if (text.length > 0) {
         if (!activeBlock || activeBlock.kind !== "text") {
           startTextBlock(controller);
@@ -747,6 +766,19 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
         }
       }
 
+      // A false-partial think tag carried to the very end of the stream is
+      // literal text (e.g. "<tho…") — surface it instead of swallowing it.
+      const thinkTail = contentThinkFilter.flush() + reasoningThinkFilter.flush();
+      if (thinkTail.length > 0) {
+        if (!activeBlock || activeBlock.kind !== "text") {
+          startTextBlock(controller);
+        }
+        emit(controller, "content_block_delta", {
+          type: "content_block_delta",
+          index: activeBlock!.index,
+          delta: { type: "text_delta", text: thinkTail },
+        });
+      }
       stopActiveBlock(controller);
       const finalUsage = await opts.usage.finalize(opts.pricing);
       // Pass the tool-block presence (not []): the stream emits tool_use blocks as it
