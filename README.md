@@ -1,5 +1,7 @@
 # llm-fusion — Fusion Proxy
 
+> **English** | [Русский](./README.ru.md) | [Українська](./README.ua.md)
+
 > **Self-hosted, OpenAI-compatible and Anthropic Messages API deliberation proxy for Ollama Cloud.**  
 > One virtual model name runs a panel of models, a judge, and a synthesizer — or a smart router that decides per request whether that heavy treatment is even worth it.
 
@@ -69,14 +71,14 @@ Three **task-specialized** presets ship in `fusion.yaml`, each assembled from an
 
 | Call this model | For | Strategy | How it is built |
 |---|---|---|---|
-| **`fusion-coder`** | programming, planning, code audit | `fusion` | panel `glm-5.2` + `kimi-k2.7-code` + `gemini-3-flash-preview` → judge `glm-5.2` → synth `kimi-k2.7-code` |
+| **`fusion-coder`** | programming, planning, code audit | `fusion` | panel `glm-5.2` + `kimi-k2.7-code` + `gpt-oss:120b` → judge `glm-5.2` → synth `kimi-k2.7-code` |
 | **`fusion-researcher`** | research, analysis, reports | `fusion` | panel `kimi-k2.7-code` + `glm-5.2` + `gpt-oss:120b` → judge `glm-5.2` → synth `kimi-k2.7-code` |
-| **`fusion-agents`** | autonomous agent loops | `smart` | router `glm-5.2`; easy steps → `gemini-3-flash-preview`, hard / error-recovery steps → the `fusion-coder` panel |
+| **`fusion-agents`** | autonomous agent loops | `smart` | router `glm-5.2`; easy steps → `glm-5.2`, hard / error-recovery steps → the `fusion-coder` panel |
 
 Two rules came straight out of the data:
 
 - **Coding uses fusion, not a single model.** Architecture and planning genuinely benefit from multiple viewpoints. (A pure code *audit* — just enumerating issues — is the one coding-shaped task a single model wins, and it is not representative of programming.)
-- **Panels mix model lineages on purpose.** `glm`/`kimi`/`deepseek`/`minimax`/`qwen` are all Chinese labs and share blind spots; every panel adds a Western decorrelator (`gemini` = Google, `gpt-oss` = OpenAI) so panel errors are less correlated — that is the whole point of a panel.
+- **Panels mix model lineages on purpose.** `glm`/`kimi`/`deepseek`/`minimax`/`qwen` are all Chinese labs and share blind spots; every panel adds a Western decorrelator (`gpt-oss:120b` = OpenAI lineage) so panel errors are less correlated — that is the whole point of a panel. (Gemini was the original decorrelator but rejects tool-call history produced by other models with a `thought_signature` error on every mid-loop step, so it was replaced.)
 
 The original generic presets (`fusion-1`, `smart-1`, `fast-glm` / `fast-kimi` / `fast-deepseek`) still ship for ad-hoc use.
 
@@ -115,6 +117,15 @@ These are **all OFF by default**; opt in per fusion model in `fusion.yaml`. Full
   ```
 - **BinEval post-synth quality check** — `bineval: { enabled: true, model: <eval>, threshold: 0.7, dimensions: [...] }`. After a *non-streaming* synth that succeeds, one extra evaluator call scores the answer on factual consistency (or your custom binary questions) and returns the results as response headers: `X-Fusion-Bineval-Score` (0–1), `X-Fusion-Bineval-Dimensions` (per-dimension JSON), and `X-Fusion-Bineval-Low-Score: true` when the overall score is below `threshold`. When bineval is configured but the evaluation does not run, the proxy sets `X-Fusion-Bineval-Skipped: <reason>` so a client can tell "score is high" from "evaluation never ran" — reasons: `streaming`, `synth_error` (synth ≥400), `eval_failed` (evaluator errored/timed out/circuit open), `empty_output` (tool-only response), `non_json_body`, `synth_only` (planning-turn-only mid-loop / bypass path). **BinEval is report-only** — it does not drive re-routing or a re-deliberation loop.
 
+### Agent-loop reliability (v0.1.16+)
+
+Long agent runs used to die on four load-dependent failure modes; all four are now handled structurally:
+
+- **Synth completeness guard with a judge fallback.** A "thinking" synth can declare itself done while still mid-plan (empty answer, or one inline `<think>` block with no artifact). The guard detects that on both the streaming and non-streaming paths, retries the same synth once with a strict completion nudge, and — if that retry is still unusable (or was itself cut by the token cap mid tool call) — makes ONE attempt on the judge model, so no single model can stall an agent loop. During the silent recovery the stream carries SSE `: keepalive` comments (every 5 s, `FUSION_SYNTH_RECOVERY_PING_MS` to tune) so clients and intermediaries don't time out.
+- **Honest `stop_reason` on token-cap cuts.** A tool call truncated by `max_tokens` is reported to Anthropic clients as `stop_reason: "max_tokens"` — not as a runnable `tool_use` with broken JSON input. When the cap lands exactly *after* a tool call's JSON completed, the call stays runnable (`tool_use`), so a finished multi-minute Write is never thrown away.
+- **Per-model concurrency budgets.** `upstream.per_model_concurrency` gives each real upstream model its own gate in front of the global limiter — a burst of background small-model calls (Claude Code fires 80–130/min) queues at its own gate instead of head-of-line blocking interactive turns.
+- **Separated traffic classes.** The `fusion-claude` launcher defaults the Claude Code background model (`ANTHROPIC_SMALL_FAST_MODEL`) to `fast-deepseek` — a model no panel, judge, synth, router, or simple route depends on — so background bursts can't rate-limit the model that writes your files.
+
 ---
 
 ## The honest cost note (read this)
@@ -133,8 +144,8 @@ A typical coding task of **15–25 steps** therefore issues roughly **75–125 u
 **Mitigation (shipped, not deferred): the `smart` strategy.** Point your agent at `fusion-agents` and routine steps (`read_file`, `grep`, …) take the cheap `single` path (1 call), while genuinely hard steps still get full fusion. Other levers baked in:
 
 - small default panel (3),
-- global `max_concurrency` cap (4),
-- tight judge/panel timeouts (60 s / 90 s, both under the ~182 s upstream ceiling),
+- global `max_concurrency` cap plus **per-model concurrency budgets** (`per_model_concurrency`) — a burst on one model queues at its own gate instead of head-of-line blocking interactive turns,
+- tight panel/judge timeouts (90 s / 120 s in the shipped presets, both under the ~182 s upstream ceiling),
 - `fusion_planning_turn_only` knob (run the full panel on every planning turn — any request whose latest message is a fresh user instruction — and degrade to synth-only — 5 calls → 1 — only on mid-loop tool-result continuations; a new task deep in a long session still gets the panel).
 
 That is how llm-fusion keeps long agent loops affordable without sacrificing deliberation where it matters.
@@ -166,7 +177,7 @@ Then restart the proxy. Your `fusion.yaml` and `.env` are yours — `git pull` n
 
 ```bash
 git fetch --tags
-git checkout v0.1.12              # or any tag from the Releases page
+git checkout v0.1.19              # or any tag from the Releases page
 npm install
 ```
 
@@ -226,7 +237,8 @@ The proxy reads plain environment variables. It also **auto-loads a local `.env`
 | `FUSION_CONFIG` | No | `./fusion.yaml` | Path to the config file to load. |
 | `LOG_PRETTY` | No | unset | `LOG_PRETTY=1` enables human-readable pretty logs (otherwise structured JSON). |
 | `LOG_LEVEL` | No | `info` | pino log level (`debug`, `info`, `warn`, …). |
-| `FUSION_BIND` | No | `server.bind` | Overrides the bind address without editing the config (used by the Docker image — see below). |
+| `FUSION_BIND` | No | `server.bind` | Overrides the bind address without editing the config (used by the Docker image). |
+| `FUSION_SYNTH_RECOVERY_PING_MS` | No | `5000` | Interval of the SSE `: keepalive` comments emitted while a synth recovery retry runs inside a stream. Positive number; anything else falls back to the default. |
 
 A `.env.example` cannot be committed here (sandbox guard). Create your own `.env` in the project root with these literal contents:
 
