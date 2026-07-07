@@ -69,6 +69,10 @@ const JudgeAnalysisSchema = z
     disagreements: z.union([z.string(), z.array(z.string())]).optional(),
     unique_insights: z.union([z.string(), z.array(z.string())]).optional(),
     blind_spots: z.union([z.string(), z.array(z.string())]).optional(),
+    // OpenRouter's fifth judge dimension: aspects of the request that SOME
+    // answers cover and others miss — the synth completes them from the
+    // covering expert instead of averaging them away.
+    partial_coverage: z.union([z.string(), z.array(z.string())]).optional(),
     hallucination_flags: z.union([z.string(), z.array(z.string())]).optional(),
     // Calibrated confidence in the analysis as a whole. Agreement is only
     // signal when the experts don't share blind spots, so the judge must say
@@ -964,6 +968,8 @@ const JUDGE_SYSTEM_PROMPT =
   '"consensus" (where the experts agree), "disagreements" (where they conflict — and, where the request makes it ' +
   'determinable, which side is correct and why), "unique_insights" (correct, useful points raised by only one expert), ' +
   '"blind_spots" (anything the request needs that none of them addressed), ' +
+  '"partial_coverage" (important aspects of the request that SOME answers cover and others miss — name the aspect ' +
+  "and which expert covered it), " +
   'and "hallucination_flags" (any claims, function/API names, library versions, or facts stated confidently by one ' +
   "expert but absent from or contradicted by the others — these are likely fabricated). " +
   "Cross-reference the experts against each other: if only one expert mentions a specific API, function, " +
@@ -1774,7 +1780,9 @@ function buildSynthContext(
       "A panel of expert models answered the user's request, and an impartial judge produced a structured " +
       "analysis of their answers. Write the single best final answer: take the actual content (code, formulas, " +
       "exact text) from the expert answers, and use the judge analysis to resolve disagreements, cover blind " +
-      "spots, and weight the consensus. Do not drop detail that only one expert provided unless it is wrong. " +
+      "spots, and weight the consensus. Where the judge listed partial_coverage, take each such aspect from the " +
+      "expert that covered it — do not average partially covered aspects away. " +
+      "Do not drop detail that only one expert provided unless it is wrong. " +
       "IMPORTANT: if the judge flagged hallucination_flags, treat those items as suspect — omit or explicitly " +
       "caveat them rather than presenting fabricated information as fact. When experts disagree and you cannot " +
       "determine which side is correct, say so honestly instead of inventing an answer. " +

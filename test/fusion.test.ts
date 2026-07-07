@@ -876,6 +876,24 @@ describe("fusion strategy — reasoning→content normalization", () => {
 describe("fusion strategy — synth completeness guard", () => {
   const judgeOk = { choices: [{ message: { content: JSON.stringify({ consensus: "ok" }) } }] };
 
+  it("asks the judge for partial_coverage and tells the synth to complete it", async () => {
+    // The OpenRouter judge's fifth dimension: aspects of the request that SOME
+    // answers cover and others miss. The schema already passes unknown keys
+    // through — this pins the PROMPTS: the judge must be asked for the
+    // dimension and the synth must be told what to do with it.
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    await (await fusionStrategy.execute(ctx(up.client, req()))).text();
+    const judgeBody = up.recorded.find((b) => b.model === "j");
+    expect(judgeBody).toBeDefined();
+    expect(systemContents(judgeBody!).join("\n")).toContain('"partial_coverage"');
+    const synthBody = up.recorded.find((b) => b.model === "s");
+    expect(synthBody).toBeDefined();
+    expect(JSON.stringify(synthBody!.messages)).toContain("partial_coverage");
+  });
+
   it("retries a synth that stopped mid-plan and adopts the completed answer", async () => {
     let synthCalls = 0;
     const up = makeUpstream((body) => {
