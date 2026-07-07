@@ -17,7 +17,7 @@
 | **Архітектура fusion** | `panel → judge → synth` + `smart`-роутер | `panel → judge → synth` (plugin інжектиться у виклик) | Trinity призначає Thinker/Worker/Verifier покроково; Conductor генерує природномовні топології |
 | **Оптимізація** | Агентний цикл (детермінований `tool_calls`, контроль витрат) | Deep-research задачі (DRACO-бенчмарк) | Багатокрокові задачі (SWE-Bench Pro, код-ревʼю, кібербезпека) |
 | **Веб-grounding** | Tavily (opt-in): **один пошук до панелі, контекст інжектиться кожному учаснику панелі** (і synth) — але не як інструмент | Вбудований `web_search` (Exa) + `web_fetch` як **інструменти** кожної моделі панелі (агентно, багато запитів) | Через інструменти агентів |
-| **Верифікація** | Judge (consensus / disagreements / unique insights / blind spots / hallucination_flags) + BinEval (report-only) | Judge: **5 вимірів** — consensus / contradictions / partial coverage / unique insights / blind spots | Verifier-роль (Thinker/Worker/Verifier) |
+| **Верифікація** | Judge (consensus / disagreements / unique insights / blind spots / **partial coverage — з v0.1.22** / hallucination_flags) + BinEval (report-only) | Judge: **5 вимірів** — consensus / contradictions / partial coverage / unique insights / blind spots | Verifier-роль (Thinker/Worker/Verifier) |
 | **Пресети** | `fusion-coder`, `fusion-researcher`, `fusion-agents` (YAML) | `general-high` / `general-budget` / `general-fast` | `fugu` (low-latency) / `fugu-ultra` (max quality) |
 | **Латентність** | 3-model panel = ~3× single (N+2 виклики) | **2–3× повільніше** за звичайний виклик | Багатокрокова координація додає латентність |
 | **Прозорість дебагу** | **Повна** — самохост, видимість усіх проміжних результатів | Чорна скринька — лише фінальна відповідь | **Навмисно прихована** маршрутизація (proprietary routing) |
@@ -122,7 +122,7 @@
 | Дублікати «панель 2–3 у бенчмарку», v0.1.21, латентність ~N+2 | **ПІДТВЕРДЖЕНО** | Збігаються з джерелом і кодом. |
 
 **Ухвалені рішення мейнтейнера (черга виконання):**
-1. **№2 partial coverage** — прийнято; найдешевший пункт (поле схеми судді + рядок промпта). Перший у черзі.
+1. **№2 partial coverage** — прийнято; найдешевший пункт (поле схеми судді + рядок промпта). **✅ Виконано у v0.1.22** (2026-07-07).
 2. **R0 self-fusion** — прийнято як бенч-скрипт поза продуктом (блокер конфігурації задокументовано); виконувати разом із №7.
 3. **№7 власні бенчмарки** — прийнято; окрема робоча сесія (набір задач + харнес; Fable 5 baseline з застереженням 93/100).
 4. **№4 bineval_gate** — прийнято з обмеженням: діє лише на непотокові відповіді (агентний шлях стрімить — gate там неможливий без буферизації); поведінка gate (один re-synth чи 502) — окремий дизайн.
