@@ -54,6 +54,14 @@ const config = parseConfig({
       synth: "s",
       adversarial: "m2",
     },
+    // judge === synth (the shipped fusion-coder shape since v0.1.23): the
+    // recovery fallback must come from a PANEL member, not the (same) judge.
+    "fusion-selfjudge": {
+      strategy: "fusion",
+      panel: ["m1", "m2", "m3"],
+      judge: "s",
+      synth: "s",
+    },
     // Web grounding: opt-in via web_search.enabled; needs TAVILY_API_KEY at runtime.
     "fusion-web": {
       strategy: "fusion",
@@ -1014,6 +1022,39 @@ describe("fusion strategy — synth completeness guard", () => {
     await res.text();
     expect(synthCalls).toBe(2); // one original + exactly one retry
     expect(judgeFallbackCalls).toBe(1); // + exactly one fallback attempt, then give up
+  });
+
+  it("falls back to a PANEL member when judge === synth", async () => {
+    // Since v0.1.23 the shipped fusion-coder has judge === synth (glm-5.2), and
+    // `judge !== synth ? judge : null` silently DISABLED the cross-model
+    // insurance. The fallback must then come from a panel member instead.
+    let synthCalls = 0;
+    let m1Nudged = 0;
+    const up = makeUpstream((body) => {
+      const sys = systemContents(body);
+      const nudged = sys.some((c) => c.includes("stopped while still planning"));
+      if (body.model === "s") {
+        // The JUDGE stage prompt (not the synth context, which merely MENTIONS
+        // "an impartial judge") uniquely asks for the keyed JSON object.
+        if (sys.some((c) => c.includes("respond with ONLY a JSON object with these keys"))) {
+          return jsonResponse({ choices: [{ message: { content: JSON.stringify({ consensus: "ok" }) } }] });
+        }
+        synthCalls += 1; // synth original + same-model retry — always empty
+        return jsonResponse({ choices: [{ message: { content: "" }, finish_reason: "stop" }] });
+      }
+      if (body.model === "m1" && nudged) {
+        m1Nudged += 1;
+        return jsonResponse({ choices: [{ message: { content: "panel-member-recovery" }, finish_reason: "stop" }] });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req(), "fusion-selfjudge"));
+    const parsed = z
+      .object({ choices: z.array(z.object({ message: z.object({ content: z.string() }) })) })
+      .parse(await res.json());
+    expect(synthCalls).toBe(2);
+    expect(m1Nudged).toBe(1);
+    expect(parsed.choices[0]?.message.content).toBe("panel-member-recovery");
   });
 
   it("falls back to the judge model when the synth retry is still empty", async () => {

@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.24] - 2026-07-07
+
+### Fixed
+
+- **Synth-recovery fallback works again when `judge === synth`.** v0.1.23 made glm-5.2 both judge and synth for `fusion-coder`, and the recovery fallback (`judge !== synth ? judge : null`) silently lost its cross-model insurance — an empty synth answer had no second model to recover on. The fallback now picks the first PANEL member that differs from the synth in that case. Stale "kimi is the fusion-coder synth" wording in `docs/claude-code.md` and the `fusion-claude` launcher comment updated to the post-v0.1.23 reality.
+
 ## [0.1.23] - 2026-07-07
 
 ### Changed

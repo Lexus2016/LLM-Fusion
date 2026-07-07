@@ -61,10 +61,10 @@ export ANTHROPIC_BASE_URL="$PROXY_URL"
 export ANTHROPIC_MODEL="$MODEL"
 # The small/fast model must NOT share a rate-limit bucket with anything the
 # main loop depends on: Claude Code fires background bursts of 80-130 small
-# calls/min, and on 2026-07-06 those bursts 429-starved kimi-k2.7-code — which
-# is also the fusion-coder SYNTH that writes file contents — killing large-file
-# generation mid-loop. deepseek-v4-pro is used by no panel, synth, judge,
-# router, or simple route, so its rate limit is free to burn.
+# calls/min, and on 2026-07-06 those bursts 429-starved kimi-k2.7-code — the
+# fusion-coder synth at the time (a panel member since v0.1.23) — killing
+# large-file generation mid-loop. deepseek-v4-pro is used by no panel, synth,
+# judge, router, or simple route, so its rate limit is free to burn.
 export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-fast-deepseek}"
 export ANTHROPIC_AUTH_TOKEN="${FUSION_PROXY_TOKEN:-local-no-auth}"
 

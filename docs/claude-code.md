@@ -76,7 +76,7 @@ The value of `ANTHROPIC_MODEL` must be a **virtual model name** defined in `fusi
 | `fusion-researcher` | Research, analysis, reports | `fusion` |
 | `fusion-agents` | Autonomous agent loops (default) | `smart` |
 
-`ANTHROPIC_SMALL_FAST_MODEL` should point to a cheap `single` model — the launcher default is `fast-deepseek`. **Do not point it at a model that also serves as a fusion synth or panel member** (e.g. `fast-kimi` → kimi-k2.7-code, the fusion-coder synth): Claude Code fires background bursts of 80–130 small-model calls/min, and those bursts can rate-limit (429) the shared upstream model and kill the main loop mid-task. Claude Code uses this model for lightweight tasks like summarizing tool output or quick lookups. The shipped `fusion.yaml` already defines the fast singles.
+`ANTHROPIC_SMALL_FAST_MODEL` should point to a cheap `single` model — the launcher default is `fast-deepseek`. **Do not point it at a model that also serves as a fusion synth, judge, or panel member** (e.g. `fast-kimi` → kimi-k2.7-code, a fusion-coder panel member; `fast-glm` → glm-5.2, the fusion-coder judge and synth since v0.1.23): Claude Code fires background bursts of 80–130 small-model calls/min, and those bursts can rate-limit (429) the shared upstream model and kill the main loop mid-task. Claude Code uses this model for lightweight tasks like summarizing tool output or quick lookups. The shipped `fusion.yaml` already defines the fast singles.
 
 ## What gets translated
 

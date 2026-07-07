@@ -166,7 +166,8 @@ async function runFusion(
       native,
       promote,
       webContext: null,
-      fallbackSynth: cfg.judge !== cfg.synth ? cfg.judge : null,
+      fallbackSynth:
+        cfg.judge !== cfg.synth ? cfg.judge : (cfg.panel.find((m) => m !== cfg.synth) ?? null),
     });
     // synth-only skips the panel, so the post-synth bineval evaluation (which scores the
     // panel-synthesized answer) does not apply. Surface that to the client rather than
@@ -220,7 +221,8 @@ async function runFusion(
     native,
     promote,
     webContext,
-    fallbackSynth: cfg.judge !== cfg.synth ? cfg.judge : null,
+    fallbackSynth:
+        cfg.judge !== cfg.synth ? cfg.judge : (cfg.panel.find((m) => m !== cfg.synth) ?? null),
   });
 
   // BINEVAL — optional post-synth quality evaluation. Streaming bodies are consumed by
