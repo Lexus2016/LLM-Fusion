@@ -453,12 +453,14 @@ export function openAiToAnthropicResponse(
     contentBlocks.push({ type: "text", text: textContent });
   }
 
+  let toolInputsComplete = true;
   for (const tc of message?.tool_calls ?? []) {
     let input: Record<string, unknown> = {};
     try {
       input = JSON.parse(tc.function.arguments);
     } catch {
       input = {};
+      toolInputsComplete = false;
     }
     contentBlocks.push({
       type: "tool_use",
@@ -474,7 +476,7 @@ export function openAiToAnthropicResponse(
     role: "assistant",
     model,
     content: contentBlocks,
-    stop_reason: finishReasonToAnthropic(finishReason, contentBlocks),
+    stop_reason: finishReasonToAnthropic(finishReason, contentBlocks, { toolInputsComplete }),
     stop_sequence: null,
     usage: {
       input_tokens: usage.promptTokens,
@@ -486,18 +488,23 @@ export function openAiToAnthropicResponse(
 function finishReasonToAnthropic(
   reason: string | null | undefined,
   contentBlocks: Array<Record<string, unknown>>,
+  recovery?: { toolInputsComplete?: boolean },
 ): string | null {
-  // Truncation trumps everything, tool blocks included: a tool call cut by the
-  // token limit is NOT runnable — its input JSON is missing the tail, and
-  // reporting "tool_use" would make Claude Code execute that broken input.
-  // "max_tokens" tells the client the turn was cut so it can recover.
-  if (reason === "length") return "max_tokens";
+  const hasToolBlocks = contentBlocks.some((b) => b.type === "tool_use");
+  // A length-cut turn is only runnable when every tool call's input JSON
+  // actually parsed to completion (the cap can land exactly after a finished
+  // call). Otherwise the tool input is missing its tail, and reporting
+  // "tool_use" would make Claude Code execute that broken input — report
+  // "max_tokens" so the client recovers instead.
+  if (reason === "length") {
+    return hasToolBlocks && recovery?.toolInputsComplete === true ? "tool_use" : "max_tokens";
+  }
   // tool_use DOMINATES the rest: if the turn produced a tool call, it ended to
   // run that tool, regardless of the upstream finish_reason. Some upstreams send
   // "stop" (or null on a truncated stream) alongside tool_calls; checking tool
   // presence keeps the Anthropic stop_reason correct so the Claude Code agent
   // loop actually runs the tool.
-  if (reason === "tool_calls" || contentBlocks.some((b) => b.type === "tool_use")) {
+  if (reason === "tool_calls" || hasToolBlocks) {
     return "tool_use";
   }
   if (reason === "stop") return "end_turn";
@@ -532,6 +539,9 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
   let nextBlockIndex = 0;
   let activeBlock: ActiveBlock | null = null;
   const toolBlockIndex = new Map<number, number>();
+  // Accumulated tool-call argument JSON per OpenAI tool index — only consulted
+  // on a length-cut stream to decide whether the call is complete and runnable.
+  const toolArgs = new Map<number, string>();
   let finishReason: string | null = null;
   let started = false;
 
@@ -660,6 +670,7 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
         activeBlock = { index: blockIdx, kind: "tool", toolIndex: idx };
       }
       const partial = tc.function?.arguments ?? "";
+      toolArgs.set(idx, (toolArgs.get(idx) ?? "") + partial);
       emit(controller, "content_block_delta", {
         type: "content_block_delta",
         index: blockIdx,
@@ -742,9 +753,20 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
       // converts tool_calls deltas, so the final stop_reason must reflect them even when
       // the upstream finish_reason is "stop"/null — otherwise Claude Code sees tool_use
       // content but stop_reason:"end_turn" and never runs the tool.
+      const toolInputsComplete =
+        toolBlockIndex.size > 0 &&
+        [...toolArgs.values()].every((args) => {
+          try {
+            JSON.parse(args);
+            return true;
+          } catch {
+            return false;
+          }
+        });
       const stopReason = finishReasonToAnthropic(
         finishReason,
         toolBlockIndex.size > 0 ? [{ type: "tool_use" }] : [],
+        { toolInputsComplete },
       );
       emit(controller, "message_delta", {
         type: "message_delta",

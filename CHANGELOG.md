@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.17] - 2026-07-07
+
+### Fixed
+
+- **Length-cut turns keep COMPLETE tool calls runnable.** Refines the 0.1.16 `stop_reason` change (flagged in cross-provider peer review): the token cap can land exactly after a tool call's JSON finished — discarding such a call as `max_tokens` wasted a whole (possibly multi-minute) turn. `finish_reason: "length"` now maps to `tool_use` when EVERY tool call's input JSON parses to completion (streamed `input_json_delta` fragments are reassembled per block and validated), and to `max_tokens` only when the input is actually truncated. Both the JSON and streaming paths.
+
 ## [0.1.16] - 2026-07-07
 
 ### Fixed

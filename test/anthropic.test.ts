@@ -279,7 +279,7 @@ describe("anthropic translation", () => {
             tool_calls: [
               {
                 id: "tu-3",
-                function: { name: "write_file", arguments: JSON.stringify({ path: "a.html" }) },
+                function: { name: "write_file", arguments: '{"path":"a.html","content":"<html>' },
               },
             ],
           },
@@ -295,6 +295,38 @@ describe("anthropic translation", () => {
       costUsd: null,
     });
     expect(anthropic).toMatchObject({ stop_reason: "max_tokens" });
+  });
+
+  it("keeps stop_reason:tool_use when a length-cut turn still carries a COMPLETE tool call", () => {
+    // The cap can land exactly after a finished call (the model would have kept
+    // talking). The call is complete and runnable — discarding it as
+    // "max_tokens" would waste a whole (possibly multi-minute) turn.
+    const openAi = {
+      id: "r-4",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "tu-4",
+                function: { name: "write_file", arguments: JSON.stringify({ path: "a.html", content: "<html></html>" }) },
+              },
+            ],
+          },
+          finish_reason: "length",
+        },
+      ],
+    };
+    const anthropic = openAiToAnthropicResponse(openAi, "anthropic-fast", {
+      upstreamCalls: 1,
+      promptTokens: 4,
+      completionTokens: 5,
+      totalTokens: 9,
+      costUsd: null,
+    });
+    expect(anthropic).toMatchObject({ stop_reason: "tool_use" });
   });
 
   it("accepts null assistant content and converts it to an empty string", () => {
@@ -591,6 +623,30 @@ describe("anthropic route", () => {
     const text = await res.text();
     expect(text).toContain('"type":"tool_use"'); // the (partial) tool block still streams
     expect(text).toContain('"stop_reason":"max_tokens"'); // but the turn is honestly marked as cut
+  });
+
+  it("streamed COMPLETE tool call with finish_reason:length still yields stop_reason:tool_use", async () => {
+    // The token cap landed after the call's JSON finished (args split across
+    // deltas and reassembled) — the call is runnable and must not be discarded.
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          sseResponse([
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: "tu-1", function: { name: "write_file", arguments: '{"path":"a.html",' } }] } }] },
+            { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"content":"<html></html>"}' } }] } }] },
+            { choices: [{ delta: {}, finish_reason: "length" }] },
+          ]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-fast",
+      stream: true,
+      messages: [{ role: "user", content: "write the file" }],
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"stop_reason":"tool_use"');
   });
 
   it("authenticates with x-api-key header", async () => {
