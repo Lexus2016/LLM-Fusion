@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.16] - 2026-07-07
+
+### Fixed
+
+- **Synth judge-model fallback.** kimi-k2.7-code intermittently answers a tool-turn with reasoning-only / empty output (`finish_reason: "stop"`, no tool_calls, no content) even after the strict completion nudge — one model could stall a whole agent loop. After the same-synth retry, the completeness guard now makes ONE additional non-streamed attempt on the judge model (a different lineage, empirically the most reliable structured-output model in the panel). At most two recovery calls, covering both the streaming and non-streaming synth paths.
+- **Honest `stop_reason` for length-truncated tool calls.** A Write/Edit tool call cut by the token limit arrived at the Anthropic endpoint with `stop_reason: "tool_use"` and a partial `input` JSON; Claude Code then executed the broken input, failed, and escalated. `finish_reason: "length"` now maps to `stop_reason: "max_tokens"` BEFORE tool-presence domination, on both the JSON and streaming paths, so clients recover instead of running truncated tool input.
+
+### Changed
+
+- `bin/fusion-claude`: default `ANTHROPIC_SMALL_FAST_MODEL` moved `fast-kimi` → `fast-deepseek`. Claude Code fires background bursts of 80-130 small-model calls/min; on 2026-07-06 those bursts 429-starved kimi — which is also the fusion synth that writes file contents — killing large-file generation mid-loop. deepseek-v4-pro is used by no panel/synth/judge/router/simple route, so its rate-limit bucket is free to burn.
+- `fusion.yaml`: `web_search` disabled for `fusion-coder` (kept for `fusion-researcher`). Grounding added ~12s of pre-panel silence per deliberate agent turn (measured 12.7s of a 28.7s time-to-first-byte) while searching the web for things like "create page.html" — pure latency on agent tool-loops.
+
+Validated end-to-end: a pure fusion-coder agent loop produced a 3364-line / 117 KB file in 297 s (the whole file in one streamed 119 KB Write tool call); a fusion-agents loop produced a 5000-line / 169 KB file in ~21 min with zero 429s and zero synth retries.
+
 ## [0.1.15] - 2026-07-06
 
 ### Fixed
