@@ -970,8 +970,19 @@ describe("fusion strategy — synth completeness guard", () => {
 
   it("keeps the original answer when the retry is also incomplete (no infinite loop)", async () => {
     let synthCalls = 0;
+    let judgeFallbackCalls = 0;
     const up = makeUpstream((body) => {
-      if (body.model === "j") return jsonResponse(judgeOk);
+      const nudged = systemContents(body).some((c) => c.includes("stopped while still planning"));
+      if (body.model === "j") {
+        // The judge-model fallback attempt is ALSO incomplete — nothing can recover
+        // this turn, so the original (partial) answer must be kept and no further
+        // attempts made.
+        if (nudged) {
+          judgeFallbackCalls += 1;
+          return jsonResponse({ choices: [{ message: { content: "" }, finish_reason: "stop" }] });
+        }
+        return jsonResponse(judgeOk);
+      }
       if (body.model === "s") {
         synthCalls += 1;
         // Always stops mid-plan, even after the nudge.
@@ -983,7 +994,79 @@ describe("fusion strategy — synth completeness guard", () => {
     });
     const res = await fusionStrategy.execute(ctx(up.client, req()));
     await res.text();
-    expect(synthCalls).toBe(2); // one original + exactly one retry, then give up
+    expect(synthCalls).toBe(2); // one original + exactly one retry
+    expect(judgeFallbackCalls).toBe(1); // + exactly one fallback attempt, then give up
+  });
+
+  it("falls back to the judge model when the synth retry is still empty", async () => {
+    // kimi-k2.7-code intermittently answers a tool-turn with reasoning-only /
+    // empty output even after the completion nudge. A second model (the judge —
+    // a different lineage, empirically the most reliable structured-output
+    // model) must then finish the turn so agent loops don't stall on one model.
+    let synthCalls = 0;
+    let judgeFallbackCalls = 0;
+    const up = makeUpstream((body) => {
+      const nudged = systemContents(body).some((c) => c.includes("stopped while still planning"));
+      if (body.model === "j") {
+        if (!nudged) return jsonResponse(judgeOk);
+        judgeFallbackCalls += 1;
+        expect(body.stream).toBe(false); // recovery attempts are never streamed
+        return jsonResponse({ choices: [{ message: { content: "recovered-by-fallback" }, finish_reason: "stop" }] });
+      }
+      if (body.model === "s") {
+        synthCalls += 1;
+        return jsonResponse({ choices: [{ message: { content: "" }, finish_reason: "stop" }] });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    const parsed = z
+      .object({ choices: z.array(z.object({ message: z.object({ content: z.string() }) })) })
+      .parse(await res.json());
+    expect(synthCalls).toBe(2);
+    expect(judgeFallbackCalls).toBe(1);
+    expect(parsed.choices[0]?.message.content).toBe("recovered-by-fallback");
+  });
+
+  it("streaming: falls back to the judge model and delivers its recovered tool call", async () => {
+    // The agent-loop shape of the same failure: streamed synth stalls mid-plan,
+    // the same-model retry stays empty, and the judge-model fallback produces the
+    // actual tool call the loop needs to keep moving.
+    let synthCalls = 0;
+    let judgeFallbackCalls = 0;
+    const up = makeUpstream((body) => {
+      const nudged = systemContents(body).some((c) => c.includes("stopped while still planning"));
+      if (body.model === "j") {
+        if (!nudged) return jsonResponse(judgeOk);
+        judgeFallbackCalls += 1;
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                content: "",
+                tool_calls: [{ id: "c9", type: "function", function: { name: "write_file", arguments: '{"path":"b.txt"}' } }],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        });
+      }
+      if (body.model === "s") {
+        synthCalls += 1;
+        if (nudged) return jsonResponse({ choices: [{ message: { content: "" }, finish_reason: "stop" }] });
+        return sseResponse([
+          { choices: [{ delta: { reasoning: "step 1 ... let's write the file." } }] },
+          { choices: [{ delta: {}, finish_reason: "stop" }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    expect(synthCalls).toBe(2);
+    expect(judgeFallbackCalls).toBe(1);
+    expect(text).toContain("write_file");
+    expect(text).toContain("[DONE]");
   });
 
   it("does NOT retry a complete content answer that ends on a planning-like phrase", async () => {

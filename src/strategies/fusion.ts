@@ -156,7 +156,14 @@ async function runFusion(
       { model: request.model, reason: cfg.tool_mode === "bypass" ? "bypass" : "planning_turn_only" },
       "fusion: synth-only path",
     );
-    const synthResponse = await runSynth(ctx, resilience, cfg.synth, null, [], { stream, hasTools, native, promote, webContext: null });
+    const synthResponse = await runSynth(ctx, resilience, cfg.synth, null, [], {
+      stream,
+      hasTools,
+      native,
+      promote,
+      webContext: null,
+      fallbackSynth: cfg.judge !== cfg.synth ? cfg.judge : null,
+    });
     // synth-only skips the panel, so the post-synth bineval evaluation (which scores the
     // panel-synthesized answer) does not apply. Surface that to the client rather than
     // silently omitting the score header on a model the user configured bineval on.
@@ -203,7 +210,14 @@ async function runFusion(
   const analysis = await runJudge(ctx, resilience, cfg.judge, panelAnswers, timer, defaults);
 
   // SYNTH — final answer, streams when requested, the only stage with real tools.
-  const response = await runSynth(ctx, resilience, cfg.synth, analysis, panelAnswers, { stream, hasTools, native, promote, webContext });
+  const response = await runSynth(ctx, resilience, cfg.synth, analysis, panelAnswers, {
+    stream,
+    hasTools,
+    native,
+    promote,
+    webContext,
+    fallbackSynth: cfg.judge !== cfg.synth ? cfg.judge : null,
+  });
 
   // BINEVAL — optional post-synth quality evaluation. Streaming bodies are consumed by
   // the client, so we can only evaluate non-streaming JSON responses.
@@ -1093,7 +1107,14 @@ async function runSynth(
   synth: string,
   analysis: JudgeAnalysis | null,
   panelAnswers: PanelAnswer[],
-  opts: { stream: boolean; hasTools: boolean; native: boolean; promote: boolean; webContext: string | null },
+  opts: {
+    stream: boolean;
+    hasTools: boolean;
+    native: boolean;
+    promote: boolean;
+    webContext: string | null;
+    fallbackSynth?: string | null;
+  },
 ): Promise<Response> {
   if (!resilience.breaker.canAttempt(synth)) {
     logUpstreamFailure(ctx.logger, { stage: "synth", model: synth, kind: "circuit_open", latencyMs: 0 });
@@ -1281,11 +1302,14 @@ function appendSynthCompletionNudge(body: Record<string, unknown>): Record<strin
 }
 
 /**
- * One stricter, non-streamed synth retry to recover a final answer after the first
- * attempt stopped mid-plan. Returns the recovered completion data, or null if the
- * retry failed, errored, or is STILL incomplete — in which case the caller keeps the
- * original (a partial plan beats nothing, and we never loop more than once). The
- * retry does not touch the circuit breaker (same model, already counted), but its
+ * Recover a final answer after the synth stopped mid-plan: one stricter,
+ * non-streamed retry on the SAME synth model, and — if that is also empty /
+ * unusable — one attempt on `opts.fallbackSynth` (the judge model: a different
+ * lineage, empirically the most reliable structured-output model in the
+ * panel). Returns the recovered completion data, or null when every attempt
+ * failed — in which case the caller keeps the original (a partial plan beats
+ * nothing). At most two recovery calls, never more (no loops). The retries do
+ * not touch the circuit breaker (already counted for the stage), but their
  * token usage IS recorded so cost accounting stays honest.
  */
 async function retrySynthForCompletion(
@@ -1293,46 +1317,51 @@ async function retrySynthForCompletion(
   resilience: Resilience,
   synth: string,
   originalBody: Record<string, unknown>,
-  opts: { native: boolean },
+  opts: { native: boolean; fallbackSynth?: string | null },
   reason: "empty" | "planning_tail",
 ): Promise<unknown | null> {
+  const nudgedBody = appendSynthCompletionNudge(originalBody);
+
+  const attempt = async (model: string, body: Record<string, unknown>): Promise<unknown | null> => {
+    let result: ChatCompletionResult;
+    try {
+      result = await resilience.limiter(() =>
+        invokeUpstream(ctx.client, body, { stream: false, native: opts.native, signal: ctx.signal }),
+      );
+    } catch (err) {
+      ctx.logger.warn(
+        { stage: "synth", model, err: err instanceof Error ? err.message : String(err) },
+        "fusion: synth completion retry threw",
+      );
+      return null;
+    }
+    ctx.usage?.record(model, result);
+    if (result.kind !== "json" || result.status >= 400) {
+      ctx.logger.warn({ stage: "synth", model }, "fusion: synth completion retry not usable");
+      return null;
+    }
+    if (detectIncompleteSynth(result.data) !== null) {
+      ctx.logger.warn({ stage: "synth", model }, "fusion: synth completion retry still incomplete");
+      return null;
+    }
+    ctx.logger.info({ stage: "synth", model, reason }, "fusion: synth completion retry recovered the final answer");
+    return result.data;
+  };
+
   ctx.logger.warn(
     { stage: "synth", model: synth, reason },
     "fusion: synth stopped mid-plan; one stricter retry for the final answer",
   );
-  const retryBody = appendSynthCompletionNudge(originalBody);
-  let result: ChatCompletionResult;
-  try {
-    result = await resilience.limiter(() =>
-      invokeUpstream(ctx.client, retryBody, { stream: false, native: opts.native, signal: ctx.signal }),
-    );
-  } catch (err) {
-    ctx.logger.warn(
-      { stage: "synth", model: synth, err: err instanceof Error ? err.message : String(err) },
-      "fusion: synth completion retry threw; keeping original answer",
-    );
-    return null;
-  }
-  ctx.usage?.record(synth, result);
-  if (result.kind !== "json" || result.status >= 400) {
-    ctx.logger.warn(
-      { stage: "synth", model: synth },
-      "fusion: synth completion retry not usable; keeping original answer",
-    );
-    return null;
-  }
-  if (detectIncompleteSynth(result.data) !== null) {
-    ctx.logger.warn(
-      { stage: "synth", model: synth },
-      "fusion: synth completion retry still incomplete; keeping original answer",
-    );
-    return null;
-  }
-  ctx.logger.info(
-    { stage: "synth", model: synth, reason },
-    "fusion: synth completion retry recovered the final answer",
+  const recovered = await attempt(synth, nudgedBody);
+  if (recovered !== null) return recovered;
+
+  const fallback = opts.fallbackSynth ?? null;
+  if (fallback === null || fallback === synth) return null;
+  ctx.logger.warn(
+    { stage: "synth", model: synth, fallback_model: fallback, reason },
+    "fusion: synth retry failed; one fallback attempt on the judge model",
   );
-  return result.data;
+  return attempt(fallback, { ...nudgedBody, model: fallback });
 }
 
 const SynthStreamChunkSchema = z
@@ -1426,7 +1455,7 @@ function makeSynthStreamCompletenessGuard(
   resilience: Resilience,
   synth: string,
   originalBody: Record<string, unknown>,
-  opts: { native: boolean },
+  opts: { native: boolean; fallbackSynth?: string | null },
 ): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
