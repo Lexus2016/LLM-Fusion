@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.21] - 2026-07-07
+
+### Fixed
+
+- **`<think>` tags no longer leak across SSE fragment boundaries.** The think-tag stripper ran per stream fragment, so an SSE boundary splitting the tag itself (`"<th"` + `"ink>"`) leaked the literal tag into the visible output, and a block whose body arrived in later fragments leaked the private reasoning as answer text. A stateful stream filter (`createThinkTagStreamFilter`) now carries a possible partial tag across fragment boundaries, suppresses everything inside an open block until its close tag, strips orphan close tags, and surfaces a false-partial tail (e.g. a literal `"<tho…"`) as text instead of swallowing it. Wired into both streaming paths — the reasoning-promotion transform (OpenAI clients) and the Anthropic stream transform (Claude Code) — with separate filter instances per source field, so an unterminated block in `reasoning` can never suppress real `content`; a reasoning-phase false partial is merged before the first content fragment, preserving order. The synthetic tail chunk before `[DONE]` is framed as its own blank-line-closed SSE event and carries the stream's `id`/`model` metadata (pre-tag adversarial review findings).
+
 ## [0.1.20] - 2026-07-07
 
 ### Added
