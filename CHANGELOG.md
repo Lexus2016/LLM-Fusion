@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.19] - 2026-07-07
+
+### Added
+
+- **Per-model concurrency budgets.** All three consilium advisors independently flagged head-of-line blocking: one global `p-limit` meant a burst of background small-model calls occupied the whole FIFO queue ahead of interactive fusion turns. Every real upstream model now gets its own gate in front of the global limiter (`resilience.limiterFor(model)`), with strict model-gate → global-slot acquisition order (uniform ordering — no lock cycle; confirmed deadlock-free in a pre-tag adversarial review). A saturated model holds at most its budget of global-queue positions. Config: `upstream.per_model_concurrency` (map, keyed by real upstream model name) and `upstream.per_model_concurrency_default`; both unset = behavior identical to the previous single global limiter. The shipped `fusion.yaml` caps `deepseek-v4-pro` (the Claude Code background-call carrier) at 2. All strategy fallbacks wire the same budgets via `resilienceForUpstream`, and `/v1/models` capability discovery is keyed too.
+
 ## [0.1.18] - 2026-07-07
 
 ### Fixed
