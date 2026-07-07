@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.20] - 2026-07-07
+
+### Added
+
+- **Russian and Ukrainian READMEs.** Full translations (`README.ru.md`, `README.ua.md`) pinned to v0.1.19, with a language switcher in all three files.
+
+### Changed
+
+- **README refreshed for v0.1.16–19.** Fixed the stale model lineup (`gemini-3-flash-preview` → `gpt-oss:120b` in the fusion-coder panel; `glm-5.2` on the fusion-agents simple route), documented the agent-loop reliability features (synth completeness guard with judge fallback + SSE keepalive, honest `max_tokens` stop_reason, per-model concurrency budgets, separated background-traffic class), updated concurrency/timeout numbers to the shipped presets, added `FUSION_SYNTH_RECOVERY_PING_MS` to the environment table, removed a dangling Docker cross-reference.
+
 ## [0.1.19] - 2026-07-07
 
 ### Added
