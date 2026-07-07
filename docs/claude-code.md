@@ -39,7 +39,7 @@ If you prefer not to use the launcher, set these environment variables and then 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080      # proxy root — do NOT add /v1
 export ANTHROPIC_MODEL=fusion-agents                  # virtual model from fusion.yaml
-export ANTHROPIC_SMALL_FAST_MODEL=fast-kimi           # cheap model for quick tasks
+export ANTHROPIC_SMALL_FAST_MODEL=fast-deepseek       # cheap model for quick tasks (see note below)
 export ANTHROPIC_AUTH_TOKEN=local-no-auth             # or your FUSION_PROXY_TOKEN
 claude
 ```
@@ -76,7 +76,7 @@ The value of `ANTHROPIC_MODEL` must be a **virtual model name** defined in `fusi
 | `fusion-researcher` | Research, analysis, reports | `fusion` |
 | `fusion-agents` | Autonomous agent loops (default) | `smart` |
 
-`ANTHROPIC_SMALL_FAST_MODEL` should point to a cheap `single` model, e.g. `fast-kimi`, `fast-glm`, or `fast-deepseek`. Claude Code uses this for lightweight tasks like summarizing tool output or quick lookups. The shipped `fusion.yaml` already defines those fast singles.
+`ANTHROPIC_SMALL_FAST_MODEL` should point to a cheap `single` model — the launcher default is `fast-deepseek`. **Do not point it at a model that also serves as a fusion synth or panel member** (e.g. `fast-kimi` → kimi-k2.7-code, the fusion-coder synth): Claude Code fires background bursts of 80–130 small-model calls/min, and those bursts can rate-limit (429) the shared upstream model and kill the main loop mid-task. Claude Code uses this model for lightweight tasks like summarizing tool output or quick lookups. The shipped `fusion.yaml` already defines the fast singles.
 
 ## What gets translated
 
