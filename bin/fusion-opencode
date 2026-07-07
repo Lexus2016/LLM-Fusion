@@ -2,10 +2,10 @@
 # fusion-opencode — launch OpenCode wired to the llm-fusion Fusion Proxy with a chosen model.
 #
 # Usage:
-#   fusion-opencode <model> [opencode args...]
-#   fusion-opencode fusion-1                  # interactive TUI with Fusion 1
-#   fusion-opencode smart-1                    # interactive TUI with Smart routing
-#   fusion-opencode smart-1 run "Fix bug X"    # headless one-shot
+#   fusion-opencode [model] [opencode args...]   # default model: fusion-agents
+#   fusion-opencode                              # interactive TUI, smart agent routing
+#   fusion-opencode fusion-coder                 # interactive TUI, full coding panel
+#   fusion-opencode fusion-agents run "Fix bug X"  # headless one-shot
 #
 # What it does:
 #   1. starts the proxy (npm start) if it is not already answering on /health;
@@ -22,7 +22,7 @@ set -euo pipefail
 # Otherwise `fusion-opencode --some-flag` would swallow `--some-flag` as the
 # model name and drop the flag; a leading `-...` means "no model given — use
 # the default and pass every arg straight through to opencode".
-MODEL="fusion-1"
+MODEL="fusion-agents"
 if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
   MODEL="$1"
   shift
