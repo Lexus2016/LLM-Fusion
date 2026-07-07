@@ -264,6 +264,39 @@ describe("anthropic translation", () => {
     });
   });
 
+  it("maps a length-truncated tool_calls response to stop_reason:max_tokens, not tool_use", () => {
+    // Regression: a Write/Edit tool call cut by max_tokens arrives with
+    // finish_reason "length" and a tool_calls block whose arguments JSON is
+    // missing its tail. Reporting stop_reason "tool_use" makes Claude Code
+    // execute the truncated input; "max_tokens" lets it recover instead.
+    const openAi = {
+      id: "r-3",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "tu-3",
+                function: { name: "write_file", arguments: JSON.stringify({ path: "a.html" }) },
+              },
+            ],
+          },
+          finish_reason: "length",
+        },
+      ],
+    };
+    const anthropic = openAiToAnthropicResponse(openAi, "anthropic-fast", {
+      upstreamCalls: 1,
+      promptTokens: 4,
+      completionTokens: 5,
+      totalTokens: 9,
+      costUsd: null,
+    });
+    expect(anthropic).toMatchObject({ stop_reason: "max_tokens" });
+  });
+
   it("accepts null assistant content and converts it to an empty string", () => {
     const req: AnthropicRequest = {
       model: "anthropic-fast",
@@ -533,6 +566,31 @@ describe("anthropic route", () => {
     const text = await res.text();
     expect(text).toContain('"type":"tool_use"'); // tool block was emitted
     expect(text).toContain('"stop_reason":"tool_use"'); // and reflected despite finish:stop
+  });
+
+  it("streamed tool_calls cut by finish_reason:length yield stop_reason:max_tokens", async () => {
+    // Regression: a big streamed tool call truncated by the token limit must NOT
+    // be presented as a runnable tool_use — its input_json_delta JSON is missing
+    // its tail. stop_reason:"max_tokens" tells the client the turn was cut.
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          sseResponse([
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: "tu-1", function: { name: "write_file", arguments: '{"path":"a.html","content":"<html>' } }] } }] },
+            { choices: [{ delta: {}, finish_reason: "length" }] },
+          ]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-fast",
+      stream: true,
+      messages: [{ role: "user", content: "write the file" }],
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"type":"tool_use"'); // the (partial) tool block still streams
+    expect(text).toContain('"stop_reason":"max_tokens"'); // but the turn is honestly marked as cut
   });
 
   it("authenticates with x-api-key header", async () => {

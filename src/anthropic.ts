@@ -487,15 +487,20 @@ function finishReasonToAnthropic(
   reason: string | null | undefined,
   contentBlocks: Array<Record<string, unknown>>,
 ): string | null {
-  // tool_use DOMINATES: if the turn produced a tool call, it ended to run that tool,
-  // regardless of the upstream finish_reason. Some upstreams send "stop" (or null on a
-  // truncated stream) alongside tool_calls; checking tool presence first keeps the
-  // Anthropic stop_reason correct so the Claude Code agent loop actually runs the tool.
+  // Truncation trumps everything, tool blocks included: a tool call cut by the
+  // token limit is NOT runnable — its input JSON is missing the tail, and
+  // reporting "tool_use" would make Claude Code execute that broken input.
+  // "max_tokens" tells the client the turn was cut so it can recover.
+  if (reason === "length") return "max_tokens";
+  // tool_use DOMINATES the rest: if the turn produced a tool call, it ended to
+  // run that tool, regardless of the upstream finish_reason. Some upstreams send
+  // "stop" (or null on a truncated stream) alongside tool_calls; checking tool
+  // presence keeps the Anthropic stop_reason correct so the Claude Code agent
+  // loop actually runs the tool.
   if (reason === "tool_calls" || contentBlocks.some((b) => b.type === "tool_use")) {
     return "tool_use";
   }
   if (reason === "stop") return "end_turn";
-  if (reason === "length") return "max_tokens";
   return null;
 }
 
