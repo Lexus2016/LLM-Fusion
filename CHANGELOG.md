@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.22] - 2026-07-07
+
+### Added
+
+- **`partial_coverage` judge dimension.** The judge now also names the aspects of the request that SOME expert answers cover and others miss (and which expert covered each), and the synth is instructed to take each such aspect from the covering expert instead of averaging it away. Closes the one dimension missing versus OpenRouter Fusion's five-dimension judge (accepted item #2 of the comparative audit, verification 2).
+
 ## [0.1.21] - 2026-07-07
 
 ### Fixed
