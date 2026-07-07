@@ -1069,6 +1069,118 @@ describe("fusion strategy — synth completeness guard", () => {
     expect(text).toContain("[DONE]");
   });
 
+  it("retries when the synth 'answer' is only inline <think> narration", async () => {
+    // DeepSeek-R1 / QwQ-style models put their reasoning INSIDE `content` as
+    // <think> blocks. When the whole content strips to nothing, there is no
+    // artifact — the guard must fire exactly as for an empty answer.
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        const nudged = systemContents(body).some((c) => c.includes("stopped while still planning"));
+        if (nudged) return jsonResponse({ choices: [{ message: { content: "REAL ANSWER" }, finish_reason: "stop" }] });
+        return jsonResponse({
+          choices: [
+            { message: { content: "<think>step 1 ... let's produce the final answer.</think>" }, finish_reason: "stop" },
+          ],
+        });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    const parsed = z
+      .object({ choices: z.array(z.object({ message: z.object({ content: z.string() }) })) })
+      .parse(await res.json());
+    expect(synthCalls).toBe(2);
+    expect(parsed.choices[0]?.message.content).toBe("REAL ANSWER");
+  });
+
+  it("does not adopt a length-cut retry with truncated tool JSON; falls back to the judge", async () => {
+    // The strict retry can ITSELF hit the token cap mid tool call. Adopting it
+    // would deliver a paid-for but unrunnable artifact — the fallback model must
+    // get its attempt instead.
+    let synthCalls = 0;
+    let judgeFallbackCalls = 0;
+    const up = makeUpstream((body) => {
+      const nudged = systemContents(body).some((c) => c.includes("stopped while still planning"));
+      if (body.model === "j") {
+        if (!nudged) return jsonResponse(judgeOk);
+        judgeFallbackCalls += 1;
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                content: "",
+                tool_calls: [{ id: "cF", type: "function", function: { name: "write_file", arguments: '{"path":"ok.txt"}' } }],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        });
+      }
+      if (body.model === "s") {
+        synthCalls += 1;
+        if (nudged) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  content: "",
+                  tool_calls: [{ id: "cT", type: "function", function: { name: "write_file", arguments: '{"path":"tru' } }],
+                },
+                finish_reason: "length",
+              },
+            ],
+          });
+        }
+        return jsonResponse({ choices: [{ message: { content: "" }, finish_reason: "stop" }] });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ tools: TOOLS })));
+    const text = await res.text();
+    expect(synthCalls).toBe(2);
+    expect(judgeFallbackCalls).toBe(1);
+    expect(text).toContain('"cF"'); // the fallback's complete tool call is delivered
+    expect(text).not.toContain('"cT"'); // the truncated retry is not
+  });
+
+  it("streaming: emits SSE keepalive comments while the recovery retry runs", async () => {
+    // The recovery retry runs synchronously inside the stream's flush — during
+    // it the client would otherwise see total silence and can time out. SSE
+    // comment lines (": keepalive") are protocol-legal no-ops that keep the
+    // connection warm; parsers ignore them.
+    process.env.FUSION_SYNTH_RECOVERY_PING_MS = "10";
+    try {
+      let synthCalls = 0;
+      const up = makeUpstream(async (body) => {
+        if (body.model === "j") return jsonResponse(judgeOk);
+        if (body.model === "s") {
+          synthCalls += 1;
+          const nudged = systemContents(body).some((c) => c.includes("stopped while still planning"));
+          if (nudged) {
+            await new Promise((r) => setTimeout(r, 60));
+            return jsonResponse({ choices: [{ message: { content: "recovered late" }, finish_reason: "stop" }] });
+          }
+          return sseResponse([
+            { choices: [{ delta: { reasoning: "planning ... let's write the file." } }] },
+            { choices: [{ delta: {}, finish_reason: "stop" }] },
+          ]);
+        }
+        return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+      });
+      const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true })));
+      const text = await res.text();
+      expect(synthCalls).toBe(2);
+      expect(text).toContain(": keepalive"); // pings flowed during the silent recovery
+      expect(text).toContain("recovered late");
+      expect(text.trimEnd().endsWith("data: [DONE]")).toBe(true);
+    } finally {
+      delete process.env.FUSION_SYNTH_RECOVERY_PING_MS;
+    }
+  });
+
   it("does NOT retry a complete content answer that ends on a planning-like phrase", async () => {
     // Regression: a real `content` answer must never be second-guessed, even if its
     // tail matches a planning marker — only reasoning-only answers are suspect.

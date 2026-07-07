@@ -1276,15 +1276,51 @@ function detectIncompleteSynth(data: unknown): "empty" | "planning_tail" | null 
   if (!choice || choice.finish_reason !== "stop") return null;
   const toolCalls = choice.message?.tool_calls;
   if (Array.isArray(toolCalls) && toolCalls.length > 0) return null;
-  const answer = (extractAnswer(data) ?? "").trim();
+  // Inline <think> blocks are narration, not artifact: R1/QwQ-style models put
+  // their reasoning INSIDE `content`, so both the answer and the raw-content
+  // check below must judge the STRIPPED text or a pure think-block "answer"
+  // sails through as complete. Known trade-off: an answer that legitimately
+  // consists ENTIRELY of literal <think> markup would be misjudged as empty —
+  // that costs one wasted recovery attempt (the original is kept when recovery
+  // fails), never content loss, and is far rarer than the R1 stall it fixes.
+  const answer = stripThinkingTags(extractAnswer(data) ?? "").trim();
   if (answer.length === 0) return "empty";
   // A real `content` answer is authoritative — leave it alone regardless of its tail.
   const rawContent = typeof choice.message?.content === "string" ? choice.message.content : "";
-  if (rawContent.trim().length > 0) return null;
+  if (stripThinkingTags(rawContent).trim().length > 0) return null;
   // Reasoning-only answer that trails off on planning narration -> incomplete.
   const tail = answer.slice(-80).toLowerCase();
   if (SYNTH_PLANNING_TAIL_MARKERS.some((m) => tail.includes(m))) return "planning_tail";
   return null;
+}
+
+/**
+ * A completion whose finish_reason is "length" AND whose tool_calls carry
+ * unparseable (truncated) arguments. Prose cut by the cap is still worth
+ * delivering (the honest "length" travels with it), but a broken tool call is
+ * not runnable — a recovery attempt that ends this way must yield to the
+ * fallback model instead of being adopted. Non-string `arguments` are treated
+ * the same way ON PURPOSE: they can be neither validated here nor safely
+ * streamed to OpenAI clients (input_json_delta expects string fragments), so
+ * yielding to the fallback is the safe move.
+ */
+function lengthCutMidToolCall(data: unknown): boolean {
+  const parsed = SynthCompletionSchema.safeParse(data);
+  if (!parsed.success) return false;
+  const choice = parsed.data.choices?.[0];
+  if (!choice || choice.finish_reason !== "length") return false;
+  const toolCalls = choice.message?.tool_calls;
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return false;
+  return !toolCalls.every((tc) => {
+    const args = (tc as { function?: { arguments?: unknown } })?.function?.arguments;
+    if (typeof args !== "string") return false;
+    try {
+      JSON.parse(args);
+      return true;
+    } catch {
+      return false;
+    }
+  });
 }
 
 const SYNTH_COMPLETION_NUDGE =
@@ -1342,6 +1378,13 @@ async function retrySynthForCompletion(
     }
     if (detectIncompleteSynth(result.data) !== null) {
       ctx.logger.warn({ stage: "synth", model }, "fusion: synth completion retry still incomplete");
+      return null;
+    }
+    if (lengthCutMidToolCall(result.data)) {
+      ctx.logger.warn(
+        { stage: "synth", model },
+        "fusion: synth completion retry was length-cut mid tool call; not usable",
+      );
       return null;
     }
     ctx.logger.info({ stage: "synth", model, reason }, "fusion: synth completion retry recovered the final answer");
@@ -1540,12 +1583,57 @@ function makeSynthStreamCompletenessGuard(
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         return;
       }
-      const recovered = await retrySynthForCompletion(ctx, resilience, synth, originalBody, opts, incomplete);
+      const recovered = await runRecoveryWithKeepalive(ctx, resilience, synth, originalBody, opts, incomplete, controller, encoder);
       const replacementLine = recovered !== null ? synthRecoveredChunkLine(recovered, meta) : terminalLine;
       controller.enqueue(encoder.encode(replacementLine + "\n\n"));
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
     },
   });
+}
+
+/**
+ * Run the synth recovery retry while keeping the client connection warm: the
+ * retry is synchronous and silent (up to two non-streamed upstream calls), so
+ * SSE comment lines (": keepalive") are emitted on an interval — protocol-legal
+ * no-ops every parser ignores. Interval override for tests / ops via
+ * FUSION_SYNTH_RECOVERY_PING_MS. Any unexpected throw fails OPEN: the caller
+ * keeps the original terminal chunk, never a broken stream.
+ */
+async function runRecoveryWithKeepalive(
+  ctx: StrategyContext,
+  resilience: Resilience,
+  synth: string,
+  originalBody: Record<string, unknown>,
+  opts: { native: boolean; fallbackSynth?: string | null },
+  incomplete: "empty" | "planning_tail",
+  controller: TransformStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder,
+): Promise<unknown | null> {
+  // 5s default: comfortably under common intermediary idle timeouts (nginx 60s,
+  // Cloudflare ~100s, undici bodyTimeout 300s) with margin for stricter setups.
+  // Env override must be a positive number; anything else falls back to the
+  // default (there is deliberately no "0 = off" — a silent recovery is the
+  // exact failure mode this exists to prevent).
+  const envPing = Number(process.env.FUSION_SYNTH_RECOVERY_PING_MS ?? "");
+  const pingMs = Number.isFinite(envPing) && envPing > 0 ? envPing : 5_000;
+  const ping = setInterval(() => {
+    try {
+      controller.enqueue(encoder.encode(": keepalive\n\n"));
+    } catch {
+      /* stream already closed — nothing to keep alive */
+    }
+  }, pingMs);
+  try {
+    return await retrySynthForCompletion(ctx, resilience, synth, originalBody, opts, incomplete);
+  } catch (err) {
+    ctx.logger.warn(
+      { stage: "synth", model: synth, err: err instanceof Error ? err.message : String(err) },
+      "fusion: synth stream recovery threw; delivering the original terminal chunk",
+    );
+    return null;
+  } finally {
+    clearInterval(ping);
+  }
 }
 
 async function attachBinevalHeaders(
