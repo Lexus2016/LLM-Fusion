@@ -117,11 +117,15 @@ models:
     # A failed search degrades silently to an ungrounded panel. Respects
     # fusion_planning_turn_only (no web search on mid-loop tool-result turns).
     web_search:
-      enabled: true
+      enabled: false           # OFF for the coder (2026-07-07): agent tool-loops route here, and
+                               # grounding added ~12s of pre-panel silence per deliberate turn
+                               # (measured 12.7s of a 28.7s time-to-first-byte) while searching
+                               # for things like "create page.html" — pure latency, no value.
+                               # fusion-researcher keeps grounding ON (freshness matters there).
       max_results: 3           # Tavily results to fetch (1-10)
       timeout_s: 20            # per-search timeout (< 60)
       max_context_chars: 4000  # cap on the injected context block
-    
+
   # fusion-researcher — research, analysis, reports. Fusion for breadth.
   #   P2: kimi 15 (flawless, BEST WRITER) | glm-5.2 14 (fast, best framing) |
   #   gpt-oss:120b 13 (most exhaustive coverage + Western lineage).

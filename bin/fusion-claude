@@ -15,7 +15,7 @@
 # Env:
 #   FUSION_PROXY_URL           override proxy URL (default http://127.0.0.1:8080)
 #   FUSION_PROXY_TOKEN         if your proxy requires client auth, used as ANTHROPIC_AUTH_TOKEN
-#   ANTHROPIC_SMALL_FAST_MODEL override the fast model Claude uses for light tasks (default fast-kimi)
+#   ANTHROPIC_SMALL_FAST_MODEL override the fast model Claude uses for light tasks (default fast-deepseek)
 set -euo pipefail
 
 # The first positional arg selects the model, but ONLY when it is not a flag.
@@ -59,7 +59,13 @@ fi
 # 2. wire Claude Code to the proxy -------------------------------------------
 export ANTHROPIC_BASE_URL="$PROXY_URL"
 export ANTHROPIC_MODEL="$MODEL"
-export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-fast-kimi}"
+# The small/fast model must NOT share a rate-limit bucket with anything the
+# main loop depends on: Claude Code fires background bursts of 80-130 small
+# calls/min, and on 2026-07-06 those bursts 429-starved kimi-k2.7-code — which
+# is also the fusion-coder SYNTH that writes file contents — killing large-file
+# generation mid-loop. deepseek-v4-pro is used by no panel, synth, judge,
+# router, or simple route, so its rate limit is free to burn.
+export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-fast-deepseek}"
 export ANTHROPIC_AUTH_TOKEN="${FUSION_PROXY_TOKEN:-local-no-auth}"
 
 # A user-level ~/.claude/settings.json `env` block (e.g. a personal
