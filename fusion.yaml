@@ -75,29 +75,30 @@ models:
 
   # fusion-coder — programming, planning, audit. Fusion = multiple viewpoints
   #   (coding/architecture decisions genuinely benefit from diverse takes).
-  #   P1: glm-5.2 14 (best JS-concurrency reasoning) | kimi 13 (most complete
-  #   impl) | gpt-oss:120b (OpenAI lineage — Western decorrelator). gemini-3-flash
-  #   was the original 3rd member, but it returns 400 "Function call is missing a
-  #   thought_signature in functionCall parts" on every panel request carrying
-  #   tool-call history from other models (i.e. every agent-loop step), and the
-  #   panel drops it SILENTLY (extractAnswer -> null) — so fusion-coder ran at 2/3.
-  #   gpt-oss handles foreign tool-call history cleanly (verified 3/3 panel-shaped).
+  #   Panel history: P1 (2026-06-27) was glm+kimi+gpt-oss; gpt-oss's 131K ctx became
+  #   the fusion-agents context bottleneck, so it was swapped for mistral-large-3:675b
+  #   (2026-07-08, 262K ctx). Panel changed again same day to the 4-model lineup below
+  #   (glm-5.2 dropped from the panel, stays judge+synth).
+  #   gemini-3-flash previously 400'd with "missing thought_signature in functionCall
+  #   parts" on panel requests carrying foreign tool-call history (every agent-loop
+  #   step) — a 2026-07-08 spot-check (2 synthetic multi-turn probes, with and without
+  #   an active tools schema) did NOT reproduce the 400, but this is not exhaustive;
+  #   watch the `tool-turn terminal state` log line in real agent-loop sessions.
   fusion-coder:
     strategy: fusion
-    panel: [glm-5.2, kimi-k2.7-code, mistral-large-3:675b]   # Mistral lineage (Western decorrelator).
-                                      # CHANGED 2026-07-08: gpt-oss:120b (131K ctx) was the context
-                                      # bottleneck — it capped the advertised fusion-agents window at
-                                      # 131K while every other member has >=262K. mistral-large-3:675b
-                                      # keeps the Western-lineage decorrelation (Mistral vs the two
-                                      # Chinese labs), has 262K ctx (advertised window now 262K, the
-                                      # kimi bound), accepts foreign tool-call history (panel-shaped
-                                      # probe: 200 in 7s, correct minimal-fix answer), and is a larger
-                                      # model (675B MoE vs 120B). Candidates rejected: nemotron-3-super
-                                      # (120s timeout on the same probe), gemma4:31b (too small a
-                                      # calibre for the panel), gemini-3-flash (thought_signature 400).
-                                      # NOTE: panel-member swap after the fusion-lift bench — quality
-                                      # delta unmeasured; it is one voice of three weighed by the judge,
-                                      # so the blast radius is bounded. Re-run bench/ to re-verify.
+    panel: [kimi-k2.7-code, deepseek-v4-flash, gemini-3-flash-preview, qwen3-coder-next]
+    # panel: [kimi-k2.7-code, minimax-m3, gpt-oss:120b]   # earlier 3-model alternative, unused
+    # Benchmark (bench/fusion-bench.mjs, 15/15 tasks, this panel): the fused answer beat
+    # every panel member AND solo glm-5.2 on the 9/15 tasks that completed cleanly
+    # (29.56/30 vs best member 26.67/30) — the panel/judge/synth mechanism is sound.
+    # The other 6/15 tasks were dragged down by a separate synth bug (the synth
+    # narrating its own reasoning — "Expert 1 says X... I will provide..." — into the
+    # visible answer, sometimes exhausting the token budget before a real answer),
+    # fixed in src/strategies/fusion.ts (SYNTH_DIRECT_ANSWER_DIRECTIVE, 2026-07-08).
+    # kimi-k2.7-code is the weakest panel voice in this bench (17.00/30) — prone to
+    # long, rambling generations that eat its own token budget; no per-panel-member
+    # request_overrides mechanism exists yet to throttle it (only single/smart.simple
+    # support request_overrides — see src/config.ts).
     judge: glm-5.2                    # most reliable structured-JSON (router shoot-out) -> fewer judge-parse failures
     synth: glm-5.2                    # CHANGED 2026-07-07 (fusion-lift bench, docs/llm-fusion-audit.md):
                                       # as synth, kimi emitted 17-19k-char draft-style output on factual/
