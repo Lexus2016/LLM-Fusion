@@ -22,6 +22,11 @@ const SingleModelSchema = z
     target: z.string().min(1),
     // Per-model override of `defaults.promote_reasoning_to_content`.
     promote_reasoning_to_content: z.boolean().optional(),
+    // Extra request-body fields merged into every upstream call for this model
+    // (e.g. { reasoning_effort: "none" } to suppress a thinking model's
+    // deliberation on mechanical agent steps). Core keys (model, messages,
+    // stream, tools, tool_choice) are protected and cannot be overridden.
+    request_overrides: z.record(z.string(), z.unknown()).optional(),
   })
   .strict();
 
@@ -100,7 +105,15 @@ const FusionModelSchema = z
   .strict();
 
 /** Inline single-strategy block usable inside a `smart` model's `simple` slot. */
-const SimpleBlockSchema = z.object({ target: z.string().min(1) }).strict();
+const SimpleBlockSchema = z
+  .object({
+    target: z.string().min(1),
+    // Same semantics as SingleModelSchema.request_overrides — flows through to
+    // the resolved single config so the smart simple route can e.g. suppress a
+    // thinking model's deliberation ({ reasoning_effort: "none" }).
+    request_overrides: z.record(z.string(), z.unknown()).optional(),
+  })
+  .strict();
 
 /** Inline fusion-strategy block usable inside a `smart` model's `fusion` slot. */
 const FusionBlockSchema = z

@@ -410,7 +410,7 @@ async function classifyUncached(
 function resolveSimple(ctx: StrategyContext, cfg: SmartModelConfig): SingleModelConfig {
   const ref = cfg.simple;
   if (typeof ref !== "string") {
-    return { strategy: "single", target: ref.target };
+    return { strategy: "single", target: ref.target, request_overrides: ref.request_overrides };
   }
   const target = ctx.config.models[ref];
   if (!target || target.strategy !== "single") {

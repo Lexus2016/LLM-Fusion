@@ -32,6 +32,15 @@ const config = parseConfig({
       simple: "fast-1",
       fusion: "fusion-1",
     },
+    // Inline simple slot carrying request_overrides (the fusion-agents shape):
+    // the overrides must flow through resolveSimple into the single call body.
+    "smart-overrides": {
+      strategy: "smart",
+      router: "rt",
+      default: "simple",
+      simple: { target: "deepseek", request_overrides: { reasoning_effort: "none" } },
+      fusion: { panel: ["p1", "p2", "p3"], judge: "jdg", synth: "syn" },
+    },
     "smart-default-fusion": {
       strategy: "smart",
       router: "rt",
@@ -216,6 +225,17 @@ describe("smart strategy", () => {
     const routerBodies = up.routerBodies();
     expect(routerBodies).toHaveLength(1); // exactly one router call
     expect(routerBodies[0]?.stream).not.toBe(true); // never streamed
+  });
+
+  it("inline simple request_overrides flow through to the routed single call body", async () => {
+    const up = makeUpstream(chatWith(routeSimple));
+    const res = await smartStrategy.execute(ctx(up.client, req("smart-overrides"), "smart-overrides"));
+    expect(res.status).toBe(200);
+    const simpleBody = up.recorded.find((b) => b.model === "deepseek");
+    expect(simpleBody).toBeDefined();
+    expect((simpleBody as Record<string, unknown>).reasoning_effort).toBe("none"); // override reached the upstream call
+    const routerBody = up.routerBodies()[0];
+    expect((routerBody as Record<string, unknown>).reasoning_effort).toBeUndefined(); // router call untouched
   });
 
   it("escalates to fusion on a failing tool result WITHOUT calling the router", async () => {

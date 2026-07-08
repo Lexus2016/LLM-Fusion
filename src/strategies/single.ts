@@ -7,6 +7,7 @@ import {
   logUpstreamFailure,
 } from "../attribution";
 import { promoteReasoningNonStream, makeReasoningPromotionTransform } from "../reasoning";
+import { detectIncompleteToolTurn, makeToolTurnGuardStream, retryToolTurn } from "./tool_turn_guard";
 
 /**
  * `single` strategy — 1:1 passthrough to a single target model. Supports both
@@ -32,10 +33,19 @@ export const singleStrategy: Strategy = {
     }
     const target = ctx.modelConfig.target;
     const stream = ctx.request.stream === true;
+    // Agentic context: the tool-turn completeness guard runs ONLY when the
+    // request carried tools. Tool-less / mechanical requests stay byte-identical
+    // passthrough (no extra latency, no retry surface).
+    const hasTools = Array.isArray(ctx.request.tools) && ctx.request.tools.length > 0;
 
     // Forward the request verbatim, only rewriting the virtual model name to
-    // the resolved real upstream target.
-    const body: Record<string, unknown> = { ...ctx.request, model: target };
+    // the resolved real upstream target. Per-model request_overrides (e.g.
+    // { reasoning_effort: "none" } to keep a thinking model from deliberating
+    // for minutes on mechanical agent steps) are merged in, with the core
+    // request keys protected so an override can never corrupt the call shape.
+    const overrides: Record<string, unknown> = { ...(ctx.modelConfig.request_overrides ?? {}) };
+    for (const key of ["model", "messages", "stream", "tools", "tool_choice"]) delete overrides[key];
+    const body: Record<string, unknown> = { ...ctx.request, ...overrides, model: target };
     const resilience = ctx.resilience;
 
     if (resilience && !resilience.breaker.canAttempt(target)) {
@@ -103,14 +113,33 @@ export const singleStrategy: Strategy = {
         ...STREAM_HEADERS_BASE,
         "content-type": result.contentType ?? "text/event-stream",
       };
-      const body =
-        promote && result.status < 400 && result.body
-          ? result.body.pipeThrough(makeReasoningPromotionTransform())
-          : result.body;
-      return new Response(body, { status: result.status, headers });
+      let streamBody = result.body;
+      // Tool-turn completeness guard (agentic requests only). Runs BEFORE
+      // promotion so it sees the raw reasoning/content/tool_calls: a reasoning
+      // model that narrates the next action ("let me write the file now") and
+      // stops with no tool_call is caught and recovered into the tool call. A
+      // healthy stream is forwarded unchanged, so first-token latency is untouched.
+      // Reader-driven (not pipeThrough) so a MID-FLIGHT upstream cut — the
+      // large-file "terminated" failure — is caught and recovered too.
+      if (hasTools && result.status < 400 && streamBody) {
+        streamBody = makeToolTurnGuardStream(ctx, resilience, target, body, streamBody);
+      }
+      if (promote && result.status < 400 && streamBody) {
+        streamBody = streamBody.pipeThrough(makeReasoningPromotionTransform());
+      }
+      return new Response(streamBody, { status: result.status, headers });
     }
 
-    const data = promote && result.status < 400 ? promoteReasoningNonStream(result.data) : result.data;
+    // Non-stream tool-turn guard: same recovery for a narrate-and-stop turn.
+    let responseData = result.data;
+    if (hasTools && result.status < 400) {
+      const incomplete = detectIncompleteToolTurn(responseData);
+      if (incomplete !== null) {
+        const recovered = await retryToolTurn(ctx, resilience, target, body, incomplete);
+        if (recovered !== null) responseData = recovered;
+      }
+    }
+    const data = promote && result.status < 400 ? promoteReasoningNonStream(responseData) : responseData;
     return new Response(JSON.stringify(data ?? null), {
       status: result.status,
       headers: { "content-type": "application/json" },
