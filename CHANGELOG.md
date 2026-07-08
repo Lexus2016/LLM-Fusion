@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.28] - 2026-07-08
+
+### Fixed
+
+- **Fusion synth no longer leaks its own scratchpad reasoning into the answer.** `buildSynthContext` told the synth to "write the single best final answer" but never forbade it from narrating its own synthesis process ("Expert 1 says X, Expert 2 says Y, I will provide...") into the visible response. On harder tasks that scratchpad consumed the entire token budget, leaving the real answer truncated or missing outright. Reproduced on 6/15 `bench/fusion-bench.mjs` tasks across two independent `fusion-coder` panel configurations (the retired mistral panel and the new 4-model panel below) — dragging `fusion`'s bench average to 23.60/30, below two of its own panel members. On the 9/15 tasks where the leak did not fire, `fusion` averaged 29.56/30, beating every panel member including solo glm-5.2 (28.11/30) — confirming the panel/judge/synth mechanism itself is sound; only the narration habit needed fixing. Added `SYNTH_DIRECT_ANSWER_DIRECTIVE`: forbids referencing "the experts/panel/judge" or showing draft reasoning, requires the final answer only, appended last in the synth context for maximum recency weight. Verified live against the three clearest prior failures (fs.watch platform caveats, LRU-TTL cache, Postgres isolation levels) — all three now return complete, direct answers with zero "Expert"/"judge" references.
+
+### Changed
+
+- **`fusion-coder` panel: 4 models, `glm-5.2` drops to judge+synth only.** New panel: `kimi-k2.7-code`, `deepseek-v4-flash`, `gemini-3-flash-preview`, `qwen3-coder-next` (replacing `glm-5.2` + `kimi-k2.7-code` + `mistral-large-3:675b`). Benchmarked on all 15 tasks: the fused answer beat every panel member on the 9/15 tasks unaffected by the synth-leakage bug above. `kimi-k2.7-code` is this panel's weakest voice (17.00/30 bench avg) — prone to long rambling generations that consume its own token budget; no per-panel-member `request_overrides` mechanism exists yet to throttle it (only `single` and the smart `simple` slot support `request_overrides` — see `src/config.ts`). `gemini-3-flash-preview` previously 400'd on foreign tool-call history in agent loops (`thought_signature` error, see v0.1.27 notes); a live spot-check with synthetic multi-turn tool-call history (with and without an active `tools` schema) did not reproduce the 400, but this is not exhaustive — worth watching in real agent-loop sessions via the existing `tool-turn terminal state` log line.
+
+### Added
+
+- **`bench/fusion-bench.mjs` hardening.** `--resume` flag to continue a killed/crashed run without re-paying for completed tasks. Scorer rewritten from one joint `{"scores":[...]}` object to JSON Lines (one object per condition per line) with a three-layer fallback (per-line, bare/prose-wrapped array, legacy object shape) — a bad line or shape mismatch no longer loses the whole task's score; unrecoverable labels are omitted, never defaulted to a fake 0 (which would silently corrupt the aggregate). Per-answer 8000-char cap before the scorer prompt, since a single unusually verbose answer (~19k chars) could overload the joint scorer call. Running stats and a stability/error counter now print after every task, not just at the end.
+- Benchmark result files committed for provenance: `bench/results-v0127.json` (6/15 tasks, retired 3-model panel) and `bench/results-v0127-4panel.json` (full 15/15 run, new 4-model panel, 0/120 call errors).
+
 ## [0.1.27] - 2026-07-08
 
 ### Changed
