@@ -142,11 +142,15 @@ models:
 
   fusion-coder:                       # programming / planning / audit — fusion (multiple viewpoints)
     strategy: fusion
-    panel: [glm-5.2, kimi-k2.7-code, gpt-oss:120b]  # GLM + Moonshot + OpenAI-OSS (Western decorrelator).
+    panel: [glm-5.2, kimi-k2.7-code, mistral-large-3:675b]  # GLM + Moonshot + Mistral (Western decorrelator;
+                                                    # 262K ctx — replaced gpt-oss:120b whose 131K window capped the
+                                                    # whole virtual model's advertised context at 131K).
                                                     # NOT gemini here: a Gemini panel member 400s ("thought_signature")
                                                     # on tool-call history from other models and is dropped silently.
     judge: glm-5.2                    # most reliable structured-JSON of the field -> fewer judge-parse failures
-    synth: kimi-k2.7-code             # most complete, compilable code generator in the shoot-out
+    synth: glm-5.2                    # since v0.1.23 (fusion-lift bench): as synth, kimi emitted draft-style
+                                      # output and dragged the composite below every solo; with glm-5.2 the
+                                      # fused model beats every member. kimi stays on the panel.
     tool_mode: deliberate
     fusion_planning_turn_only: true  # full panel on the planning turn, synth-only mid-loop (cost knob)
 

@@ -71,14 +71,14 @@ Three **task-specialized** presets ship in `fusion.yaml`, each assembled from an
 
 | Call this model | For | Strategy | How it is built |
 |---|---|---|---|
-| **`fusion-coder`** | programming, planning, code audit | `fusion` | panel `glm-5.2` + `kimi-k2.7-code` + `gpt-oss:120b` → judge `glm-5.2` → synth `glm-5.2` |
+| **`fusion-coder`** | programming, planning, code audit | `fusion` | panel `glm-5.2` + `kimi-k2.7-code` + `mistral-large-3:675b` → judge `glm-5.2` → synth `glm-5.2` |
 | **`fusion-researcher`** | research, analysis, reports | `fusion` | panel `kimi-k2.7-code` + `glm-5.2` + `gpt-oss:120b` → judge `glm-5.2` → synth `kimi-k2.7-code` |
 | **`fusion-agents`** | autonomous agent loops | `smart` | router `glm-5.2`; easy steps → `glm-5.2`, hard / error-recovery steps → the `fusion-coder` panel |
 
 Two rules came straight out of the data:
 
 - **Coding uses fusion, not a single model.** Architecture and planning genuinely benefit from multiple viewpoints. (A pure code *audit* — just enumerating issues — is the one coding-shaped task a single model wins, and it is not representative of programming.)
-- **Panels mix model lineages on purpose.** `glm`/`kimi`/`deepseek`/`minimax`/`qwen` are all Chinese labs and share blind spots; every panel adds a Western decorrelator (`gpt-oss:120b` = OpenAI lineage) so panel errors are less correlated — that is the whole point of a panel. (Gemini was the original decorrelator but rejects tool-call history produced by other models with a `thought_signature` error on every mid-loop step, so it was replaced.)
+- **Panels mix model lineages on purpose.** `glm`/`kimi`/`deepseek`/`minimax`/`qwen` are all Chinese labs and share blind spots; every panel adds a Western decorrelator — `mistral-large-3:675b` (Mistral) on the coder panel (since v0.1.26+: it also lifts the advertised context window from 131K to 262K), `gpt-oss:120b` (OpenAI lineage) on the researcher panel — so panel errors are less correlated; that is the whole point of a panel. (Gemini was the original decorrelator but rejects tool-call history produced by other models with a `thought_signature` error on every mid-loop step, so it was replaced.)
 
 The original generic presets (`fusion-1`, `smart-1`, `fast-glm` / `fast-kimi` / `fast-deepseek`) still ship for ad-hoc use.
 
