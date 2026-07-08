@@ -84,13 +84,20 @@ models:
   #   gpt-oss handles foreign tool-call history cleanly (verified 3/3 panel-shaped).
   fusion-coder:
     strategy: fusion
-    panel: [glm-5.2, kimi-k2.7-code, gpt-oss:120b]   # OpenAI lineage (Western decorrelator).
-                                      # Previously minimax-m3 (3rd Chinese lab — shared blind-spot class).
-                                      # gpt-oss:120b streams its deliberation in delta.reasoning then may
-                                      # emit a tool_calls chunk (finish_reason tool_calls); the panel
-                                      # extractor now serialises that to prose instead of dropping it,
-                                      # and buildPanelBody strips response_format/max_tokens/etc. so the
-                                      # panel gets a clean deliberation request.
+    panel: [glm-5.2, kimi-k2.7-code, mistral-large-3:675b]   # Mistral lineage (Western decorrelator).
+                                      # CHANGED 2026-07-08: gpt-oss:120b (131K ctx) was the context
+                                      # bottleneck — it capped the advertised fusion-agents window at
+                                      # 131K while every other member has >=262K. mistral-large-3:675b
+                                      # keeps the Western-lineage decorrelation (Mistral vs the two
+                                      # Chinese labs), has 262K ctx (advertised window now 262K, the
+                                      # kimi bound), accepts foreign tool-call history (panel-shaped
+                                      # probe: 200 in 7s, correct minimal-fix answer), and is a larger
+                                      # model (675B MoE vs 120B). Candidates rejected: nemotron-3-super
+                                      # (120s timeout on the same probe), gemma4:31b (too small a
+                                      # calibre for the panel), gemini-3-flash (thought_signature 400).
+                                      # NOTE: panel-member swap after the fusion-lift bench — quality
+                                      # delta unmeasured; it is one voice of three weighed by the judge,
+                                      # so the blast radius is bounded. Re-run bench/ to re-verify.
     judge: glm-5.2                    # most reliable structured-JSON (router shoot-out) -> fewer judge-parse failures
     synth: glm-5.2                    # CHANGED 2026-07-07 (fusion-lift bench, docs/llm-fusion-audit.md):
                                       # as synth, kimi emitted 17-19k-char draft-style output on factual/
