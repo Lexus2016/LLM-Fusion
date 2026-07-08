@@ -1787,6 +1787,26 @@ const SYNTH_TOOL_ACTION_DIRECTIVE =
   "complete or no tool action is possible; otherwise act by calling the appropriate tool now.";
 
 /**
+ * Mandatory synth directive (always appended, last): deliver ONLY the final
+ * answer, addressed directly to the user. Without this, the synth sometimes
+ * narrates its own synthesis process into the visible response — "Expert 1
+ * says X, Expert 2 says Y, I will provide..." — before ever reaching the
+ * actual answer; on harder tasks that scratchpad can consume the entire
+ * token budget, leaving the real answer truncated or missing outright.
+ * Reproduced 6/15 tasks across two independent panel configurations
+ * (bench/fusion-bench.mjs, 2026-07-08) — on the 9 tasks where it did NOT
+ * fire, the synth beat every panel member (29.56/30 vs the best member's
+ * 26.67/30), so the synthesis mechanism itself is sound; this directive
+ * targets specifically the narration failure, not the synthesis logic.
+ */
+const SYNTH_DIRECT_ANSWER_DIRECTIVE =
+  "\n\nCRITICAL: respond to the user directly, as if you are answering their question yourself. Never " +
+  "mention \"the experts\", \"the panel\", \"the judge\", \"Expert 1\", \"Expert 2\", or your own synthesis " +
+  "process — the user never saw any of that, and referencing it is confusing and unprofessional. Do not show " +
+  "draft reasoning, planning, or an internal monologue before the answer — go straight to the final answer " +
+  "with no preamble about how you arrived at it.";
+
+/**
  * Build the synthesis context message. `null` on the synth-only path (no panel
  * ran). Otherwise the synth ALWAYS receives the raw panel answers, so it never
  * loses the experts' actual artifacts (code, formulas, exact text); the
@@ -1823,7 +1843,8 @@ function buildSynthContext(
       JSON.stringify(analysis) +
       "\n\nEXPERT ANSWERS:\n" +
       experts +
-      toolDirective
+      toolDirective +
+      SYNTH_DIRECT_ANSWER_DIRECTIVE
     );
   }
   return (
@@ -1831,7 +1852,8 @@ function buildSynthContext(
     "Synthesize the single best final answer from these expert answers; where they disagree, reconcile the " +
     "conflict explicitly and prefer the better-supported answer over the more verbose one.\n\nEXPERT ANSWERS:\n" +
     experts +
-    toolDirective
+    toolDirective +
+    SYNTH_DIRECT_ANSWER_DIRECTIVE
   );
 }
 
