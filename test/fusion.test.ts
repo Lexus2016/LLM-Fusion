@@ -505,6 +505,28 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(ctxText).toContain("ans-m2");
   });
 
+  it("appends the agentic tool-action directive to the synth context WHEN tools are present", async () => {
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req({ tools: TOOLS })));
+    expect(res.status).toBe(200);
+    const synthBody = up.recorded.find((b) => b.model === "s");
+    const ctxText = systemContents(synthBody!).join("\n");
+    // Root cause of "does a step, then stops": the prose-synthesis framing biases the
+    // synth to answer in prose (finish_reason:"stop", no tool_calls), which ends the
+    // agent turn. In a tool-carrying (agentic) request the synth must be told to ACT.
+    expect(ctxText).toContain("AGENTIC TOOL CONTEXT");
+    expect(ctxText).toMatch(/emit that tool call|act by calling the appropriate tool/i);
+  });
+
+  it("omits the tool-action directive on the tool-less research/report path (prose synthesis untouched)", async () => {
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req())); // no tools in the request
+    expect(res.status).toBe(200);
+    const synthBody = up.recorded.find((b) => b.model === "s");
+    const ctxText = systemContents(synthBody!).join("\n");
+    expect(ctxText).not.toContain("AGENTIC TOOL CONTEXT");
+  });
+
   it("gives the judge the original user request, not just the panel answers (2a)", async () => {
     const up = makeUpstream(defaultChat(true));
     const res = await fusionStrategy.execute(

@@ -1753,7 +1753,7 @@ function buildSynthBody(
   if (opts.webContext !== null) {
     insertBeforeLastUser(msgs, { role: "user", content: opts.webContext });
   }
-  const context = buildSynthContext(analysis, panelAnswers);
+  const context = buildSynthContext(analysis, panelAnswers, opts.hasTools);
   if (context !== null) {
     msgs.push({ role: "system", content: context });
   }
@@ -1764,19 +1764,46 @@ function buildSynthBody(
 }
 
 /**
+ * Agentic-loop directive appended to the synth context ONLY when the request
+ * carries tools. Without it, the "write the single best final answer" synthesis
+ * framing biases the synth toward a PROSE answer (finish_reason:"stop", no
+ * tool_calls) even mid-task — and because the panel members deliberate in prose
+ * (they get no tools), the synth is reading prose and naturally continues in
+ * prose. In an OpenAI-compatible agent loop (OpenCode et al.) a prose message
+ * with no tool call ENDS the turn, so the loop stalls until the user types
+ * "continue". detectIncompleteSynth deliberately leaves a NON-EMPTY prose answer
+ * untouched, so nothing recovers this case — the fix has to be at the prompt.
+ * This directive is inert on the pure research/report path (no tools present),
+ * so prose-first synthesis (and its benchmarks) are unaffected.
+ */
+const SYNTH_TOOL_ACTION_DIRECTIVE =
+  "\n\nAGENTIC TOOL CONTEXT: this request provides tools and is ONE STEP of an autonomous " +
+  "tool-calling loop. The expert answers above are DELIBERATION ONLY — the panel had no tools and " +
+  "could not act. Do not turn their prose into more prose: if the best next step is an action " +
+  "(reading or editing a file, running a command, invoking any provided tool), you MUST emit that " +
+  "tool call as your response. A prose message with NO tool call ends the agent's turn and stalls " +
+  "the loop, forcing the user to say \"continue\" — so never narrate a plan (\"next I will…\", \"let's " +
+  "read the file\") and then stop. Produce a prose-only answer ONLY when the task is genuinely " +
+  "complete or no tool action is possible; otherwise act by calling the appropriate tool now.";
+
+/**
  * Build the synthesis context message. `null` on the synth-only path (no panel
  * ran). Otherwise the synth ALWAYS receives the raw panel answers, so it never
  * loses the experts' actual artifacts (code, formulas, exact text); the
  * structured judge analysis, when available, is layered on top as adjudication
  * guidance rather than replacing the answers. When the judge failed, the synth
- * is told to reconcile conflicts itself.
+ * is told to reconcile conflicts itself. When the request carries tools, the
+ * agentic tool-action directive is appended so the synth acts (emits a tool
+ * call) instead of stalling the loop with a prose plan.
  */
 function buildSynthContext(
   analysis: JudgeAnalysis | null,
   panelAnswers: PanelAnswer[],
+  hasTools: boolean,
 ): string | null {
   if (panelAnswers.length === 0) return null;
   const experts = renderPanelForJudge(panelAnswers);
+  const toolDirective = hasTools ? SYNTH_TOOL_ACTION_DIRECTIVE : "";
   if (analysis !== null) {
     return (
       "A panel of expert models answered the user's request, and an impartial judge produced a structured " +
@@ -1795,14 +1822,16 @@ function buildSynthContext(
       "JUDGE ANALYSIS (JSON):\n" +
       JSON.stringify(analysis) +
       "\n\nEXPERT ANSWERS:\n" +
-      experts
+      experts +
+      toolDirective
     );
   }
   return (
     "A panel of expert models answered the user's request (a structured judge analysis was unavailable). " +
     "Synthesize the single best final answer from these expert answers; where they disagree, reconcile the " +
     "conflict explicitly and prefer the better-supported answer over the more verbose one.\n\nEXPERT ANSWERS:\n" +
-    experts
+    experts +
+    toolDirective
   );
 }
 
