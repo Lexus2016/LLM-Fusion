@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.26] - 2026-07-08
+
+### Added
+
+- **Single-route tool-turn completeness guard (`src/strategies/tool_turn_guard.ts`).** Field debugging of "fusion-agents stalls the OpenCode agent loop" found three live-validated failure modes on the smart `simple` passthrough, none of which the single strategy recovered from: (1) *narrate-and-stop* — the model describes the next action in prose and ends the turn with `finish_reason:stop` and no `tool_calls`; (2) *length-cut tool calls* — large-file writes truncate the tool-call arguments mid-JSON (`finish_reason:length`), leaving an unrunnable call the client drops; (3) *upstream stream termination* — Ollama Cloud kills generation streams at ~5 minutes (`terminated`). The guard detects all three on tool-carrying requests and runs ONE streamed recovery retry forwarded to the client live (nudged to emit the tool call and to write large payloads in chunks), failing open to the original response. The stream wrapper is reader-driven rather than a `pipeThrough` TransformStream because `flush()` never runs when the source errors — a transform-based guard is structurally blind to failure (3).
+- **Terminal-state instrumentation.** Every tool-carrying single-route stream now logs one `single: tool-turn terminal state` line (finish_reason, tool-call count, guard verdict, content/reasoning lengths, tail), making real-session stalls diagnosable from the log alone.
+- **Per-model `request_overrides` (single strategy + smart inline `simple` slot).** Extra request-body fields merged into every upstream call for that model; core keys (`model`, `messages`, `stream`, `tools`, `tool_choice`) are protected. A/B-measured use case: `reasoning_effort:"none"` stops glm-5.2 from deliberating for minutes on mechanical agent steps (reasoning 1692→0 chars, 6s→2s; `think:false` and `reasoning_effort:"low"` are ignored by Ollama Cloud; tool-calling verified intact).
+- **Fusion synth: agentic tool-action directive.** When (and only when) the request carries tools, the synth context now states that the panel's prose answers are deliberation, not the final shape — if the best next step is an action, emit the tool call. Inert on the tool-less research/report path, so prose synthesis and its benchmark results are untouched.
+
+### Changed
+
+- **`fusion-agents` simple route now sends `reasoning_effort:"none"`** (via the new `request_overrides`) — mechanical steps don't need deliberation; the smart router escalates hard steps to the fusion panel, and the tool-turn guard covers residual failures. The stale simple-target comment (which still claimed kimi was the fusion-coder synth) now documents the two real constraints: foreign tool-call-history compatibility and a large context window (a real session overflowed kimi's 262K — do not swap kimi in for speed).
+
 ## [0.1.25] - 2026-07-07
 
 ### Changed
