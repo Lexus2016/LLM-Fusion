@@ -103,6 +103,14 @@ models:
   fast-1:
     strategy: single
     target: deepseek-v4-pro
+    # request_overrides:              # optional: extra request-body fields merged into every
+    #   reasoning_effort: "none"      #   upstream call for this model (e.g. suppress a thinking
+    #                                 #   model's deliberation on mechanical agent steps).
+    #                                 #   Core keys (model, messages, stream, tools, tool_choice)
+    #                                 #   are protected and cannot be overridden.
+    #                                 #   Measured on Ollama Cloud glm-5.2: reasoning_effort "none"
+    #                                 #   works (reasoning 1692->0 chars, 6s->2s, tool-calling
+    #                                 #   intact); think:false and "low" are ignored.
 
   # --- failover strategy (Phase 2) ---
   resilient-1:
@@ -116,7 +124,9 @@ models:
     default: simple                   # route used when the router is unsure / errors (simple | fusion; default: simple)
     escalate_on_tool_error: true      # agent-loop: a failing latest tool result (error / exception / non-zero exit / test failure)
                                       #   skips the router and goes straight to fusion — re-deliberate on recovery (default: true)
-    simple: { target: deepseek-v4-pro }   # inline single-strategy block, OR a string naming another model (e.g. simple: fast-1)
+    simple: { target: deepseek-v4-pro }   # inline single-strategy block, OR a string naming another model (e.g. simple: fast-1).
+                                          #   The inline block also accepts request_overrides (see the single strategy above),
+                                          #   e.g. simple: { target: glm-5.2, request_overrides: { reasoning_effort: "none" } }
     fusion:                           # inline fusion-strategy block, OR a string naming another model (e.g. fusion: fusion-1)
       panel: [glm-5.2, kimi-k2.7-code, deepseek-v4-pro]
       judge: glm-5.2
