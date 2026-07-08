@@ -189,11 +189,20 @@ models:
     default: simple
     escalate_on_tool_error: true      # a failing tool result (test failure / error / exception) -> straight to
                                       # fusion: error-recovery is exactly where multiple viewpoints earn their cost
-    simple: { target: glm-5.2 }       # mechanical steps (read / grep / run). MUST be a model that accepts
-                                         # tool-call history produced by OTHER models in the loop: gemini-3-flash-preview
-                                         # rejects it with 400 "Function call is missing a thought_signature in
-                                         # functionCall parts" — a Gemini-only requirement. The loop's tool_calls come
-                                         # from the kimi synth (not Gemini), so a Gemini passthrough breaks the session.
-                                         # kimi accepts its own tool history cleanly (it is also the fusion synth).
+    simple:
+      target: glm-5.2                 # mechanical steps (read / grep / run). Constraints, in order:
+                                      # 1. MUST accept tool-call history produced by OTHER models in the loop:
+                                      #    gemini-3-flash-preview rejects it with 400 "Function call is missing a
+                                      #    thought_signature in functionCall parts" — a Gemini-only requirement.
+                                      # 2. MUST have a large context window: agent sessions grow past 200K
+                                      #    (a real session overflowed kimi's 262K -> 502). glm-5.2 (1M) is the
+                                      #    only context-safe choice; do NOT swap in kimi for speed.
+      request_overrides:
+        reasoning_effort: "none"      # A/B-measured 2026-07-08: glm-5.2 on "continue writing" turns sank into
+                                      # ~5-min near-silent deliberation and Ollama Cloud terminates streams at
+                                      # ~5 min -> dead turn. With reasoning_effort:"none": reasoning 1692->0 chars,
+                                      # 6s->2s latency, tool-calling intact (2/2 correct calls, finish=tool_calls).
+                                      # Mechanical steps don't need deliberation — that's what the router's
+                                      # fusion escalation is for. The tool-turn guard still covers what remains.
     fusion: fusion-coder              # substantive steps -> the coder panel. The router's decision to deliberate
                                       # forces the FULL panel here (planning_turn_only is overridden mid-loop)
