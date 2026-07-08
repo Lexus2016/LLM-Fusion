@@ -585,6 +585,38 @@ describe("single strategy — tool-turn completeness guard", () => {
     expect(calls).toBe(1); // no recovery retry fired
   });
 
+  it("emits exactly ONE [DONE] even when the upstream ends with [DONE] but no finish_reason chunk", async () => {
+    // Post-release review finding: the guard used to forward the upstream [DONE]
+    // and then append its own after the terminal-less recovery — double framing.
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: (_u, init) => {
+            const body = String(init?.body ?? "");
+            if (body.includes("Emit the tool call NOW")) {
+              return sseResponse([
+                { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "c", type: "function", function: { name: "write", arguments: "{}" } }] } }] },
+                { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+              ]);
+            }
+            // Anomalous upstream: content chunks, then [DONE] with NO finish_reason chunk.
+            return sseResponse([{ choices: [{ delta: { role: "assistant", content: "partial" } }] }]);
+          },
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(
+      ctxWith(client, { model: "fast-glm", stream: true, tools: TOOLS, messages: [{ role: "user", content: "x" }] }),
+    );
+    const text = await res.text();
+    const doneCount = (text.match(/data: \[DONE\]/g) ?? []).length;
+    expect(doneCount).toBe(1); // canonical framing: exactly one [DONE], appended by the guard
+    expect(text.indexOf("[DONE]")).toBeGreaterThan(text.indexOf('"name":"write"')); // recovery BEFORE the single [DONE]
+  });
+
   it("leaves tool-less requests as plain passthrough (guard inert even on narrate-and-stop)", async () => {
     let calls = 0;
     const client = new OllamaClient({

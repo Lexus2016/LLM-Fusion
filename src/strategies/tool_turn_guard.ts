@@ -407,7 +407,14 @@ export function makeToolTurnGuardStream(
       return;
     }
     const payload = trimmed.slice("data:".length).trim();
-    if (payload.length === 0 || payload === "[DONE]") {
+    // Swallow the upstream [DONE]: every finish branch of this guard appends its
+    // own. Forwarding the upstream one would double-frame the stream when the
+    // upstream ends cleanly WITHOUT a finish_reason chunk (recovery chunks and a
+    // second [DONE] after the client already saw one). Found in post-release
+    // review; in production the usage-injection transform downstream happened to
+    // normalize it, but the guard's own framing must be canonical regardless.
+    if (payload === "[DONE]") return;
+    if (payload.length === 0) {
       controller.enqueue(encoder.encode(line + "\n"));
       return;
     }
