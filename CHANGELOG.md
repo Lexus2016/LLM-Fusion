@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.27] - 2026-07-08
+
+### Changed
+
+- **`fusion-coder` panel: `gpt-oss:120b` → `mistral-large-3:675b`.** gpt-oss (131K ctx) was the context bottleneck — it capped the advertised `fusion-agents`/`fusion-coder` window at 131K while every other member has ≥262K; the advertised window is now **262144** (the kimi bound). Selection against the live Ollama Cloud roster with four filters: ctx ≥ 262K; Western lineage so the panel keeps its 2-Chinese-labs + 1-Western decorrelation (Mistral); accepts foreign tool-call history (panel-shaped probe: 200 in 7 s with the correct minimal-fix answer — gemini-3-flash still 400s on `thought_signature`); deliberation calibre (675B MoE). Rejected: nemotron-3-super (120 s timeout on the same probe), gemma4:31b (calibre); runner-up: devstral-2:123b. `fusion-researcher` intentionally keeps gpt-oss. A cross-provider review flagged the honest open item: the quality delta vs gpt-oss is unmeasured until the fusion-lift bench is re-run — bounded meanwhile (one voice of three, weighed by the judge; the synth writes the final code). Preset tables (README en/ua/ru) and the example config were synced, including the example's stale pre-v0.1.23 kimi synth.
+
+### Fixed
+
+- **Tool-turn guard emits canonical single-`[DONE]` framing.** Found by a cross-provider post-release review of v0.1.26: when the upstream ended its stream with `[DONE]` but no `finish_reason` chunk, the guard forwarded that `[DONE]` and then appended its own after the terminal-less recovery — recovery chunks and a second `[DONE]` after the client already saw one. Production clients were shielded by the downstream usage-injection transform (it drops upstream `[DONE]`s and appends exactly one), so no corruption was observable — but the guard's own output must be canonical regardless of what sits behind it. The upstream `[DONE]` is now swallowed; every finish branch appends its own. +1 framing test.
+
 ## [0.1.26] - 2026-07-08
 
 ### Added
