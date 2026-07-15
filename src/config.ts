@@ -349,6 +349,28 @@ export const ConfigSchema = z
         });
       }
     }
+    // A `smart` model runs its `simple`/`fusion` routes through ITS OWN provider
+    // group's pool (dispatch resolves the client from the smart model). So a
+    // string-referenced sub-model MUST resolve to the SAME provider group, else
+    // its members would be sent to the wrong provider's accounts (404s).
+    for (const [name, entry] of Object.entries(cfg.models)) {
+      if (entry.strategy !== "smart") continue;
+      const smartGroup = entry.provider ?? soleGroup;
+      for (const role of ["simple", "fusion"] as const) {
+        const slot = entry[role];
+        if (typeof slot !== "string") continue; // inline block inherits the smart group
+        const ref = cfg.models[slot];
+        if (!ref) continue; // unknown-ref already reported elsewhere
+        const refGroup = ref.provider ?? soleGroup;
+        if (smartGroup !== undefined && refGroup !== undefined && smartGroup !== refGroup) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["models", name, role],
+            message: `smart model '${name}' (provider '${smartGroup}') references '${slot}' bound to a different provider group '${refGroup}'; a smart model and its routes must share one provider group`,
+          });
+        }
+      }
+    }
     // A `smart` model may reference other configured models by name for its
     // `simple` / `fusion` slots; those references must resolve.
     for (const [name, entry] of Object.entries(cfg.models)) {

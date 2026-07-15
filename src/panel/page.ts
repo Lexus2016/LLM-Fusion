@@ -136,6 +136,20 @@ export const PANEL_HTML = `<!doctype html>
   .toast{background:var(--panel); border:1px solid var(--line-2); border-left:3px solid var(--accent);
     border-radius:9px; padding:10px 14px; box-shadow:var(--shadow); font-size:13px; animation:rise .18s ease both}
   .toast.err{border-left-color:var(--down)}
+
+  /* Confirmation modal — every mutating action asks first. */
+  .ovl{position:fixed; inset:0; background:rgba(4,7,11,.5); display:none; align-items:center;
+    justify-content:center; z-index:30; backdrop-filter:blur(2px); padding:20px}
+  .ovl.on{display:flex; animation:fade .12s ease both}
+  @keyframes fade{from{opacity:0}to{opacity:1}}
+  .modal{background:var(--panel); border:1px solid var(--line-2); border-radius:14px; box-shadow:var(--shadow);
+    padding:20px 20px 16px; max-width:400px; width:100%; animation:rise .16s ease both}
+  .modal h3{margin:0 0 8px; font-size:15px; display:flex; align-items:center; gap:9px}
+  .modal h3 .idot{width:9px;height:9px;border-radius:50%; background:var(--cooling); flex:none}
+  .modal h3.danger .idot{background:var(--down)}
+  .modal p{margin:0 0 18px; color:var(--muted); font-size:13.5px; line-height:1.55}
+  .modal p b{color:var(--fg); font-family:var(--mono); font-weight:600}
+  .modal .row{display:flex; gap:8px; justify-content:flex-end}
   @media (prefers-reduced-motion: reduce){*{animation:none !important; transition:none !important}}
 </style>
 </head>
@@ -156,6 +170,18 @@ export const PANEL_HTML = `<!doctype html>
   <section id="summary" class="summary"></section>
   <section id="providers"></section>
   <div id="empty" class="empty" style="display:none">No providers reported.</div>
+
+  <div id="ovl" class="ovl">
+    <div class="modal" role="dialog" aria-modal="true">
+      <h3 id="ovl-title"><span class="idot"></span><span id="ovl-title-txt">Confirm</span></h3>
+      <p id="ovl-msg"></p>
+      <div class="row">
+        <button class="act" id="ovl-cancel" type="button">Cancel</button>
+        <button class="act danger" id="ovl-ok" type="button">Confirm</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toasts"></div>
 
 <script>
@@ -211,7 +237,43 @@ export const PANEL_HTML = `<!doctype html>
       });
   }
 
+  function esc(s){
+    return String(s).replace(/[&<>"]/g, function(c){ return { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]; });
+  }
+
+  // Every mutating action asks for confirmation first (destructive / data-changing).
+  var pendingYes = null;
+  function askConfirm(action, id, onYes){
+    var danger = (action === "disable");
+    var b = "<b>" + esc(id) + "</b>";
+    var msgs = {
+      disable: "Disable account " + b + "? It will stop serving requests until you enable it again.",
+      enable: "Enable account " + b + " so it can serve requests again?",
+      reset: "Reset account " + b + " back to healthy (clear its cooldown / failure state)?",
+      pin: "Make account " + b + " the active one for its provider?",
+      unpin: "Clear the pinned active account for this provider?"
+    };
+    var cap = action.charAt(0).toUpperCase() + action.slice(1);
+    document.getElementById("ovl-title-txt").textContent = cap;
+    document.getElementById("ovl-title").className = danger ? "danger" : "";
+    document.getElementById("ovl-msg").innerHTML = msgs[action] || ("Confirm " + esc(action) + " on " + b + "?");
+    var ok = document.getElementById("ovl-ok");
+    ok.textContent = cap;
+    ok.className = danger ? "act danger" : "act";
+    pendingYes = onYes;
+    document.getElementById("ovl").classList.add("on");
+    // Focus Cancel (not Confirm) so a reflexive Enter/Space cancels rather than
+    // confirming a destructive action — Confirm requires a deliberate click.
+    document.getElementById("ovl-cancel").focus();
+  }
+  function closeConfirm(){ document.getElementById("ovl").classList.remove("on"); pendingYes = null; }
+
   function act(id, action){
+    if (busy[id]) return;
+    askConfirm(action, id, function(){ doAct(id, action); });
+  }
+
+  function doAct(id, action){
     if (busy[id]) return;
     busy[id] = true; render(last);
     var path = "admin/connectors/" + encodeURIComponent(id) + "/" + action;
@@ -424,6 +486,11 @@ export const PANEL_HTML = `<!doctype html>
   document.getElementById("tokenin").addEventListener("keydown", function(e){
     if (e.key === "Enter") document.getElementById("tokensave").click();
   });
+
+  document.getElementById("ovl-cancel").onclick = closeConfirm;
+  document.getElementById("ovl-ok").onclick = function(){ var f = pendingYes; closeConfirm(); if (f) f(); };
+  document.getElementById("ovl").onclick = function(e){ if (e.target === this) closeConfirm(); };
+  document.addEventListener("keydown", function(e){ if (e.key === "Escape") closeConfirm(); });
 
   tick();
   setInterval(tick, POLL_MS);

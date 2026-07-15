@@ -104,6 +104,22 @@ describe("config: provider groups", () => {
     ).toThrow(/no base_url/);
   });
 
+  it("rejects a smart model whose route is in a different provider group", () => {
+    expect(() =>
+      parseConfig({
+        upstream: {},
+        providers: {
+          g1: { type: "ollama", base_url: "https://a.com", accounts: [{ id: "a", api_key_env: "K1" }] },
+          g2: { type: "ollama", base_url: "https://b.com", accounts: [{ id: "b", api_key_env: "K2" }] },
+        },
+        models: {
+          "deep-g2": { strategy: "fusion", provider: "g2", panel: ["x"], judge: "x", synth: "x" },
+          "s": { strategy: "smart", provider: "g1", router: "r", simple: { target: "y" }, fusion: "deep-g2" },
+        },
+      }),
+    ).toThrow(/different provider group/);
+  });
+
   it("rejects a config with no provider source at all", () => {
     expect(() =>
       parseConfig({ upstream: { max_concurrency: 4 }, models: { m: { strategy: "single", target: "x" } } }),
