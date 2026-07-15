@@ -71,6 +71,7 @@ class FakeClient implements ConnectorClient {
 function cfg(id: string, o: Partial<ResolvedConnector> = {}): ResolvedConnector {
   return {
     id,
+    group: o.group ?? "g1",
     provider: o.provider ?? "openai-compat",
     baseUrl: o.baseUrl ?? `https://${id}.test`,
     host: o.host ?? `https://${id}.test`,

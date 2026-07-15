@@ -1,15 +1,16 @@
 import type { Logger } from "pino";
-import type { Config, ConnectorConfig } from "../config";
+import type { AccountConfig, Config } from "../config";
 import type { FetchFn } from "../types";
 import { createUpstreamClient } from "../upstream/provider";
 import type { ConnectorClient, ResolvedConnector } from "./registry";
 
 /**
- * Resolve the config's connector pool into `{ cfg, client }` entries ready for
- * the `ConnectorRegistry`. Reads the API key for each connector from its
+ * Resolve the config's provider groups into ready-to-run structures. Each group
+ * is one upstream provider (Ollama Cloud, OpenRouter, …) and its ordered accounts;
+ * failover happens WITHIN a group. Reads each account's API key from its
  * `api_key_env` env var (never stores the value in `cfg`). When no explicit
- * `connectors:` list is configured, a single connector is synthesised from the
- * legacy `upstream.base_url` + `upstream.api_key_env` (backward compatible).
+ * `providers:` map is configured, a single `default` group is synthesised from
+ * the legacy `upstream.base_url` + `upstream.api_key_env` (backward compatible).
  */
 
 export interface ResolveOptions {
@@ -19,63 +20,91 @@ export interface ResolveOptions {
   fetchFn?: FetchFn;
 }
 
-export interface ResolvedEntry {
+export interface ResolvedAccount {
   cfg: ResolvedConnector;
   client: ConnectorClient;
 }
 
-export function connectorDefs(config: Config): ConnectorConfig[] {
-  if (config.connectors && config.connectors.length > 0) return config.connectors;
+export interface ResolvedGroup {
+  id: string;
+  type: "ollama" | "openai-compat";
+  accounts: ResolvedAccount[];
+}
+
+interface GroupDef {
+  id: string;
+  type: "ollama" | "openai-compat";
+  base_url: string | undefined;
+  accounts: AccountConfig[];
+}
+
+/** Config's provider groups (or the single synthesised `default` group). */
+export function groupDefs(config: Config): GroupDef[] {
+  if (config.providers && Object.keys(config.providers).length > 0) {
+    return Object.entries(config.providers).map(([id, g]) => ({
+      id,
+      type: g.type,
+      base_url: g.base_url,
+      accounts: g.accounts,
+    }));
+  }
   const u = config.upstream;
   if (!u.base_url || !u.api_key_env) {
-    // Guaranteed present by config validation when no connectors are set; guard
-    // so the types narrow without a non-null assertion.
     throw new Error(
-      "no connector source: neither `connectors:` nor `upstream.base_url`+`upstream.api_key_env` is set",
+      "no provider source: neither `providers:` nor `upstream.base_url`+`upstream.api_key_env` is set",
     );
   }
   return [
     {
       id: "default",
-      provider: "ollama",
+      type: "ollama",
       base_url: u.base_url,
-      api_key_env: u.api_key_env,
-      treat_403_as: "passthrough",
-      quota_markers: [],
+      accounts: [
+        { id: "default", api_key_env: u.api_key_env, treat_403_as: "passthrough", quota_markers: [] },
+      ],
     },
   ];
 }
 
-export function resolveConnectors(config: Config, opts: ResolveOptions): ResolvedEntry[] {
+export function resolveProviders(config: Config, opts: ResolveOptions): ResolvedGroup[] {
   const u = config.upstream;
-  return connectorDefs(config).map((c) => {
-    const apiKey = opts.env[c.api_key_env];
-    if (!apiKey) {
-      opts.logger?.warn(
-        { connector: c.id, env: c.api_key_env },
-        "connector API key env var is unset; this connector will start DOWN on first auth failure",
-      );
-    }
-    const timeoutMs = (c.request_timeout_s ?? u.request_timeout_s) * 1000;
-    const client = createUpstreamClient({
-      provider: c.provider,
-      baseUrl: c.base_url,
-      apiKey,
-      timeoutMs,
-      extraHeaders: c.extra_headers,
-      fetchFn: opts.fetchFn,
+  return groupDefs(config).map((g) => {
+    const accounts = g.accounts.map((acc): ResolvedAccount => {
+      const apiKey = opts.env[acc.api_key_env];
+      if (!apiKey) {
+        opts.logger?.warn(
+          { provider: g.id, account: acc.id, env: acc.api_key_env },
+          "account API key env var is unset; this account will go DOWN on first auth failure",
+        );
+      }
+      const baseUrl = acc.base_url ?? g.base_url;
+      if (!baseUrl) {
+        // Guaranteed present by config validation; guard so the type narrows.
+        throw new Error(`account '${acc.id}' in provider '${g.id}' has no base_url`);
+      }
+      const timeoutMs = (acc.request_timeout_s ?? u.request_timeout_s) * 1000;
+      const client = createUpstreamClient({
+        provider: g.type,
+        baseUrl,
+        apiKey,
+        timeoutMs,
+        extraHeaders: acc.extra_headers,
+        fetchFn: opts.fetchFn,
+      });
+      const cfg: ResolvedConnector = {
+        id: acc.id,
+        group: g.id,
+        provider: g.type,
+        baseUrl,
+        host: hostOf(baseUrl),
+        hasKey: Boolean(apiKey),
+        treat403As: acc.treat_403_as,
+        quotaMarkers: acc.quota_markers,
+        modelMap: acc.model_map ?? {},
+      };
+      return { cfg, client };
     });
-    const cfg: ResolvedConnector = {
-      id: c.id,
-      provider: c.provider,
-      baseUrl: c.base_url,
-      host: hostOf(c.base_url),
-      hasKey: Boolean(apiKey),
-      treat403As: c.treat_403_as,
-      quotaMarkers: c.quota_markers,
-      modelMap: c.model_map ?? {},
-    };
-    return { cfg, client };
+    return { id: g.id, type: g.type, accounts };
   });
 }
 

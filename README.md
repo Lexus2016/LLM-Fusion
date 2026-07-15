@@ -226,37 +226,43 @@ Long agent runs used to die on four load-dependent failure modes; all four are n
 ## Connectors, multi-account failover & the panel
 
 By default the proxy talks to one upstream (one Ollama Cloud account). You can
-instead give it an **ordered pool of connectors** — several Ollama Cloud accounts
-and/or other OpenAI-compatible providers — and it **fails over between them
-automatically** when one degrades, hits its rate limit, or its billing runs out.
+instead group upstreams into **providers**, each with several **accounts**, and
+it **fails over between accounts of the same provider automatically** when one
+degrades, hits its rate limit, or its billing runs out. Failover stays *within* a
+provider (same models), and each virtual model is bound to one provider — so a
+fusion never silently jumps to a provider with a different model catalog.
 
 ```yaml
-connectors:
-  - id: ollama-primary          # tried first
-    provider: ollama
+providers:
+  ollama-cloud:                 # a provider group = one provider + its accounts
+    type: ollama
     base_url: https://ollama.com
-    api_key_env: OLLAMA_API_KEY
-  - id: ollama-backup           # same models, second account/key
-    provider: ollama
-    base_url: https://ollama.com
-    api_key_env: OLLAMA_API_KEY_2
-  - id: openrouter-1            # any OpenAI-compatible provider
-    provider: openai-compat
+    accounts:                   # failover across these (same models, different keys)
+      - { id: ollama-1, api_key_env: OLLAMA_API_KEY }
+      - { id: ollama-2, api_key_env: OLLAMA_API_KEY_2 }
+  openrouter:                   # a different provider = its own group
+    type: openai-compat
     base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
-    model_map: { "qwen3-coder:480b": "qwen/qwen3-coder" }
+    accounts:
+      - id: openrouter-1
+        api_key_env: OPENROUTER_API_KEY
+        model_map: { "qwen3-coder:480b": "qwen/qwen3-coder" }
+
+models:
+  # bind a model to a provider group (optional when there is only one group)
+  fusion-coder: { strategy: fusion, provider: ollama-cloud, panel: [glm-5.2, kimi-k2.7-code], judge: glm-5.2, synth: kimi-k2.7-code }
 ```
 
-**How failover decides.** The first healthy connector serves. A `429`
-(rate-limit), `5xx`, network error, or timeout **cools** that connector down for
-`connector_cooldown_s` and the next one takes over; the cooled connector is
-auto-probed once the window elapses. A `401` (bad key), `402` (out of credits),
-or a body-matched quota exhaustion marks it **down** ("billing ended") — skipped
-until `connector_down_recheck_s` or a manual reset. When several connectors are
-throttled the proxy surfaces the most-recoverable error (a transient `429` beats
-a dead backup's `401`), so a passing request is never turned into a hard failure.
-It's transparent: every model/strategy (single, failover, fusion, smart) rides
-the pool with no config change.
+**How failover decides.** The first healthy account serves. A `429`
+(rate-limit), `5xx`, network error, or timeout **cools** that account down for
+`connector_cooldown_s` and the next account in the same provider takes over; the
+cooled account is auto-probed once the window elapses. A `401` (bad key), `402`
+(out of credits), or a body-matched quota exhaustion marks it **down** ("billing
+ended") — skipped until `connector_down_recheck_s` or a manual reset. When
+several accounts are throttled the proxy surfaces the most-recoverable error (a
+transient `429` beats a dead backup's `401`), so a passing request is never
+turned into a hard failure. It's transparent: every model/strategy (single,
+failover, fusion, smart) rides its provider's pool with no config change.
 
 **Any OpenAI-compatible provider works by config alone.** The generic
 `openai-compat` type covers OpenRouter, DeepInfra, Together, Novita, Nebius,
@@ -439,9 +445,9 @@ On boot it prints a banner: the listen URL, the loaded virtual models and their 
 | `GET /v1/models` | Lists the configured virtual models (OpenAI list shape). Adds `context_window` / `supports_vision` where capability discovery knows them. |
 | `GET /health` | Liveness. `200` if the process is up. No upstream check. |
 | `GET /ready` | Readiness. `200` only if the upstream is reachable and a representative model is discoverable; otherwise `503`. |
-| `GET /panel` | Local connector dashboard (HTML). Shows which connector is active, which are cooling/down and why, with manual controls. |
-| `GET /admin/connectors` | JSON snapshot of connector health (auth-gated when a client token is set). Backs the panel. |
-| `POST /admin/connectors/:id/{disable,enable,reset,pin}` · `POST /admin/unpin` | Manual connector controls (auth-gated). |
+| `GET /panel` | Local connector dashboard (HTML). Shows each provider group, which account is active, which are cooling/down and why, with manual controls. |
+| `GET /admin/providers` | Grouped JSON snapshot of provider/account health (auth-gated when a client token is set). Backs the panel. |
+| `POST /admin/connectors/:id/{disable,enable,reset,pin,unpin}` | Manual account controls (auth-gated). |
 
 ## Phase 0 — live verification
 

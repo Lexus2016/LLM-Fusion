@@ -6,7 +6,7 @@ import type { Config } from "./config";
 import type { CapabilityProvider, RequestUsage, UpstreamClient } from "./types";
 import type { Resilience } from "./concurrency";
 import { resilienceForUpstream } from "./concurrency";
-import type { ConnectorRegistry } from "./connectors/registry";
+import type { ProviderRouter } from "./connectors/provider_router";
 import { createPanelApp } from "./panel/routes";
 import { ChatCompletionRequestSchema } from "./types";
 import {
@@ -45,11 +45,11 @@ export interface AppDeps {
    */
   resilience?: Resilience;
   /**
-   * Connector registry backing the local panel (`/panel`, `/admin/connectors`).
-   * Optional so bare unit tests can build the app without one; the server always
-   * supplies it.
+   * Provider-group router backing the panel (`/panel`, `/admin/providers`) and
+   * per-request routing (a model's `provider` selects its group's pool). Optional
+   * so bare unit tests can build the app without one; the server always supplies it.
    */
-  registry?: ConnectorRegistry;
+  router?: ProviderRouter;
 }
 
 interface ModelListItem {
@@ -75,20 +75,19 @@ export function createApp(deps: AppDeps): Hono {
 
   app.get("/health", (c) => c.json({ status: "ok" }));
 
-  // Local connector panel + admin API (mounted only when a registry is wired).
-  if (deps.registry) {
-    app.route("/", createPanelApp({ registry: deps.registry, auth, logger: deps.logger }));
+  // Local connector panel + admin API (mounted only when a router is wired).
+  if (deps.router) {
+    app.route("/", createPanelApp({ router: deps.router, auth, logger: deps.logger }));
   }
 
   app.get("/ready", async (c) => {
-    // With a connector pool, readiness reflects the pool: ready iff at least one
-    // connector is currently up. This holds for any provider mix (an
-    // openai-compat-only pool has no native /api/show to probe).
-    if (deps.registry) {
-      const up = deps.registry.snapshot().some((s) => s.state === "up");
-      return up
+    // Readiness reflects the provider pool: ready iff at least one account in any
+    // provider group is currently up. Holds for any provider mix (an
+    // openai-compat-only group has no native /api/show to probe).
+    if (deps.router) {
+      return deps.router.anyUp()
         ? c.json({ status: "ok" })
-        : c.json({ status: "degraded", reason: "no connector is currently up" }, 503);
+        : c.json({ status: "degraded", reason: "no account is currently up" }, 503);
     }
     const config = deps.getConfig();
     const member = firstMember(config);
@@ -189,6 +188,7 @@ export function createApp(deps: AppDeps): Hono {
         request: parsed.data,
         config,
         client: deps.client,
+        router: deps.router,
         capabilities: deps.capabilities,
         logger: reqLogger,
         resilience,

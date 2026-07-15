@@ -22,43 +22,43 @@ upstream:
                                       # recheck window before an auto-probe; 0 = never
                                       # (manual reset only in the panel). (default: 900)
 
-# --- connectors (optional) --------------------------------------------------
-# An ordered pool of upstream accounts/providers the proxy fails over across.
-# When ABSENT, a single connector is synthesised from `upstream.base_url` +
-# `upstream.api_key_env` above (fully backward compatible). When PRESENT, this
-# list IS the pool and is tried top-to-bottom: the first healthy connector
-# serves; on a rate-limit / server / network failure it cools down and the next
-# connector takes over; on an auth (401) / payment (402) / quota failure it is
-# marked DOWN ("billing ended") and skipped until it recovers or you reset it in
-# the panel. Watch it all live at http://127.0.0.1:8080/panel.
+# --- providers (optional) ---------------------------------------------------
+# Provider GROUPS the proxy fails over across. Each group is ONE upstream
+# provider (Ollama Cloud, OpenRouter, …) and its ordered ACCOUNTS. Failover
+# happens WITHIN a group, so every account of a group serves the SAME models — a
+# fusion built on this group stays consistent when one account degrades and the
+# next takes over. A virtual model is bound to ONE group via its `provider:`
+# field (see `models:`), so it never silently jumps to a provider with a
+# different model catalog.
 #
-# connectors:
-#   # Two Ollama Cloud accounts — same models, different keys. Rotate on limits.
-#   - id: ollama-primary
-#     provider: ollama
-#     base_url: https://ollama.com
-#     api_key_env: OLLAMA_API_KEY
-#   - id: ollama-backup
-#     provider: ollama
-#     base_url: https://ollama.com
-#     api_key_env: OLLAMA_API_KEY_2
+# When ABSENT, a single `default` group is synthesised from `upstream.base_url` +
+# `upstream.api_key_env` above (fully backward compatible). Watch it all live at
+# http://127.0.0.1:8080/panel.
 #
-#   # Any OpenAI-compatible provider via the generic `openai-compat` type.
-#   # OpenRouter shown here; DeepInfra / Together / Novita / Nebius / Groq /
-#   # DeepSeek / Mistral / … all work the same way — just change base_url,
-#   # api_key_env, and model_map. No code change needed.
-#   - id: openrouter-1
-#     provider: openai-compat
-#     base_url: https://openrouter.ai/api/v1
-#     api_key_env: OPENROUTER_API_KEY
-#     extra_headers:                  # optional (OpenRouter ranking headers)
-#       HTTP-Referer: https://localhost
-#       X-Title: llm-fusion
-#     model_map:                      # logical id (used in `models:`) -> provider id
-#       "qwen3-coder:480b": "qwen/qwen3-coder"
-#       "glm-5.2": "z-ai/glm-4.6"
-#     # treat_403_as: down            # some gateways use 403 for no-credits (default: passthrough)
-#     # quota_markers: ["insufficient", "out of credit"]  # opt-in: escalate a matching 429 to DOWN
+# providers:
+#   ollama-cloud:                     # provider group id (referenced by models)
+#     type: ollama                    # ollama | openai-compat
+#     base_url: https://ollama.com    # group default; an account may override it
+#     accounts:                       # failover across these (same models, diff keys)
+#       - { id: ollama-1, api_key_env: OLLAMA_API_KEY }
+#       - { id: ollama-2, api_key_env: OLLAMA_API_KEY_2 }
+#
+#   openrouter:                       # any OpenAI-compatible provider = its own group
+#     type: openai-compat             # covers OpenRouter / DeepInfra / Together /
+#     base_url: https://openrouter.ai/api/v1   # Novita / Nebius / Groq / DeepSeek / …
+#     accounts:
+#       - id: openrouter-1
+#         api_key_env: OPENROUTER_API_KEY
+#         extra_headers: { HTTP-Referer: https://localhost, X-Title: llm-fusion }
+#         model_map:                  # this group's model ids (used in `models:`)
+#           "qwen3-coder:480b": "qwen/qwen3-coder"
+#         # treat_403_as: down        # some gateways use 403 for no-credits (default: passthrough)
+#         # quota_markers: ["insufficient"]  # opt-in: escalate a matching 429 to DOWN
+#
+# A model then binds to a group. With ONE group `provider:` is optional; with
+# several it is REQUIRED:
+#   models:
+#     fusion-coder: { strategy: fusion, provider: ollama-cloud, panel: [...], judge: ..., synth: ... }
 
 server:
   bind: 127.0.0.1                     # localhost only (default: 127.0.0.1)

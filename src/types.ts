@@ -107,6 +107,15 @@ export interface UpstreamClient {
   ): Promise<ChatCompletionResult>;
 }
 
+/**
+ * Resolves a virtual model's provider group to the pooled client that serves it.
+ * Implemented by `ProviderRouter`; declared here (structurally) so `router.ts`
+ * can depend on it without importing the connectors layer (avoids a cycle).
+ */
+export interface UpstreamRouter {
+  poolFor(group?: string): UpstreamClient;
+}
+
 // --- OpenAI-compatible request shapes -------------------------------------
 
 const ContentPartSchema = z.object({ type: z.string() }).passthrough();
@@ -173,6 +182,13 @@ export interface RequestContext {
   request: ChatCompletionRequest;
   config: Config;
   client: UpstreamClient;
+  /**
+   * Provider-group router. When present, `dispatch` resolves the per-request
+   * client from the virtual model's provider group (`poolFor(entry.provider)`),
+   * so failover stays within one provider. Optional so bare unit contexts (and
+   * legacy single-client callers) can supply just `client`.
+   */
+  router?: UpstreamRouter;
   capabilities: CapabilityProvider;
   logger: Logger;
   /**

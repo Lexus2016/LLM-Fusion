@@ -1,10 +1,11 @@
 /**
- * Self-contained connector-panel HTML (no external requests — inline CSS + JS,
- * so it renders on localhost with no network). Polls `/admin/connectors`, renders
- * a summary + one card per connector with live state/reason/metrics, and offers
- * manual controls (disable/enable/reset/make-active). When the proxy has a client
- * auth token configured, the panel prompts for it once and stores it in
- * localStorage, sending it as a Bearer header on the data/action calls.
+ * Self-contained connector-panel HTML (no external requests — inline CSS + JS, so
+ * it renders on localhost with no network). Polls `/admin/providers` and renders,
+ * per provider group, a section with one card per account (state/reason/metrics)
+ * plus manual controls (disable/enable/reset/make-active). Updates are applied
+ * IN PLACE (a two-level keyed reconcile — no innerHTML teardown), so the panel
+ * never flickers. When the proxy has a client auth token configured, the panel
+ * prompts for it once, stores it in localStorage, and sends it as a Bearer header.
  *
  * The client script deliberately avoids template literals so this file needs no
  * backtick/`${` escaping.
@@ -64,11 +65,22 @@ export const PANEL_HTML = `<!doctype html>
   .beat{animation:beat 2s ease-in-out infinite}
   @keyframes beat{0%,100%{opacity:.25;transform:scale(.85)}50%{opacity:1;transform:scale(1)}}
 
-  .summary{display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:22px}
+  .summary{display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:24px}
   .stat{background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 14px}
   .stat .k{color:var(--muted); font-size:11.5px; text-transform:uppercase; letter-spacing:.6px}
   .stat .v{font-size:22px; font-weight:680; margin-top:3px}
   .stat .v small{font-size:13px; color:var(--muted); font-weight:500}
+
+  .provider{margin-bottom:24px}
+  .phead{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:0 2px 11px}
+  .phead .pdot{width:10px;height:10px;border-radius:50%;flex:none}
+  .phead.g-ok .pdot{background:var(--up); box-shadow:0 0 0 3px var(--up-bg)}
+  .phead.g-warn .pdot{background:var(--cooling); box-shadow:0 0 0 3px var(--cooling-bg)}
+  .phead.g-bad .pdot{background:var(--down); box-shadow:0 0 0 3px var(--down-bg)}
+  .phead .pname{font-family:var(--mono); font-weight:650; font-size:15px}
+  .ptype{font-size:10.5px; color:var(--muted); border:1px solid var(--line-2); border-radius:6px;
+    padding:1px 7px; text-transform:uppercase; letter-spacing:.5px}
+  .phead .pmeta{color:var(--muted); font-size:12px}
 
   .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:14px}
   .card{background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
@@ -96,7 +108,6 @@ export const PANEL_HTML = `<!doctype html>
   .badge.active{color:var(--accent); border-color:color-mix(in srgb,var(--accent) 45%, var(--line-2)); background:var(--accent-bg)}
   .badge.pin{color:#9b7bff; border-color:color-mix(in srgb,#9b7bff 45%, var(--line-2))}
   .meta{color:var(--muted); font-size:12px; display:flex; align-items:center; gap:8px; margin:2px 0 10px}
-  .meta .prov{font-weight:600; color:var(--fg); opacity:.8}
   .host{font-family:var(--mono)}
   .reason{font-size:12.5px; padding:8px 10px; border-radius:9px; margin-bottom:11px; border:1px solid var(--line)}
   .reason.soft{background:var(--cooling-bg); border-color:color-mix(in srgb,var(--cooling) 30%, var(--line))}
@@ -143,8 +154,8 @@ export const PANEL_HTML = `<!doctype html>
   </form>
 
   <section id="summary" class="summary"></section>
-  <section id="grid" class="grid"></section>
-  <div id="empty" class="empty" style="display:none">No connectors reported.</div>
+  <section id="providers"></section>
+  <div id="empty" class="empty" style="display:none">No providers reported.</div>
   <div id="toasts"></div>
 
 <script>
@@ -153,13 +164,21 @@ export const PANEL_HTML = `<!doctype html>
   var TOKEN_KEY = "fusion_panel_token";
   var POLL_MS = 3000;
   var last = null;      // last snapshot payload
-  var busy = {};        // connector ids with an in-flight action
+  var busy = {};        // account ids with an in-flight action
+  var groups = {};      // groupId -> { section, head, grid, cards } — reused across polls
+  var sum = null;       // summary tile refs, built once
+  var since = Date.now();
 
   function tok(){ try { return localStorage.getItem(TOKEN_KEY) || ""; } catch(e){ return ""; } }
   function setTok(v){ try { localStorage.setItem(TOKEN_KEY, v); } catch(e){} }
   function authHeaders(){ var h = {}; var t = tok(); if (t) h["authorization"] = "Bearer " + t; return h; }
 
   function el(tag, cls, text){ var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+  // In-place setters — only touch the DOM when the value actually changed.
+  function setText(n, v){ if (n.textContent !== v) n.textContent = v; }
+  function setClass(n, v){ if (n.className !== v) n.className = v; }
+  function show(n, on){ var d = on ? "" : "none"; if (n.style.display !== d) n.style.display = d; }
+
   function fmtInt(n){ return (n == null ? 0 : n).toLocaleString("en-US"); }
   function pct(f, t){ if (!t) return "—"; return Math.round((1 - f / t) * 100) + "%"; }
   function rel(ts){
@@ -180,10 +199,10 @@ export const PANEL_HTML = `<!doctype html>
     setTimeout(function(){ if (t.parentNode) t.parentNode.removeChild(t); }, 3000);
   }
 
-  function showTokenBar(show){ document.getElementById("tokenbar").style.display = show ? "flex" : "none"; }
+  function showTokenBar(s){ document.getElementById("tokenbar").style.display = s ? "flex" : "none"; }
 
   function get(){
-    return fetch("admin/connectors", { headers: authHeaders(), cache: "no-store" })
+    return fetch("admin/providers", { headers: authHeaders(), cache: "no-store" })
       .then(function(r){
         if (r.status === 401){ showTokenBar(true); throw new Error("auth"); }
         showTokenBar(false);
@@ -195,159 +214,222 @@ export const PANEL_HTML = `<!doctype html>
   function act(id, action){
     if (busy[id]) return;
     busy[id] = true; render(last);
-    var path = action === "unpin" ? "admin/unpin" : "admin/connectors/" + encodeURIComponent(id) + "/" + action;
+    var path = "admin/connectors/" + encodeURIComponent(id) + "/" + action;
     fetch(path, { method: "POST", headers: authHeaders() })
       .then(function(r){
         if (r.status === 401){ showTokenBar(true); throw new Error("auth required"); }
         return r.json().then(function(j){ if (!r.ok) throw new Error(j && j.error ? j.error : "HTTP " + r.status); return j; });
       })
-      .then(function(j){ last = j; toast((action === "unpin" ? "unpinned" : id + " · " + action)); render(last); })
+      .then(function(j){ last = j; toast(id + " · " + action); render(last); })
       .catch(function(e){ toast(String(e.message || e), true); })
       .finally(function(){ delete busy[id]; render(last); });
   }
 
-  function overall(items){
-    var o = document.getElementById("overall"); var lbl = o.querySelector(".lbl");
-    var down = items.filter(function(c){ return c.state === "down"; }).length;
-    var cool = items.filter(function(c){ return c.state === "cooling"; }).length;
-    var upN = items.filter(function(c){ return c.state === "up"; }).length;
-    o.className = "pill " + (down ? "bad" : cool ? "warn" : "ok");
-    lbl.textContent = down ? (down + " down") : cool ? (cool + " cooling") : (upN + " healthy");
-  }
-
-  function summary(items, activeId){
-    var box = document.getElementById("summary"); box.innerHTML = "";
-    var upN = items.filter(function(c){ return c.state === "up"; }).length;
-    var cool = items.filter(function(c){ return c.state === "cooling"; }).length;
-    var downOff = items.filter(function(c){ return c.state === "down" || c.state === "off"; }).length;
-    var reqs = items.reduce(function(a, c){ return a + c.totalRequests; }, 0);
-    var fails = items.reduce(function(a, c){ return a + c.totalFailures; }, 0);
-    var active = items.filter(function(c){ return c.id === activeId; })[0];
-    function stat(k, v, sub){
-      var s = el("div", "stat"); s.appendChild(el("div", "k", k));
-      var val = el("div", "v num"); val.textContent = v;
-      if (sub){ var sm = el("small"); sm.textContent = " " + sub; val.appendChild(sm); }
-      s.appendChild(val); return s;
-    }
-    box.appendChild(stat("connectors", String(items.length)));
-    box.appendChild(stat("healthy", String(upN)));
-    box.appendChild(stat("cooling", String(cool)));
-    box.appendChild(stat("down / off", String(downOff)));
-    box.appendChild(stat("active", active ? active.id : "—"));
-    box.appendChild(stat("requests", fmtInt(reqs), pct(fails, reqs) + " ok"));
-  }
-
-  function metric(k, v){
-    var m = el("div", "metric"); m.appendChild(el("div", "mk", k));
-    m.appendChild(el("div", "mv num", v)); return m;
-  }
-
-  function card(c){
-    var wrap = el("div", "card s-" + c.state + (c.active ? " active" : ""));
-    var r1 = el("div", "row1");
-    r1.appendChild(el("span", "sdot"));
-    r1.appendChild(el("span", "cid", c.id));
-    r1.appendChild(el("span", "state", c.state));
-    var sp = el("span"); sp.style.flex = "1"; r1.appendChild(sp);
-    if (c.active) r1.appendChild(el("span", "badge active", "active"));
-    if (c.pinned) r1.appendChild(el("span", "badge pin", "pinned"));
-    wrap.appendChild(r1);
-
-    var meta = el("div", "meta");
-    meta.appendChild(el("span", "prov", c.provider));
-    meta.appendChild(el("span", "host mono", c.host));
-    if (!c.hasKey) meta.appendChild(el("span", "badge", "no key"));
-    wrap.appendChild(meta);
-
-    if (c.state === "cooling" || c.state === "down" || c.state === "off"){
-      var hard = c.state === "down";
-      var box = el("div", "reason " + (hard ? "hard" : c.state === "off" ? "" : "soft"));
-      var why = el("span", "why", c.reason || (c.state === "off" ? "manual" : c.state));
-      box.appendChild(why);
-      if (c.lastError){ box.appendChild(document.createTextNode(" · ")); box.appendChild(el("span", "err", c.lastError)); }
-      if (c.cooldownRemainingMs != null && c.cooldownRemainingMs > 0){
-        box.appendChild(el("div", "cd", (hard ? "recheck in " : "probe in ") + secs(c.cooldownRemainingMs)));
-      } else if (c.state !== "off"){
-        box.appendChild(el("div", "cd", "probing on next request"));
-      }
-      wrap.appendChild(box);
-    }
-
-    var m = el("div", "metrics");
-    m.appendChild(metric("requests", fmtInt(c.totalRequests)));
-    m.appendChild(metric("failures", fmtInt(c.totalFailures)));
-    m.appendChild(metric("success", pct(c.totalFailures, c.totalRequests)));
-    m.appendChild(metric("last ok", rel(c.lastSuccessAt)));
-    m.appendChild(metric("last fail", rel(c.lastFailureAt)));
-    m.appendChild(metric("latency", c.lastLatencyMs != null ? c.lastLatencyMs + "ms" : "—"));
-    wrap.appendChild(m);
-
-    var acts = el("div", "actions");
-    var b = !!busy[c.id];
-    if (c.state === "off"){
-      acts.appendChild(mkBtn("Enable", "act", b, function(){ act(c.id, "enable"); }));
-    } else {
-      acts.appendChild(mkBtn("Disable", "act danger", b, function(){ act(c.id, "disable"); }));
-    }
-    if (c.state === "down" || c.state === "cooling"){
-      acts.appendChild(mkBtn("Reset", "act", b, function(){ act(c.id, "reset"); }));
-    }
-    if (!c.active && c.state !== "off"){
-      acts.appendChild(mkBtn("Make active", "act", b, function(){ act(c.id, "pin"); }));
-    }
-    if (c.pinned){
-      acts.appendChild(mkBtn("Unpin", "act", b, function(){ act(c.id, "unpin"); }));
-    }
-    wrap.appendChild(acts);
-    return wrap;
-  }
-
   function mkBtn(label, cls, disabled, fn){
-    var btn = el("button", cls, label); btn.disabled = disabled; btn.onclick = fn; return btn;
+    var b = el("button", cls, label); b.disabled = disabled; b.onclick = fn; return b;
+  }
+
+  function allAccounts(provs){
+    var out = []; provs.forEach(function(p){ p.accounts.forEach(function(a){ out.push(a); }); }); return out;
+  }
+  function counts(items){
+    var c = { up:0, cooling:0, down:0, off:0, reqs:0, fails:0 };
+    items.forEach(function(a){
+      if (a.state === "up") c.up++; else if (a.state === "cooling") c.cooling++;
+      else if (a.state === "down") c.down++; else if (a.state === "off") c.off++;
+      c.reqs += a.totalRequests; c.fails += a.totalFailures;
+    });
+    return c;
+  }
+
+  function overall(provs){
+    var o = document.getElementById("overall");
+    var c = counts(allAccounts(provs));
+    setClass(o, "pill " + (c.down ? "bad" : c.cooling ? "warn" : "ok"));
+    setText(o.querySelector(".lbl"), c.down ? (c.down + " down") : c.cooling ? (c.cooling + " cooling") : (c.up + " healthy"));
+  }
+
+  function ensureSummary(){
+    if (sum) return;
+    var box = document.getElementById("summary");
+    sum = {};
+    [["providers","providers"],["accounts","accounts"],["healthy","healthy"],["cooling","cooling"],["down / off","downoff"]].forEach(function(d){
+      var s = el("div","stat"); s.appendChild(el("div","k",d[0]));
+      var v = el("div","v num"); s.appendChild(v); box.appendChild(s); sum[d[1]] = v;
+    });
+    var s = el("div","stat"); s.appendChild(el("div","k","requests"));
+    var v = el("div","v num"); var main = document.createTextNode(""); var sm = el("small");
+    v.appendChild(main); v.appendChild(sm); s.appendChild(v); box.appendChild(s);
+    sum.reqMain = main; sum.reqSub = sm;
+  }
+
+  function updateSummary(provs){
+    ensureSummary();
+    var items = allAccounts(provs); var c = counts(items);
+    setText(sum.providers, String(provs.length));
+    setText(sum.accounts, String(items.length));
+    setText(sum.healthy, String(c.up));
+    setText(sum.cooling, String(c.cooling));
+    setText(sum.downoff, String(c.down + c.off));
+    var r = fmtInt(c.reqs); if (sum.reqMain.nodeValue !== r) sum.reqMain.nodeValue = r;
+    setText(sum.reqSub, " " + pct(c.fails, c.reqs) + " ok");
+  }
+
+  // Build an account card ONCE and return update(a) that mutates it in place.
+  function buildCard(){
+    var root = el("div","card");
+    var r1 = el("div","row1");
+    r1.appendChild(el("span","sdot"));
+    var cid = el("span","cid"); r1.appendChild(cid);
+    var state = el("span","state"); r1.appendChild(state);
+    var sp = el("span"); sp.style.flex = "1"; r1.appendChild(sp);
+    var activeBadge = el("span","badge active","active"); r1.appendChild(activeBadge);
+    var pinBadge = el("span","badge pin","pinned"); r1.appendChild(pinBadge);
+    root.appendChild(r1);
+
+    var meta = el("div","meta");
+    var host = el("span","host mono"); var nokey = el("span","badge","no key");
+    meta.appendChild(host); meta.appendChild(nokey);
+    root.appendChild(meta);
+
+    var reason = el("div","reason");
+    var why = el("span","why"); var sep = document.createTextNode(""); var errEl = el("span","err"); var cd = el("div","cd");
+    reason.appendChild(why); reason.appendChild(sep); reason.appendChild(errEl); reason.appendChild(cd);
+    root.appendChild(reason);
+
+    var metrics = el("div","metrics");
+    function metric(k){ var m = el("div","metric"); m.appendChild(el("div","mk",k)); var v = el("div","mv num"); m.appendChild(v); metrics.appendChild(m); return v; }
+    var mReq = metric("requests"), mFail = metric("failures"), mSucc = metric("success"),
+        mOk = metric("last ok"), mBad = metric("last fail"), mLat = metric("latency");
+    root.appendChild(metrics);
+
+    var actions = el("div","actions"); root.appendChild(actions);
+    var actKey = "";
+
+    function update(a){
+      setClass(root, "card s-" + a.state + (a.active ? " active" : ""));
+      setText(cid, a.id);
+      setText(state, a.state);
+      show(activeBadge, !!a.active);
+      show(pinBadge, !!a.pinned);
+      setText(host, a.host);
+      show(nokey, !a.hasKey);
+
+      var isReason = (a.state === "cooling" || a.state === "down" || a.state === "off");
+      show(reason, isReason);
+      if (isReason){
+        var hard = a.state === "down";
+        setClass(reason, "reason " + (hard ? "hard" : a.state === "off" ? "" : "soft"));
+        setText(why, a.reason || (a.state === "off" ? "manual" : a.state));
+        var hasErr = !!a.lastError;
+        show(errEl, hasErr);
+        var s = hasErr ? " · " : ""; if (sep.nodeValue !== s) sep.nodeValue = s;
+        if (hasErr) setText(errEl, a.lastError);
+        if (a.cooldownRemainingMs != null && a.cooldownRemainingMs > 0) setText(cd, (hard ? "recheck in " : "probe in ") + secs(a.cooldownRemainingMs));
+        else if (a.state !== "off") setText(cd, "probing on next request");
+        else setText(cd, "");
+      }
+
+      setText(mReq, fmtInt(a.totalRequests));
+      setText(mFail, fmtInt(a.totalFailures));
+      setText(mSucc, pct(a.totalFailures, a.totalRequests));
+      setText(mOk, rel(a.lastSuccessAt));
+      setText(mBad, rel(a.lastFailureAt));
+      setText(mLat, a.lastLatencyMs != null ? a.lastLatencyMs + "ms" : "—");
+
+      var b = !!busy[a.id];
+      var key = a.state + "|" + (a.active ? 1 : 0) + "|" + (a.pinned ? 1 : 0) + "|" + (b ? 1 : 0);
+      if (key !== actKey){
+        actKey = key;
+        actions.textContent = "";
+        if (a.state === "off") actions.appendChild(mkBtn("Enable","act",b,function(){ act(a.id,"enable"); }));
+        else actions.appendChild(mkBtn("Disable","act danger",b,function(){ act(a.id,"disable"); }));
+        if (a.state === "down" || a.state === "cooling") actions.appendChild(mkBtn("Reset","act",b,function(){ act(a.id,"reset"); }));
+        if (!a.active && a.state !== "off") actions.appendChild(mkBtn("Make active","act",b,function(){ act(a.id,"pin"); }));
+        if (a.pinned) actions.appendChild(mkBtn("Unpin","act",b,function(){ act(a.id,"unpin"); }));
+      }
+    }
+
+    return { root: root, update: update };
+  }
+
+  function buildGroup(){
+    var section = el("div","provider");
+    var head = el("div","phead");
+    head.appendChild(el("span","pdot"));
+    var pname = el("span","pname"); head.appendChild(pname);
+    var ptype = el("span","ptype"); head.appendChild(ptype);
+    var pmeta = el("span","pmeta"); head.appendChild(pmeta);
+    section.appendChild(head);
+    var grid = el("div","grid"); section.appendChild(grid);
+    return { section: section, head: head, pname: pname, ptype: ptype, pmeta: pmeta, grid: grid, cards: {} };
+  }
+
+  function updateGroupHead(g, p){
+    var c = counts(p.accounts);
+    setClass(g.head, "phead " + (c.down ? "g-bad" : c.cooling ? "g-warn" : "g-ok"));
+    setText(g.pname, p.id);
+    setText(g.ptype, p.type);
+    var active = p.activeId ? ("active: " + p.activeId) : "no active account";
+    setText(g.pmeta, p.accounts.length + " account" + (p.accounts.length === 1 ? "" : "s") + " · " + active);
   }
 
   function render(payload){
     if (!payload) return;
-    var items = payload.connectors || [];
-    document.getElementById("empty").style.display = items.length ? "none" : "block";
-    overall(items);
-    summary(items, payload.activeId);
-    var grid = document.getElementById("grid"); grid.innerHTML = "";
-    items.forEach(function(c){ grid.appendChild(card(c)); });
+    var provs = payload.providers || [];
+    show(document.getElementById("empty"), provs.length === 0);
+    overall(provs);
+    updateSummary(provs);
+
+    var container = document.getElementById("providers");
+    var seenG = {};
+    provs.forEach(function(p){
+      seenG[p.id] = true;
+      var g = groups[p.id];
+      if (!g){ g = buildGroup(); groups[p.id] = g; container.appendChild(g.section); }
+      updateGroupHead(g, p);
+      var seenA = {};
+      p.accounts.forEach(function(a){
+        seenA[a.id] = true;
+        var card = g.cards[a.id];
+        if (!card){ card = buildCard(); g.cards[a.id] = card; g.grid.appendChild(card.root); }
+        card.update(a);
+      });
+      Object.keys(g.cards).forEach(function(id){
+        if (!seenA[id]){ if (g.cards[id].root.parentNode) g.grid.removeChild(g.cards[id].root); delete g.cards[id]; }
+      });
+    });
+    Object.keys(groups).forEach(function(id){
+      if (!seenG[id]){ if (groups[id].section.parentNode) container.removeChild(groups[id].section); delete groups[id]; }
+    });
   }
 
   function tick(){
     get().then(function(j){
-      last = j;
-      document.getElementById("updated").textContent = "updated just now";
+      last = j; since = Date.now();
       document.getElementById("hb").classList.add("beat");
       render(j);
+      setText(document.getElementById("updated"), "updated just now");
     }).catch(function(e){
       if (String(e.message) !== "auth"){
-        document.getElementById("updated").textContent = "disconnected — retrying";
+        setText(document.getElementById("updated"), "disconnected — retrying");
         document.getElementById("hb").classList.remove("beat");
       }
     });
   }
 
-  // Re-label "updated" as time passes (without a fetch), and refresh cooldown countdowns.
-  var since = Date.now();
-  function relabel(){
-    if (last){ document.getElementById("updated").textContent = "updated " + rel(since); }
-  }
-
   document.getElementById("tokensave").onclick = function(){
-    setTok(document.getElementById("tokenin").value.trim());
-    showTokenBar(false); tick();
+    setTok(document.getElementById("tokenin").value.trim()); showTokenBar(false); tick();
   };
   document.getElementById("tokenin").addEventListener("keydown", function(e){
     if (e.key === "Enter") document.getElementById("tokensave").click();
   });
 
-  function loop(){ since = Date.now(); tick(); }
-  loop();
-  setInterval(loop, POLL_MS);
-  setInterval(relabel, 1000);
+  tick();
+  setInterval(tick, POLL_MS);
+  // 1 s in-place refresh keeps relative times + cooldown countdowns live between
+  // network polls — no fetch, no flicker (render() only writes changed values).
+  setInterval(function(){ if (last){ render(last); setText(document.getElementById("updated"), "updated " + rel(since)); } }, 1000);
 })();
 </script>
 </body>

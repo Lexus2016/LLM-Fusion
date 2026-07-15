@@ -1,9 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { parseConfig } from "../src/config";
-import { connectorDefs, resolveConnectors } from "../src/connectors/resolve";
+import { groupDefs, resolveProviders } from "../src/connectors/resolve";
 import type { FetchFn } from "../src/types";
 
-const models = { models: { m: { strategy: "single", target: "x" } } };
 const stubFetch: FetchFn = async () => new Response("{}");
 
 function at<T>(arr: T[], i: number): T {
@@ -12,83 +11,129 @@ function at<T>(arr: T[], i: number): T {
   return v;
 }
 
-describe("config: connectors", () => {
-  it("accepts a connectors list and applies defaults", () => {
+describe("config: provider groups", () => {
+  it("accepts a providers map and applies defaults", () => {
     const cfg = parseConfig({
       upstream: { max_concurrency: 4 },
-      connectors: [
-        { id: "a", provider: "ollama", base_url: "https://ollama.com", api_key_env: "K1" },
-        {
-          id: "b",
-          provider: "openai-compat",
-          base_url: "https://openrouter.ai/api/v1",
-          api_key_env: "K2",
-          model_map: { x: "y/z" },
-          extra_headers: { "X-Title": "llm-fusion" },
+      providers: {
+        "ollama-cloud": {
+          type: "ollama",
+          base_url: "https://ollama.com",
+          accounts: [
+            { id: "acc-1", api_key_env: "K1" },
+            { id: "acc-2", api_key_env: "K2" },
+          ],
         },
-      ],
-      ...models,
+        openrouter: {
+          type: "openai-compat",
+          base_url: "https://openrouter.ai/api/v1",
+          accounts: [{ id: "or-1", api_key_env: "K3", model_map: { x: "y/z" } }],
+        },
+      },
+      models: { m: { strategy: "single", provider: "ollama-cloud", target: "glm-5.2" } },
     });
-    expect(cfg.connectors).toHaveLength(2);
-    expect(at(cfg.connectors ?? [], 0).treat_403_as).toBe("passthrough");
-    expect(at(cfg.connectors ?? [], 0).quota_markers).toEqual([]);
-    expect(cfg.upstream.connector_cooldown_s).toBe(60);
-    expect(cfg.upstream.connector_down_recheck_s).toBe(900);
+    expect(Object.keys(cfg.providers ?? {})).toEqual(["ollama-cloud", "openrouter"]);
+    const acc = (cfg.providers ?? {})["ollama-cloud"]?.accounts?.[0];
+    expect(acc?.treat_403_as).toBe("passthrough");
+    expect(acc?.quota_markers).toEqual([]);
   });
 
-  it("backward compat: single upstream, no connectors → one synthesised connector", () => {
+  it("backward compat: legacy single upstream → one synthesised `default` group", () => {
     const cfg = parseConfig({
       upstream: { base_url: "https://ollama.com", api_key_env: "OLLAMA_API_KEY" },
-      ...models,
+      models: { m: { strategy: "single", target: "glm-5.2" } },
     });
-    const defs = connectorDefs(cfg);
+    const defs = groupDefs(cfg);
     expect(defs).toHaveLength(1);
-    expect(at(defs, 0)).toMatchObject({
-      id: "default",
-      provider: "ollama",
-      base_url: "https://ollama.com",
-      api_key_env: "OLLAMA_API_KEY",
-    });
+    expect(at(defs, 0)).toMatchObject({ id: "default", type: "ollama", base_url: "https://ollama.com" });
+    expect(at(defs, 0).accounts[0]).toMatchObject({ id: "default", api_key_env: "OLLAMA_API_KEY" });
   });
 
-  it("rejects duplicate connector ids", () => {
+  it("a model with no `provider` is fine when there is one group, rejected when ambiguous", () => {
+    // single group -> provider optional
     expect(() =>
       parseConfig({
         upstream: {},
-        connectors: [
-          { id: "a", base_url: "https://x.com", api_key_env: "K1" },
-          { id: "a", base_url: "https://y.com", api_key_env: "K2" },
-        ],
-        ...models,
+        providers: { g1: { type: "ollama", base_url: "https://a.com", accounts: [{ id: "a", api_key_env: "K" }] } },
+        models: { m: { strategy: "single", target: "x" } },
       }),
-    ).toThrow(/duplicate connector id/);
+    ).not.toThrow();
+    // two groups -> provider required
+    expect(() =>
+      parseConfig({
+        upstream: {},
+        providers: {
+          g1: { type: "ollama", base_url: "https://a.com", accounts: [{ id: "a", api_key_env: "K1" }] },
+          g2: { type: "openai-compat", base_url: "https://b.com", accounts: [{ id: "b", api_key_env: "K2" }] },
+        },
+        models: { m: { strategy: "single", target: "x" } },
+      }),
+    ).toThrow(/must set .*provider/);
   });
 
-  it("rejects a config with no connector source at all", () => {
-    expect(() => parseConfig({ upstream: { max_concurrency: 4 }, ...models })).toThrow(
-      /no connectors configured/,
-    );
+  it("rejects a model bound to an unknown provider group", () => {
+    expect(() =>
+      parseConfig({
+        upstream: {},
+        providers: { g1: { type: "ollama", base_url: "https://a.com", accounts: [{ id: "a", api_key_env: "K" }] } },
+        models: { m: { strategy: "single", provider: "nope", target: "x" } },
+      }),
+    ).toThrow(/not defined in .*providers/);
   });
 
-  it("resolveConnectors reads keys from env, derives host, and picks the client", () => {
+  it("rejects duplicate account ids across providers", () => {
+    expect(() =>
+      parseConfig({
+        upstream: {},
+        providers: {
+          g1: { type: "ollama", base_url: "https://a.com", accounts: [{ id: "dup", api_key_env: "K1" }] },
+          g2: { type: "ollama", base_url: "https://b.com", accounts: [{ id: "dup", api_key_env: "K2" }] },
+        },
+        models: { m: { strategy: "single", provider: "g1", target: "x" } },
+      }),
+    ).toThrow(/duplicate account id/);
+  });
+
+  it("rejects an account with no base_url when the provider sets none", () => {
+    expect(() =>
+      parseConfig({
+        upstream: {},
+        providers: { g1: { type: "ollama", accounts: [{ id: "a", api_key_env: "K" }] } },
+        models: { m: { strategy: "single", provider: "g1", target: "x" } },
+      }),
+    ).toThrow(/no base_url/);
+  });
+
+  it("rejects a config with no provider source at all", () => {
+    expect(() =>
+      parseConfig({ upstream: { max_concurrency: 4 }, models: { m: { strategy: "single", target: "x" } } }),
+    ).toThrow(/no providers configured/);
+  });
+
+  it("resolveProviders reads keys from env, derives host, and picks the client per group", () => {
     const cfg = parseConfig({
       upstream: {},
-      connectors: [
-        { id: "a", provider: "ollama", base_url: "https://ollama.com/", api_key_env: "PRESENT" },
-        {
-          id: "b",
-          provider: "openai-compat",
-          base_url: "https://openrouter.ai/api/v1",
-          api_key_env: "MISSING",
-          model_map: { x: "y" },
+      providers: {
+        "ollama-cloud": {
+          type: "ollama",
+          base_url: "https://ollama.com/",
+          accounts: [{ id: "acc-1", api_key_env: "PRESENT" }],
         },
-      ],
-      ...models,
+        openrouter: {
+          type: "openai-compat",
+          base_url: "https://openrouter.ai/api/v1",
+          accounts: [{ id: "or-1", api_key_env: "MISSING", model_map: { x: "y" } }],
+        },
+      },
+      models: { m: { strategy: "single", provider: "ollama-cloud", target: "x" } },
     });
-    const entries = resolveConnectors(cfg, { env: { PRESENT: "sk-1" }, fetchFn: stubFetch });
-    expect(at(entries, 0).cfg).toMatchObject({ id: "a", host: "https://ollama.com", hasKey: true });
-    expect(at(entries, 1).cfg).toMatchObject({ id: "b", hasKey: false, modelMap: { x: "y" } });
-    expect(at(entries, 0).client.supportsNativeShow).toBe(true); // ollama
-    expect(at(entries, 1).client.supportsNativeShow).toBe(false); // generic
+    const groups = resolveProviders(cfg, { env: { PRESENT: "sk-1" }, fetchFn: stubFetch });
+    expect(groups.map((g) => g.id)).toEqual(["ollama-cloud", "openrouter"]);
+    const ollama = at(groups, 0).accounts[0];
+    const or = at(groups, 1).accounts[0];
+    expect(ollama?.cfg).toMatchObject({ id: "acc-1", group: "ollama-cloud", host: "https://ollama.com", hasKey: true });
+    expect(ollama?.client.supportsNativeShow).toBe(true);
+    expect(or?.cfg).toMatchObject({ id: "or-1", group: "openrouter", hasKey: false, modelMap: { x: "y" } });
+    expect(or?.client.supportsNativeShow).toBe(false);
   });
 });

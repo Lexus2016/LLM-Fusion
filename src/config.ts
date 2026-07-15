@@ -19,6 +19,7 @@ import { z } from "zod";
 const SingleModelSchema = z
   .object({
     strategy: z.literal("single"),
+    provider: z.string().min(1).optional(),
     target: z.string().min(1),
     // Per-model override of `defaults.promote_reasoning_to_content`.
     promote_reasoning_to_content: z.boolean().optional(),
@@ -33,6 +34,7 @@ const SingleModelSchema = z
 const FailoverModelSchema = z
   .object({
     strategy: z.literal("failover"),
+    provider: z.string().min(1).optional(),
     chain: z.array(z.string().min(1)).min(1),
     // Per-model override of `defaults.promote_reasoning_to_content`.
     promote_reasoning_to_content: z.boolean().optional(),
@@ -84,6 +86,7 @@ const WebSearchSchema = z
 const FusionModelSchema = z
   .object({
     strategy: z.literal("fusion"),
+    provider: z.string().min(1).optional(),
     panel: z.array(z.string().min(1)).min(1),
     judge: z.string().min(1),
     synth: z.string().min(1),
@@ -130,6 +133,7 @@ const FusionBlockSchema = z
 const SmartModelSchema = z
   .object({
     strategy: z.literal("smart"),
+    provider: z.string().min(1).optional(),
     router: z.string().min(1),
     default: z.enum(["simple", "fusion"]).default("simple"),
     // Agent-loop escalation: when the latest tool result in the conversation
@@ -201,33 +205,50 @@ const UpstreamSchema = z
   .strict();
 
 /**
- * A single upstream connector — one account/endpoint. An ordered list of these
- * forms the pool the proxy fails over across (multiple Ollama Cloud accounts
- * and/or other OpenAI-compatible providers). Holds only the env-var NAME of the
- * key, never the key itself.
+ * A single account of a provider — one credential/endpoint the proxy fails over
+ * across WITHIN its provider group (same provider = same models). Holds only the
+ * env-var NAME of the key, never the key itself.
  */
-const ConnectorSchema = z
+const AccountSchema = z
   .object({
     id: z.string().min(1),
-    // `ollama` = native-capable (adds /api/show discovery + /api/chat vision).
-    // `openai-compat` = the generic OpenAI `/v1/chat/completions` provider that
-    // covers OpenRouter, DeepInfra, Together, Novita, Nebius, Groq, DeepSeek, …
-    provider: z.enum(["ollama", "openai-compat"]).default("ollama"),
-    base_url: z.string().url(),
     api_key_env: z.string().min(1),
-    // Per-connector override of the pool-wide `upstream.request_timeout_s`.
+    // Override the provider group's `base_url` for this one account (rare).
+    base_url: z.string().url().optional(),
+    // Per-account override of the pool-wide `upstream.request_timeout_s`.
     request_timeout_s: z.number().int().positive().lt(182).optional(),
-    // Logical→upstream model-id map (e.g. `qwen3-coder:480b`→`qwen/qwen3-coder`
-    // for OpenRouter). Identity when a model is absent from the map.
+    // Logical→upstream model-id map (e.g. `qwen3-coder:480b`→`qwen/qwen3-coder`).
+    // Identity when a model is absent from the map.
     model_map: z.record(z.string(), z.string()).optional(),
     // Extra request headers (e.g. OpenRouter ranking headers HTTP-Referer/X-Title).
     extra_headers: z.record(z.string(), z.string()).optional(),
-    // How to treat a 403: `passthrough` (client error, connector stays healthy)
-    // or `down` (some gateways use 403 for no-credits/disabled).
+    // How to treat a 403: `passthrough` (client error, account stays healthy) or
+    // `down` (some gateways use 403 for no-credits/disabled).
     treat_403_as: z.enum(["passthrough", "down"]).default("passthrough"),
     // Opt-in lowercased substrings that escalate a 429 body from a transient
-    // rate-limit to `quota` (connector down). Empty = never escalate on text.
+    // rate-limit to `quota` (account down). Empty = never escalate on text.
     quota_markers: z.array(z.string().min(1)).default([]),
+  })
+  .strict();
+
+/**
+ * A provider group — one upstream provider (Ollama Cloud, OpenRouter, …) and its
+ * ordered list of interchangeable ACCOUNTS. Failover happens WITHIN a group, so
+ * every account of a group serves the SAME models: a fusion built on this group
+ * stays consistent when one account degrades and the next takes over. A virtual
+ * model is bound to exactly one provider group (see each model's `provider`), so
+ * it never silently jumps to a provider with a different model catalog.
+ */
+const ProviderSchema = z
+  .object({
+    // `ollama` = native-capable (adds /api/show discovery + /api/chat vision).
+    // `openai-compat` = the generic OpenAI `/v1/chat/completions` provider that
+    // covers OpenRouter, DeepInfra, Together, Novita, Nebius, Groq, DeepSeek, …
+    type: z.enum(["ollama", "openai-compat"]).default("ollama"),
+    // Group-level default base URL; an account may override it. Required unless
+    // every account sets its own `base_url` (validated in superRefine).
+    base_url: z.string().url().optional(),
+    accounts: z.array(AccountSchema).min(1),
   })
   .strict();
 
@@ -265,34 +286,68 @@ export const ConfigSchema = z
     overrides: z.record(z.string(), OverrideSchema).default({}),
     // Optional cost accounting. Absent/empty -> cost_usd stays null.
     pricing: z.record(z.string(), PricingEntrySchema).optional(),
-    // Optional ordered connector pool. When absent, a single connector is
-    // synthesised from `upstream.base_url` + `upstream.api_key_env` (fully
-    // backward compatible). When present, it is the pool and supersedes those.
-    connectors: z.array(ConnectorSchema).min(1).optional(),
+    // Provider groups: each is one upstream provider (Ollama Cloud, OpenRouter, …)
+    // and its ordered accounts, which the proxy fails over across WITHIN the group
+    // (same models). When absent, a single `default` provider is synthesised from
+    // the legacy `upstream.base_url` + `upstream.api_key_env` (backward compatible).
+    providers: z.record(z.string().min(1), ProviderSchema).optional(),
   })
   .strict()
   .superRefine((cfg, ctx) => {
-    // Connector pool: either an explicit `connectors:` list, or the single
-    // connector implied by `upstream.base_url` + `upstream.api_key_env`.
-    if (cfg.connectors && cfg.connectors.length > 0) {
-      const seen = new Set<string>();
-      cfg.connectors.forEach((conn, i) => {
-        if (seen.has(conn.id)) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            path: ["connectors", i, "id"],
-            message: `duplicate connector id '${conn.id}'; each connector id must be unique`,
-          });
-        }
-        seen.add(conn.id);
-      });
-    } else if (!cfg.upstream.base_url || !cfg.upstream.api_key_env) {
+    // Provider groups: either explicit `providers:`, or the single `default`
+    // provider implied by `upstream.base_url` + `upstream.api_key_env`.
+    const groupIds = new Set<string>();
+    if (cfg.providers && Object.keys(cfg.providers).length > 0) {
+      const seenAccounts = new Set<string>();
+      for (const [gid, group] of Object.entries(cfg.providers)) {
+        groupIds.add(gid);
+        group.accounts.forEach((acc, i) => {
+          if (seenAccounts.has(acc.id)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ["providers", gid, "accounts", i, "id"],
+              message: `duplicate account id '${acc.id}'; account ids must be unique across ALL providers`,
+            });
+          }
+          seenAccounts.add(acc.id);
+          if (!acc.base_url && !group.base_url) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ["providers", gid, "accounts", i, "base_url"],
+              message: `account '${acc.id}' has no base_url and provider '${gid}' sets none; set one on either`,
+            });
+          }
+        });
+      }
+    } else if (cfg.upstream.base_url && cfg.upstream.api_key_env) {
+      groupIds.add("default");
+    } else {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ["upstream", "base_url"],
+        path: ["providers"],
         message:
-          "no connectors configured: provide a top-level `connectors:` list, or set both `upstream.base_url` and `upstream.api_key_env`",
+          "no providers configured: provide a top-level `providers:` map, or set both `upstream.base_url` and `upstream.api_key_env`",
       });
+    }
+    // Each model is bound to one provider group. An explicit `provider` must
+    // resolve; when omitted it defaults to the sole group (error if ambiguous).
+    const soleGroup = groupIds.size === 1 ? [...groupIds][0] : undefined;
+    for (const [name, entry] of Object.entries(cfg.models)) {
+      if (entry.provider !== undefined) {
+        if (!groupIds.has(entry.provider)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["models", name, "provider"],
+            message: `model '${name}' is bound to provider '${entry.provider}', which is not defined in \`providers\``,
+          });
+        }
+      } else if (soleGroup === undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["models", name, "provider"],
+          message: `model '${name}' must set \`provider\` (there are multiple provider groups; it is ambiguous which one serves it)`,
+        });
+      }
     }
     // A `smart` model may reference other configured models by name for its
     // `simple` / `fusion` slots; those references must resolve.
@@ -370,7 +425,8 @@ function checkSmartReference(
 
 export type Config = z.infer<typeof ConfigSchema>;
 export type ModelConfig = z.infer<typeof ModelSchema>;
-export type ConnectorConfig = z.infer<typeof ConnectorSchema>;
+export type ProviderConfig = z.infer<typeof ProviderSchema>;
+export type AccountConfig = z.infer<typeof AccountSchema>;
 export type SingleModelConfig = z.infer<typeof SingleModelSchema>;
 export type FailoverModelConfig = z.infer<typeof FailoverModelSchema>;
 export type FusionModelConfig = z.infer<typeof FusionModelSchema>;

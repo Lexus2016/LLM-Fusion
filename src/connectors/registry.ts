@@ -23,19 +23,23 @@ import {
  *    `down` is never downgraded to `cooling` by a subsequent soft failure.
  */
 
-/** A connector definition resolved from config (no secrets). */
+/** A connector definition resolved from config (no secrets). One account of a
+ *  provider group. */
 export interface ResolvedConnector {
   id: string;
+  /** Provider group this account belongs to (failover stays within the group). */
+  group: string;
+  /** Client kind: `ollama` (native-capable) or generic `openai-compat`. */
   provider: "ollama" | "openai-compat";
   /** Full base URL (used for the client; the panel shows only `host`). */
   baseUrl: string;
   /** Display host (scheme + host, no path/secrets). */
   host: string;
-  /** True when the connector's api-key env var resolved to a non-empty value. */
+  /** True when the account's api-key env var resolved to a non-empty value. */
   hasKey: boolean;
   treat403As: "passthrough" | "down";
   quotaMarkers: string[];
-  /** Per-connector logical→upstream model-id map (identity when absent). */
+  /** Per-account logical→upstream model-id map (identity when absent). */
   modelMap: Record<string, string>;
 }
 
@@ -81,6 +85,7 @@ export type Acquire =
 /** A plain, secret-free snapshot of one connector for the panel/JSON. */
 export interface ConnectorSnapshot {
   id: string;
+  group: string;
   provider: string;
   host: string;
   hasKey: boolean;
@@ -336,6 +341,7 @@ export class ConnectorRegistry {
       const remaining = cooling ? Math.max(0, r.cooldownUntil - now) : null;
       return {
         id: r.cfg.id,
+        group: r.cfg.group,
         provider: r.cfg.provider,
         host: r.cfg.host,
         hasKey: r.cfg.hasKey,

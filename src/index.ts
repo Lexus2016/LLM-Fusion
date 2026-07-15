@@ -1,8 +1,7 @@
 import { serve } from "@hono/node-server";
 import { createConfigManager } from "./config";
-import { resolveConnectors } from "./connectors/resolve";
-import { ConnectorRegistry } from "./connectors/registry";
-import { PooledUpstreamClient } from "./connectors/pooled_client";
+import { resolveProviders } from "./connectors/resolve";
+import { ProviderRouter } from "./connectors/provider_router";
 import { CapabilityService } from "./capabilities";
 import { createApp } from "./server";
 import { createLogger } from "./logging";
@@ -33,18 +32,21 @@ async function main(): Promise<void> {
   const manager = await createConfigManager(configPath, logger);
   const cfg = manager.config;
 
-  // Build the connector pool: one connector per Ollama Cloud account / other
-  // OpenAI-compatible provider (or a single connector synthesised from the legacy
-  // `upstream.base_url`+`api_key_env`). Keys are read from each connector's env
-  // var here and never stored in config snapshots. The pool + registry are
-  // process-lifetime (like the resilience limiter): models/routing hot-reload,
-  // but connector/upstream changes need a restart.
-  const entries = resolveConnectors(cfg, { env: process.env, logger });
-  const registry = new ConnectorRegistry(entries, {
+  // Build the provider-group router: one registry + pool per provider group
+  // (Ollama Cloud, OpenRouter, …), each with its ordered accounts. Failover stays
+  // within a group; a virtual model is served by its group's pool. Legacy single
+  // `upstream.base_url`+`api_key_env` synthesises one `default` group. The router
+  // is process-lifetime (like the resilience limiter): models/routing hot-reload,
+  // but provider/account changes need a restart.
+  const groups = resolveProviders(cfg, { env: process.env, logger });
+  const router = new ProviderRouter(groups, {
     cooldownMs: cfg.upstream.connector_cooldown_s * 1000,
     downRecheckMs: cfg.upstream.connector_down_recheck_s * 1000,
+    logger,
   });
-  const client = new PooledUpstreamClient(registry, { logger });
+  // Capability discovery + fallback use the first group's pool (routes /api/show
+  // to an ollama account, else degrades to defaults).
+  const client = router.defaultPool;
 
   const capabilities = new CapabilityService({
     client,
@@ -52,10 +54,10 @@ async function main(): Promise<void> {
     logger,
   });
   manager.onReload(() => {
-    // Models / routing / overrides / pricing hot-reload live; connector and
+    // Models / routing / overrides / pricing hot-reload live; provider and
     // upstream (base_url / key / concurrency) changes need a restart.
     capabilities.clear();
-    logger.info("configuration reloaded (models/routing); connector & upstream changes need a restart");
+    logger.info("configuration reloaded (models/routing); provider & upstream changes need a restart");
   });
 
   const getAuthToken = (): string | undefined => {
@@ -75,7 +77,7 @@ async function main(): Promise<void> {
     capabilities,
     getAuthToken,
     logger,
-    registry,
+    router,
   });
 
   // `server.bind` is the default; FUSION_BIND overrides it without editing the
@@ -92,9 +94,10 @@ async function main(): Promise<void> {
   const models = Object.entries(manager.config.models).map(
     ([name, entry]) => `${name} (${entry.strategy})`,
   );
-  const connectors = entries.map(
-    (e) => `${e.cfg.id} (${e.cfg.provider}${e.cfg.hasKey ? "" : ", NO KEY"})`,
-  );
+  const providers = groups.map((g) => {
+    const missing = g.accounts.filter((a) => !a.cfg.hasKey).length;
+    return `${g.id} (${g.type}, ${g.accounts.length} account${g.accounts.length === 1 ? "" : "s"}${missing ? `, ${missing} NO KEY` : ""})`;
+  });
   logger.info(
     {
       bind,
@@ -103,7 +106,7 @@ async function main(): Promise<void> {
       panel: `http://${bind}:${port}/panel`,
       models,
       auth: authOn ? "on" : "off",
-      connectors,
+      providers,
       config: configPath,
     },
     "llm-fusion starting",

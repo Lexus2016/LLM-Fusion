@@ -24,10 +24,15 @@ export async function dispatch(ctx: RequestContext): Promise<Response> {
     throw new NotFoundError(`unknown virtual model '${name}'`);
   }
 
+  // Route to the pool of the provider group this model is bound to, so failover
+  // stays within one provider (same models). Falls back to ctx.client when no
+  // router is wired (bare unit contexts).
+  const client = ctx.router ? ctx.router.poolFor(entry.provider) : ctx.client;
+
   const strategyCtx: StrategyContext = {
     request: ctx.request,
     config: ctx.config,
-    client: ctx.client,
+    client,
     capabilities: ctx.capabilities,
     logger: ctx.logger,
     resilience: ctx.resilience,

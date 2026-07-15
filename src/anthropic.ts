@@ -10,6 +10,7 @@ import type {
   ContentPart,
   RequestUsage,
   UpstreamClient,
+  UpstreamRouter,
   Usage,
 } from "./types";
 import type { Resilience } from "./concurrency";
@@ -172,6 +173,7 @@ export type AnthropicMessage = z.infer<typeof MessageSchema>;
 export interface AnthropicDeps {
   getConfig: () => Config;
   client: UpstreamClient;
+  router?: UpstreamRouter;
   capabilities: CapabilityProvider;
   getAuthToken: () => string | undefined;
   logger: Logger;
@@ -913,6 +915,7 @@ export function createAnthropicApp(deps: AnthropicDeps): Hono {
         request: openAiRequest,
         config,
         client: deps.client,
+        router: deps.router,
         capabilities: deps.capabilities,
         logger: reqLogger,
         resilience: deps.resilience,
