@@ -271,12 +271,29 @@ and a `model_map` (their model ids differ from Ollama's). See
 [`docs/providers-research.md`](docs/providers-research.md) for a ranked
 comparison and which providers signal an exhausted account cleanly (`402`).
 
-**The panel.** Open **http://127.0.0.1:8080/panel** to watch it live: which
-connector is active, which are cooling or down and *why* (reason + last error +
-countdown), per-connector request/failure counts, and manual controls —
-disable, enable, reset, or pin a connector as active. When a client auth token
-is configured, the panel's data and actions require it (the HTML shell carries
-no secrets). Backward compatible: omit `connectors:` and the legacy single
+**The panel — monitor + no-YAML editor.** Open **http://127.0.0.1:8080/panel**.
+It has three tabs:
+
+- **Monitor** — live health: which account is active, which are cooling or down
+  and *why* (reason + last error + countdown), per-account request/failure
+  counts, and manual controls (disable, enable, reset, or pin an account as
+  active). Flicker-free — it reconciles the view in place instead of redrawing.
+- **Providers** — add, edit, or remove provider groups and their accounts
+  through forms with plain-language hints. No hand-written YAML.
+- **Models** — create and edit `fusion` / `smart` / `failover` / `single`
+  models the same way: pick a strategy and the form shows only the fields that
+  strategy needs (panel, judge, synth, router, …), each explained inline.
+
+The **Models** form doesn't make you type model ids from memory: it fetches the
+selected provider's **live catalog** (`GET /v1/models`, with a fallback to
+Ollama's `/api/tags`) and offers it as a pick-list, so panel / judge / synth /
+router members are chosen, not mistyped. Every edit is validated with the same
+schema the server boots from, written through a comment-preserving YAML editor,
+backed up (timestamped) and saved atomically; models hot-reload and provider
+changes rebuild the live pool — **no restart**. Destructive actions
+(disable / delete / …) ask for confirmation first. When a client auth token is
+configured, the panel's data and actions require it (the HTML shell carries no
+secrets). Backward compatible: omit `providers:` and the legacy single
 `upstream.base_url` + `api_key_env` still works unchanged.
 
 ## The honest cost note (read this)
@@ -448,6 +465,10 @@ On boot it prints a banner: the listen URL, the loaded virtual models and their 
 | `GET /panel` | Local connector dashboard (HTML). Shows each provider group, which account is active, which are cooling/down and why, with manual controls. |
 | `GET /admin/providers` | Grouped JSON snapshot of provider/account health (auth-gated when a client token is set). Backs the panel. |
 | `POST /admin/connectors/:id/{disable,enable,reset,pin,unpin}` | Manual account controls (auth-gated). |
+| `GET /admin/config` | Current editable config — provider groups, models, defaults, and which api-key env vars resolve (env-var **names** + presence only, never secret values). Backs the Providers/Models tabs. |
+| `PUT · DELETE /admin/config/models/:name` | Create/edit or delete a virtual model. Validated, comment-preserving, backed-up, atomic; hot-reloaded. |
+| `PUT · DELETE /admin/config/providers/:id` | Create/edit or delete a provider group. Same write guarantees; rebuilds the live pool. |
+| `GET /admin/config/providers/:id/models` | The provider's live model catalog (for the no-typo picker). Cached briefly; degrades to an empty list so the form never blocks. |
 
 ## Phase 0 — live verification
 
