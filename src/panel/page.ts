@@ -41,8 +41,8 @@ export const PANEL_HTML = `<!doctype html>
   }
   *{box-sizing:border-box}
   html,body{margin:0}
-  body{background:var(--bg); color:var(--fg); font-family:var(--sans); font-size:14px; line-height:1.45;
-    -webkit-font-smoothing:antialiased; padding:26px 22px 60px; max-width:1180px; margin:0 auto}
+  body{background:var(--bg); color:var(--fg); font-family:var(--sans); font-size:15px; line-height:1.5;
+    -webkit-font-smoothing:antialiased; padding:28px 22px 64px; max-width:1180px; margin:0 auto}
   .num{font-variant-numeric:tabular-nums}
   .mono{font-family:var(--mono)}
   .muted{color:var(--muted)}
@@ -146,29 +146,44 @@ export const PANEL_HTML = `<!doctype html>
   .ovl{position:fixed; inset:0; background:rgba(4,7,11,.5); display:none; align-items:center; justify-content:center; z-index:30; backdrop-filter:blur(2px); padding:20px}
   .ovl.on{display:flex; animation:fade .12s ease both}
   @keyframes fade{from{opacity:0}to{opacity:1}}
-  .modal{background:var(--panel); border:1px solid var(--line-2); border-radius:14px; box-shadow:var(--shadow); padding:20px 20px 16px; max-width:400px; width:100%; animation:rise .16s ease both}
-  .modal.wide{max-width:560px; max-height:calc(100vh - 60px); overflow:auto}
-  .modal h3{margin:0 0 8px; font-size:15px; display:flex; align-items:center; gap:9px}
-  .modal h3 .idot{width:9px;height:9px;border-radius:50%; background:var(--cooling); flex:none}
+  .modal{background:var(--panel); border:1px solid var(--line-2); border-radius:16px; box-shadow:var(--shadow); padding:24px 24px 20px; max-width:440px; width:100%; animation:rise .16s ease both}
+  .modal.wide{max-width:720px; max-height:calc(100vh - 48px); overflow:auto; padding:26px 28px 22px}
+  .modal h3{margin:0 0 10px; font-size:18px; font-weight:680; letter-spacing:.2px; display:flex; align-items:center; gap:10px}
+  .modal h3 .idot{width:10px;height:10px;border-radius:50%; background:var(--cooling); flex:none}
   .modal h3.danger .idot{background:var(--down)}
-  .modal p{margin:0 0 18px; color:var(--muted); font-size:13.5px; line-height:1.55}
+  .modal p{margin:0 0 18px; color:var(--muted); font-size:14px; line-height:1.6; text-wrap:pretty}
   .modal p b{color:var(--fg); font-family:var(--mono); font-weight:600}
-  .modal .row{display:flex; gap:8px; justify-content:flex-end; margin-top:6px}
-  .ferr{color:var(--down); font-size:12.5px; margin:0 0 12px; display:none}
-  .ferr.on{display:block}
+  .modal .row{display:flex; gap:10px; justify-content:flex-end; margin-top:16px}
+  .modal .row button.act{font-size:14px; padding:9px 20px; border-radius:9px}
+  .modal .ferr{color:var(--down); font-size:13px; margin:0 0 14px; display:none}
+  .modal .ferr.on{display:block}
 
-  .fld{margin-bottom:14px}
-  .fld > label{display:block; font-size:12.5px; font-weight:600; margin-bottom:4px}
-  .fld .hint{color:var(--muted); font-size:11.5px; line-height:1.45; margin-bottom:6px}
-  .fld input[type=text], .fld select, .fld textarea{width:100%; font:inherit; font-size:13px; background:var(--panel-2);
-    border:1px solid var(--line-2); border-radius:8px; padding:8px 10px; color:var(--fg)}
+  .fld{margin-bottom:18px}
+  .fld > label{display:block; font-size:13.5px; font-weight:600; margin-bottom:5px}
+  .fld .hint{color:var(--muted); font-size:12.5px; line-height:1.5; margin-bottom:8px; text-wrap:pretty}
+  .fld input[type=text], .fld select, .fld textarea{width:100%; font:inherit; font-size:14px; background:var(--panel-2);
+    border:1px solid var(--line-2); border-radius:9px; padding:10px 12px; color:var(--fg);
+    transition:border-color .14s ease, box-shadow .14s ease}
+  .fld input[type=text]:focus, .fld select:focus, .fld textarea:focus{outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-bg)}
   .fld input.mono, .fld textarea{font-family:var(--mono)}
-  .fld textarea{min-height:60px; resize:vertical}
-  .fld.toggle{display:flex; align-items:center; gap:10px}
-  .fld.toggle > div{flex:1}
-  .sw{width:38px;height:22px;border-radius:999px;background:var(--line-2);position:relative;cursor:pointer;flex:none;transition:background .15s}
-  .sw:after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;transition:left .15s}
-  .sw.on{background:var(--accent)} .sw.on:after{left:18px}
+  .fld textarea{min-height:64px; resize:vertical}
+  .fld select{appearance:none; -webkit-appearance:none; padding-right:36px; cursor:pointer;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b98a9' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+    background-repeat:no-repeat; background-position:right 13px center}
+
+  /* toggle: a full clickable row-card with a proper-sized switch on the right */
+  .fld.toggle{display:flex; align-items:center; gap:16px; margin-bottom:12px; padding:13px 15px;
+    background:var(--panel-2); border:1px solid var(--line); border-radius:11px; cursor:pointer;
+    transition:border-color .14s ease, background .14s ease}
+  .fld.toggle:hover{border-color:var(--line-2)}
+  .fld.toggle .tgtxt{flex:1; min-width:0}
+  .fld.toggle .tgtxt label{display:block; font-size:13.5px; font-weight:600; margin:0 0 3px; cursor:pointer}
+  .fld.toggle .tgtxt .hint{margin:0}
+  .sw{width:48px; height:28px; border-radius:999px; background:var(--line-2); position:relative; flex:none;
+    transition:background .18s ease}
+  .sw:after{content:""; position:absolute; top:3px; left:3px; width:22px; height:22px; border-radius:50%;
+    background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.35); transition:left .18s cubic-bezier(.2,0,0,1)}
+  .sw.on{background:var(--accent)} .sw.on:after{left:23px}
   .rows{display:flex; flex-direction:column; gap:6px}
   .kv{display:flex; gap:6px} .kv input{flex:1}
   .tags{display:flex; flex-wrap:wrap; gap:6px; align-items:center}
@@ -420,8 +435,8 @@ export const PANEL_HTML = `<!doctype html>
   function attachSuggest(input, f, suggestions){ if(!suggestions||!suggestions.length) return; var did="dl"+(++dlSeq); var dl=el("datalist"); dl.id=did; suggestions.forEach(function(s){ var o=el("option"); o.value=s; dl.appendChild(o); }); input.setAttribute("list",did); f.appendChild(dl); }
   function fText(label, hint, value, mono, suggestions){ var f=fld(label,hint); var i=el("input"); i.type="text"; if(mono) i.className="mono"; i.value=value==null?"":value; attachSuggest(i,f,suggestions); f.appendChild(i); f._get=function(){ return i.value.trim(); }; return f; }
   function fSelect(label, hint, value, options){ var f=fld(label,hint); var s=el("select"); options.forEach(function(o){ var op=el("option",null,o.label||o); op.value=(o.value!=null?o.value:o); if((o.value!=null?o.value:o)===value) op.selected=true; s.appendChild(op); }); f.appendChild(s); f._get=function(){ return s.value; }; return f; }
-  function fToggle(label, hint, value){ var f=el("div","fld toggle"); var d=el("div"); d.appendChild(el("label",null,label)); if(hint) d.appendChild(el("div","hint",hint)); f.appendChild(d);
-    var sw=el("div","sw"+(value?" on":"")); sw.onclick=function(){ sw.classList.toggle("on"); }; f.appendChild(sw); f._get=function(){ return sw.classList.contains("on"); }; return f; }
+  function fToggle(label, hint, value){ var f=el("div","fld toggle"); var d=el("div","tgtxt"); d.appendChild(el("label",null,label)); if(hint) d.appendChild(el("div","hint",hint)); f.appendChild(d);
+    var sw=el("div","sw"+(value?" on":"")); f.appendChild(sw); f.onclick=function(){ sw.classList.toggle("on"); }; f._get=function(){ return sw.classList.contains("on"); }; return f; }
   function fTags(label, hint, arr, suggestions){ var f=fld(label,hint); var box=el("div","tags"); var vals=(arr||[]).slice();
     function draw(){ box.textContent=""; vals.forEach(function(v,i){ var t=el("span","tag"); t.appendChild(document.createTextNode(v)); var x=el("button",null,"×"); x.type="button"; x.onclick=function(){ vals.splice(i,1); draw(); }; t.appendChild(x); box.appendChild(t); });
       var add=el("span","addrow"); var inp=el("input"); inp.type="text"; inp.className="mono"; inp.placeholder="add…"; attachSuggest(inp,add,suggestions);
