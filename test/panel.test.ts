@@ -60,8 +60,9 @@ describe("panel routes", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("<!doctype html>");
-    expect(html).toContain("connectors");
-    expect(html).not.toContain("api_key"); // no secrets in the shell
+    expect(html).toContain("admin/providers");
+    // The shell carries env-var NAMES only, never a secret key VALUE.
+    expect(html).not.toMatch(/sk-[A-Za-z0-9]{6}/);
   });
 
   it("GET /admin/providers returns grouped snapshot", async () => {

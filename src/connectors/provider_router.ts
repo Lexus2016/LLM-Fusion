@@ -35,18 +35,35 @@ interface GroupRuntime {
 }
 
 export class ProviderRouter implements UpstreamRouter {
-  private readonly groups = new Map<string, GroupRuntime>();
+  private groups = new Map<string, GroupRuntime>();
+  private readonly opts: ProviderRouterOptions;
 
   constructor(groups: ResolvedGroup[], opts: ProviderRouterOptions = {}) {
+    this.opts = opts;
+    this.groups = this.build(groups);
+  }
+
+  private build(groups: ResolvedGroup[]): Map<string, GroupRuntime> {
+    const map = new Map<string, GroupRuntime>();
     for (const g of groups) {
       const registry = new ConnectorRegistry(g.accounts, {
-        cooldownMs: opts.cooldownMs,
-        downRecheckMs: opts.downRecheckMs,
-        now: opts.now,
+        cooldownMs: this.opts.cooldownMs,
+        downRecheckMs: this.opts.downRecheckMs,
+        now: this.opts.now,
       });
-      const pool = new PooledUpstreamClient(registry, { logger: opts.logger, now: opts.now });
-      this.groups.set(g.id, { id: g.id, type: g.type, registry, pool });
+      const pool = new PooledUpstreamClient(registry, { logger: this.opts.logger, now: this.opts.now });
+      map.set(g.id, { id: g.id, type: g.type, registry, pool });
     }
+    return map;
+  }
+
+  /**
+   * Rebuild the groups from a fresh resolution (used when the config editor
+   * changes `providers:`). Per-account health resets — acceptable for an operator
+   * edit, and only invoked when the providers section actually changed.
+   */
+  reload(groups: ResolvedGroup[]): void {
+    this.groups = this.build(groups);
   }
 
   /** The only group's id, or undefined when there are 0 or 2+ groups. */

@@ -53,11 +53,43 @@ async function main(): Promise<void> {
     getOverrides: () => manager.config.overrides,
     logger,
   });
+  const providersSignature = (gs: typeof groups): string =>
+    JSON.stringify(
+      gs.map((g) => ({
+        id: g.id,
+        type: g.type,
+        accounts: g.accounts.map((a) => ({
+          id: a.cfg.id,
+          baseUrl: a.cfg.baseUrl,
+          treat403As: a.cfg.treat403As,
+          quotaMarkers: a.cfg.quotaMarkers,
+          modelMap: a.cfg.modelMap,
+        })),
+      })),
+    );
+  let prevProviders = providersSignature(groups);
+
   manager.onReload(() => {
-    // Models / routing / overrides / pricing hot-reload live; provider and
-    // upstream (base_url / key / concurrency) changes need a restart.
+    // Models / routing hot-reload live. When the config editor changes the
+    // `providers:` layer, rebuild the router in place so it applies without a
+    // restart; a models-only edit leaves connector health untouched.
     capabilities.clear();
-    logger.info("configuration reloaded (models/routing); provider & upstream changes need a restart");
+    try {
+      const newGroups = resolveProviders(manager.config, { env: process.env, logger });
+      const sig = providersSignature(newGroups);
+      if (sig !== prevProviders) {
+        router.reload(newGroups);
+        prevProviders = sig;
+        logger.info("configuration reloaded (providers rebuilt live)");
+      } else {
+        logger.info("configuration reloaded (models/routing)");
+      }
+    } catch (err) {
+      logger.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        "provider reload failed; keeping the previous router",
+      );
+    }
   });
 
   const getAuthToken = (): string | undefined => {
@@ -78,6 +110,8 @@ async function main(): Promise<void> {
     getAuthToken,
     logger,
     router,
+    configPath,
+    envHas: (name: string) => Boolean(process.env[name]),
   });
 
   // `server.bind` is the default; FUSION_BIND overrides it without editing the

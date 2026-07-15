@@ -1,7 +1,9 @@
 import { Hono } from "hono";
 import type { MiddlewareHandler } from "hono";
 import type { Logger } from "pino";
+import type { Config } from "../config";
 import type { ProviderRouter } from "../connectors/provider_router";
+import { createConfigEditorApp } from "./config_editor";
 import { PANEL_HTML } from "./page";
 
 /**
@@ -23,6 +25,11 @@ export interface PanelDeps {
   router: ProviderRouter;
   auth: MiddlewareHandler;
   logger: Logger;
+  /** Config accessors for the editor (`/admin/config*`). Optional so bare unit
+   *  tests can build the monitor-only panel without a config file. */
+  getConfig?: () => Config;
+  configPath?: string;
+  envHas?: (name: string) => boolean;
 }
 
 const ACTIONS = new Set(["disable", "enable", "reset", "pin", "unpin"]);
@@ -31,6 +38,20 @@ export function createPanelApp(deps: PanelDeps): Hono {
   const app = new Hono();
 
   app.get("/panel", (c) => c.html(PANEL_HTML));
+
+  // No-YAML config editor (create/edit/delete providers + models), when wired.
+  if (deps.getConfig && deps.configPath && deps.envHas) {
+    app.route(
+      "/",
+      createConfigEditorApp({
+        getConfig: deps.getConfig,
+        configPath: deps.configPath,
+        auth: deps.auth,
+        logger: deps.logger,
+        envHas: deps.envHas,
+      }),
+    );
+  }
 
   app.get("/admin/providers", deps.auth, (c) =>
     c.json({ ...deps.router.snapshot(), now: Date.now() }),

@@ -50,6 +50,10 @@ export interface AppDeps {
    * so bare unit tests can build the app without one; the server always supplies it.
    */
   router?: ProviderRouter;
+  /** Path to the config file, for the panel's config editor. */
+  configPath?: string;
+  /** Whether an api-key env var resolves (for the config editor's UI hints). */
+  envHas?: (name: string) => boolean;
 }
 
 interface ModelListItem {
@@ -77,7 +81,17 @@ export function createApp(deps: AppDeps): Hono {
 
   // Local connector panel + admin API (mounted only when a router is wired).
   if (deps.router) {
-    app.route("/", createPanelApp({ router: deps.router, auth, logger: deps.logger }));
+    app.route(
+      "/",
+      createPanelApp({
+        router: deps.router,
+        auth,
+        logger: deps.logger,
+        getConfig: deps.getConfig,
+        configPath: deps.configPath,
+        envHas: deps.envHas,
+      }),
+    );
   }
 
   app.get("/ready", async (c) => {
