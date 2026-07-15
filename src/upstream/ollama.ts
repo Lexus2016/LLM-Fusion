@@ -1,10 +1,7 @@
-import type { ChatCompletionResult, FetchFn, UpstreamClient } from "../types";
-import { tapStreamUsage, usageFromBody } from "../usage";
-import {
-  NativeStreamingNotImplementedError,
-  UpstreamNetworkError,
-  UpstreamTimeoutError,
-} from "../errors";
+import type { ChatCompletionResult, FetchFn } from "../types";
+import { usageFromBody } from "../usage";
+import { NativeStreamingNotImplementedError, UpstreamNetworkError } from "../errors";
+import { OpenAiCompatClient, readBody } from "./openai_compat";
 
 export interface OllamaClientOptions {
   baseUrl: string;
@@ -13,135 +10,28 @@ export interface OllamaClientOptions {
   fetchFn?: FetchFn;
   /** Per-call timeout in ms. Must stay below the ~182 s Ollama Cloud ceiling. */
   timeoutMs?: number;
+  /** Extra request headers merged into every call (rarely needed for Ollama). */
+  extraHeaders?: Record<string, string>;
 }
 
 /**
- * Ollama Cloud client.
- *
- * Implements the OpenAI-compat path (`/v1/chat/completions`), the native
- * discovery path (`/api/show`), and the native chat path (`/api/chat`). The
- * native chat path serves vision requests when `api_mode === "native"`; its
- * non-stream path is wired, while native NDJSON streaming is deferred (a typed
- * `NativeStreamingNotImplementedError` is thrown).
+ * Ollama Cloud client — an OpenAI-compatible client (inherited) that additionally
+ * implements the native discovery path (`/api/show`) and native chat path
+ * (`/api/chat`). The native chat path serves vision requests when
+ * `api_mode === "native"`; its non-stream path is wired, while native NDJSON
+ * streaming is deferred (a typed `NativeStreamingNotImplementedError` is thrown).
  */
-export class OllamaClient implements UpstreamClient {
-  private baseUrl: string;
-  private apiKey: string | undefined;
-  private readonly fetchFn: FetchFn;
-  private timeoutMs: number;
-
+export class OllamaClient extends OpenAiCompatClient {
   constructor(opts: OllamaClientOptions) {
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
-    this.apiKey = opts.apiKey;
-    this.fetchFn = opts.fetchFn ?? globalThis.fetch;
-    this.timeoutMs = opts.timeoutMs ?? 170_000;
+    super({ ...opts, authScheme: "Bearer" });
   }
 
-  updateConfig(opts: { baseUrl: string; apiKey?: string; timeoutMs?: number }): void {
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
-    this.apiKey = opts.apiKey;
-    if (opts.timeoutMs !== undefined) {
-      this.timeoutMs = opts.timeoutMs;
-    }
+  /** Ollama is the one provider that can answer native `/api/show` discovery. */
+  override get supportsNativeShow(): boolean {
+    return true;
   }
 
-  private headers(): Record<string, string> {
-    const h: Record<string, string> = { "content-type": "application/json" };
-    if (this.apiKey) h.authorization = `Bearer ${this.apiKey}`;
-    return h;
-  }
-
-  private async doFetch(
-    url: string,
-    init: RequestInit,
-    opts: { phaseTimeoutOnly?: boolean } = {},
-  ): Promise<Response> {
-    // Per-call timeout. Two shapes:
-    //  - default (non-stream): the timeout covers the whole request incl. body
-    //    read, via `AbortSignal.timeout` (unref'd, does not keep the event loop
-    //    alive). Combined with any caller signal so a stage timeout/shutdown can
-    //    cancel the in-flight request and free its concurrency slot promptly.
-    //  - phaseTimeoutOnly (stream): the timeout is a CONNECTION/first-response
-    //    timeout only. It is cleared the instant `fetch()` resolves (the headers
-    //    are back), so a slow-but-progressing stream is NOT hard-cut mid-delivery
-    //    — the model already produced its answer and is delivering it. The stream
-    //    is still cancellable by the caller's signal (client disconnect / stage
-    //    abort). This turns the hard request_timeout_s into a dynamic one: it
-    //    bounds time-to-first-response, not total response time.
-    if (opts.phaseTimeoutOnly) {
-      const phaseAbort = new AbortController();
-      const handle = setTimeout(() => phaseAbort.abort(), this.timeoutMs);
-      handle.unref?.();
-      const signal = init.signal ? AbortSignal.any([init.signal, phaseAbort.signal]) : phaseAbort.signal;
-      try {
-        const res = await this.fetchFn(url, { ...init, signal });
-        // Headers received — stop the hard timeout so the streaming body is not
-        // truncated once the model starts delivering.
-        clearTimeout(handle);
-        return res;
-      } catch (err) {
-        clearTimeout(handle);
-        if (phaseAbort.signal.aborted) {
-          throw new UpstreamTimeoutError(`upstream request to ${url} timed out after ${this.timeoutMs}ms`);
-        }
-        if (init.signal?.aborted) {
-          throw new UpstreamTimeoutError(`upstream request to ${url} was cancelled by the caller`);
-        }
-        const message = err instanceof Error ? err.message : "upstream request failed";
-        throw new UpstreamNetworkError(`upstream request to ${url} failed: ${message}`);
-      }
-    }
-    const timeout = AbortSignal.timeout(this.timeoutMs);
-    const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
-    try {
-      return await this.fetchFn(url, { ...init, signal });
-    } catch (err) {
-      if (timeout.aborted) {
-        throw new UpstreamTimeoutError(`upstream request to ${url} timed out after ${this.timeoutMs}ms`);
-      }
-      if (init.signal?.aborted) {
-        throw new UpstreamTimeoutError(`upstream request to ${url} was cancelled by the caller`);
-      }
-      const message = err instanceof Error ? err.message : "upstream request failed";
-      throw new UpstreamNetworkError(`upstream request to ${url} failed: ${message}`);
-    }
-  }
-
-  async chatCompletions(
-    body: Record<string, unknown>,
-    opts: { stream: boolean; signal?: AbortSignal },
-  ): Promise<ChatCompletionResult> {
-    const url = `${this.baseUrl}/v1/chat/completions`;
-    const payload = withIncludeUsage({ ...body, stream: opts.stream }, opts.stream);
-    const res = await this.doFetch(
-      url,
-      {
-        method: "POST",
-        headers: this.headers(),
-        body: JSON.stringify(payload),
-        signal: opts.signal,
-      },
-      // Stream: hard timeout is connection/first-response only — once the model
-      // starts delivering, do not cut it. See doFetch.
-      { phaseTimeoutOnly: opts.stream },
-    );
-    // Stream only when the upstream actually succeeded; an error before the
-    // first byte is surfaced as a JSON body with the upstream status.
-    if (opts.stream && res.ok) {
-      const { stream, usage } = tapStreamUsage(res.body);
-      return {
-        kind: "stream",
-        status: res.status,
-        body: stream,
-        contentType: res.headers.get("content-type"),
-        usage,
-      };
-    }
-    const data = await readBody(res);
-    return { kind: "json", status: res.status, data, usage: usageFromBody(data) };
-  }
-
-  async show(model: string, opts: { signal?: AbortSignal } = {}): Promise<unknown> {
+  override async show(model: string, opts: { signal?: AbortSignal } = {}): Promise<unknown> {
     const url = `${this.baseUrl}/api/show`;
     const res = await this.doFetch(url, {
       method: "POST",
@@ -157,8 +47,7 @@ export class OllamaClient implements UpstreamClient {
     return readBody(res);
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  async chatNative(
+  override async chatNative(
     body: Record<string, unknown>,
     opts: { stream: boolean; signal?: AbortSignal },
   ): Promise<ChatCompletionResult> {
@@ -180,31 +69,5 @@ export class OllamaClient implements UpstreamClient {
     });
     const data = await readBody(res);
     return { kind: "json", status: res.status, data, usage: usageFromBody(data) };
-  }
-}
-
-/**
- * Add `stream_options:{include_usage:true}` for streaming requests so Ollama
- * emits a final SSE chunk carrying `usage`. Merges with any caller-supplied
- * `stream_options`. A no-op for non-stream requests.
- */
-function withIncludeUsage(
-  payload: Record<string, unknown>,
-  stream: boolean,
-): Record<string, unknown> {
-  if (!stream) return payload;
-  const existing = payload.stream_options;
-  const base = typeof existing === "object" && existing !== null ? existing : {};
-  return { ...payload, stream_options: { ...base, include_usage: true } };
-}
-
-/** Read a response body as JSON when possible, falling back to text or null. */
-async function readBody(res: Response): Promise<unknown> {
-  const text = await res.text();
-  if (text.length === 0) return null;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
   }
 }

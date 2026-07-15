@@ -6,6 +6,8 @@ import type { Config } from "./config";
 import type { CapabilityProvider, RequestUsage, UpstreamClient } from "./types";
 import type { Resilience } from "./concurrency";
 import { resilienceForUpstream } from "./concurrency";
+import type { ConnectorRegistry } from "./connectors/registry";
+import { createPanelApp } from "./panel/routes";
 import { ChatCompletionRequestSchema } from "./types";
 import {
   makeUsageInjectionTransform,
@@ -42,6 +44,12 @@ export interface AppDeps {
    * deterministic one (no-op sleeper, controllable clock).
    */
   resilience?: Resilience;
+  /**
+   * Connector registry backing the local panel (`/panel`, `/admin/connectors`).
+   * Optional so bare unit tests can build the app without one; the server always
+   * supplies it.
+   */
+  registry?: ConnectorRegistry;
 }
 
 interface ModelListItem {
@@ -67,7 +75,21 @@ export function createApp(deps: AppDeps): Hono {
 
   app.get("/health", (c) => c.json({ status: "ok" }));
 
+  // Local connector panel + admin API (mounted only when a registry is wired).
+  if (deps.registry) {
+    app.route("/", createPanelApp({ registry: deps.registry, auth, logger: deps.logger }));
+  }
+
   app.get("/ready", async (c) => {
+    // With a connector pool, readiness reflects the pool: ready iff at least one
+    // connector is currently up. This holds for any provider mix (an
+    // openai-compat-only pool has no native /api/show to probe).
+    if (deps.registry) {
+      const up = deps.registry.snapshot().some((s) => s.state === "up");
+      return up
+        ? c.json({ status: "ok" })
+        : c.json({ status: "degraded", reason: "no connector is currently up" }, 503);
+    }
     const config = deps.getConfig();
     const member = firstMember(config);
     if (!member) {

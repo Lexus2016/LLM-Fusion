@@ -84,6 +84,13 @@ export class AllMembersFailedError extends FusionError {
   }
 }
 
+/** 503 — no connector in the pool is currently usable (all off/cooling/down). */
+export class NoConnectorAvailableError extends FusionError {
+  constructor(message: string) {
+    super(message, 503, "no_connector_available");
+  }
+}
+
 /**
  * 503 — the per-model circuit breaker is open (the model is fast-failing while
  * it cools down). In a failover chain this is raised only when *every* member

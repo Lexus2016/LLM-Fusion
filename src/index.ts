@@ -1,6 +1,8 @@
 import { serve } from "@hono/node-server";
 import { createConfigManager } from "./config";
-import { OllamaClient } from "./upstream/ollama";
+import { resolveConnectors } from "./connectors/resolve";
+import { ConnectorRegistry } from "./connectors/registry";
+import { PooledUpstreamClient } from "./connectors/pooled_client";
 import { CapabilityService } from "./capabilities";
 import { createApp } from "./server";
 import { createLogger } from "./logging";
@@ -31,21 +33,18 @@ async function main(): Promise<void> {
   const manager = await createConfigManager(configPath, logger);
   const cfg = manager.config;
 
-  const apiKey = process.env[cfg.upstream.api_key_env];
-  if (!apiKey) {
-    logger.warn(
-      { env: cfg.upstream.api_key_env },
-      "upstream API key env var is unset; upstream calls will be unauthenticated and will likely fail",
-    );
-  }
-
-  // The upstream block (base_url / key / timeout) is read once at boot; routing
-  // and model changes hot-reload live, but upstream changes need a restart.
-  const client = new OllamaClient({
-    baseUrl: cfg.upstream.base_url,
-    apiKey,
-    timeoutMs: cfg.upstream.request_timeout_s * 1000,
+  // Build the connector pool: one connector per Ollama Cloud account / other
+  // OpenAI-compatible provider (or a single connector synthesised from the legacy
+  // `upstream.base_url`+`api_key_env`). Keys are read from each connector's env
+  // var here and never stored in config snapshots. The pool + registry are
+  // process-lifetime (like the resilience limiter): models/routing hot-reload,
+  // but connector/upstream changes need a restart.
+  const entries = resolveConnectors(cfg, { env: process.env, logger });
+  const registry = new ConnectorRegistry(entries, {
+    cooldownMs: cfg.upstream.connector_cooldown_s * 1000,
+    downRecheckMs: cfg.upstream.connector_down_recheck_s * 1000,
   });
+  const client = new PooledUpstreamClient(registry, { logger });
 
   const capabilities = new CapabilityService({
     client,
@@ -53,15 +52,10 @@ async function main(): Promise<void> {
     logger,
   });
   manager.onReload(() => {
+    // Models / routing / overrides / pricing hot-reload live; connector and
+    // upstream (base_url / key / concurrency) changes need a restart.
     capabilities.clear();
-    const newCfg = manager.config;
-    const newKey = process.env[newCfg.upstream.api_key_env];
-    client.updateConfig({
-      baseUrl: newCfg.upstream.base_url,
-      apiKey: newKey,
-      timeoutMs: newCfg.upstream.request_timeout_s * 1000,
-    });
-    logger.info("upstream configuration updated in client");
+    logger.info("configuration reloaded (models/routing); connector & upstream changes need a restart");
   });
 
   const getAuthToken = (): string | undefined => {
@@ -81,6 +75,7 @@ async function main(): Promise<void> {
     capabilities,
     getAuthToken,
     logger,
+    registry,
   });
 
   // `server.bind` is the default; FUSION_BIND overrides it without editing the
@@ -92,20 +87,23 @@ async function main(): Promise<void> {
   const { port } = manager.config.server;
 
   // Startup banner: what is listening, which virtual models are loaded and with
-  // which strategy, whether client auth is enforced, and whether the upstream
-  // key is present. No secret values are logged.
+  // which strategy, whether client auth is enforced, and the connector pool
+  // (id, provider, and whether each connector's key resolved). No secrets logged.
   const models = Object.entries(manager.config.models).map(
     ([name, entry]) => `${name} (${entry.strategy})`,
+  );
+  const connectors = entries.map(
+    (e) => `${e.cfg.id} (${e.cfg.provider}${e.cfg.hasKey ? "" : ", NO KEY"})`,
   );
   logger.info(
     {
       bind,
       port,
       url: `http://${bind}:${port}`,
+      panel: `http://${bind}:${port}/panel`,
       models,
       auth: authOn ? "on" : "off",
-      upstream_key: apiKey ? "present" : "MISSING",
-      upstream: cfg.upstream.base_url,
+      connectors,
       config: configPath,
     },
     "llm-fusion starting",

@@ -60,7 +60,18 @@ export type FetchFn = typeof globalThis.fetch;
 
 /** Result of an upstream chat-completions call, carrying its measured `Usage`. */
 export type ChatCompletionResult =
-  | { kind: "json"; status: number; data: unknown; usage: Usage }
+  | {
+      kind: "json";
+      status: number;
+      data: unknown;
+      usage: Usage;
+      /**
+       * Parsed `Retry-After` (ms) when the upstream sent one on a 429/503. Used
+       * by the connector pool to time a connector's cooldown from the provider's
+       * own hint instead of a fixed constant. Absent when no header was present.
+       */
+      retryAfterMs?: number;
+    }
   | {
       kind: "stream";
       status: number;

@@ -223,6 +223,56 @@ Long agent runs used to die on four load-dependent failure modes; all four are n
 - **Single-route tool-turn guard (v0.1.26).** The smart `simple` passthrough — the route ~87 % of agent steps take — gets its own completeness guard. Three field-validated failure modes used to end the agent's turn with nothing executed (the "does one step, then stops until you type *continue*" stall): the model *narrating* the next action in prose instead of emitting the tool call; a large-file write cut by the output cap mid-arguments (`finish_reason:"length"`, unrunnable JSON); and the upstream terminating long generation streams (~5 min on Ollama Cloud). The guard detects all three on tool-carrying requests and runs one **live-streamed** recovery retry (nudged to emit the tool call and write large payloads in chunks), failing open to the original response. Every tool-carrying stream also logs one `tool-turn terminal state` line, so a real-session stall is diagnosable from the log alone.
 - **Per-model `request_overrides` (v0.1.26).** Single models (and the smart inline `simple` slot) accept extra request-body fields merged into every upstream call — e.g. `request_overrides: { reasoning_effort: "none" }` stops a thinking model from deliberating for minutes on mechanical agent steps (A/B-measured on glm-5.2: reasoning 1692→0 chars, 6 s→2 s, tool-calling intact; `think:false` and `"low"` are ignored by Ollama Cloud). Core keys (`model`, `messages`, `stream`, `tools`, `tool_choice`) are protected. The shipped `fusion-agents` preset uses exactly this.
 
+## Connectors, multi-account failover & the panel
+
+By default the proxy talks to one upstream (one Ollama Cloud account). You can
+instead give it an **ordered pool of connectors** — several Ollama Cloud accounts
+and/or other OpenAI-compatible providers — and it **fails over between them
+automatically** when one degrades, hits its rate limit, or its billing runs out.
+
+```yaml
+connectors:
+  - id: ollama-primary          # tried first
+    provider: ollama
+    base_url: https://ollama.com
+    api_key_env: OLLAMA_API_KEY
+  - id: ollama-backup           # same models, second account/key
+    provider: ollama
+    base_url: https://ollama.com
+    api_key_env: OLLAMA_API_KEY_2
+  - id: openrouter-1            # any OpenAI-compatible provider
+    provider: openai-compat
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    model_map: { "qwen3-coder:480b": "qwen/qwen3-coder" }
+```
+
+**How failover decides.** The first healthy connector serves. A `429`
+(rate-limit), `5xx`, network error, or timeout **cools** that connector down for
+`connector_cooldown_s` and the next one takes over; the cooled connector is
+auto-probed once the window elapses. A `401` (bad key), `402` (out of credits),
+or a body-matched quota exhaustion marks it **down** ("billing ended") — skipped
+until `connector_down_recheck_s` or a manual reset. When several connectors are
+throttled the proxy surfaces the most-recoverable error (a transient `429` beats
+a dead backup's `401`), so a passing request is never turned into a hard failure.
+It's transparent: every model/strategy (single, failover, fusion, smart) rides
+the pool with no config change.
+
+**Any OpenAI-compatible provider works by config alone.** The generic
+`openai-compat` type covers OpenRouter, DeepInfra, Together, Novita, Nebius,
+Groq, Cerebras, DeepSeek, Mistral, Baseten, … — set `base_url`, `api_key_env`,
+and a `model_map` (their model ids differ from Ollama's). See
+[`docs/providers-research.md`](docs/providers-research.md) for a ranked
+comparison and which providers signal an exhausted account cleanly (`402`).
+
+**The panel.** Open **http://127.0.0.1:8080/panel** to watch it live: which
+connector is active, which are cooling or down and *why* (reason + last error +
+countdown), per-connector request/failure counts, and manual controls —
+disable, enable, reset, or pin a connector as active. When a client auth token
+is configured, the panel's data and actions require it (the HTML shell carries
+no secrets). Backward compatible: omit `connectors:` and the legacy single
+`upstream.base_url` + `api_key_env` still works unchanged.
+
 ## The honest cost note (read this)
 
 Full fusion runs on **every** step. An agent loop (read → think → edit → run tests → re-read …) multiplies upstream **model API calls**:
@@ -389,6 +439,9 @@ On boot it prints a banner: the listen URL, the loaded virtual models and their 
 | `GET /v1/models` | Lists the configured virtual models (OpenAI list shape). Adds `context_window` / `supports_vision` where capability discovery knows them. |
 | `GET /health` | Liveness. `200` if the process is up. No upstream check. |
 | `GET /ready` | Readiness. `200` only if the upstream is reachable and a representative model is discoverable; otherwise `503`. |
+| `GET /panel` | Local connector dashboard (HTML). Shows which connector is active, which are cooling/down and why, with manual controls. |
+| `GET /admin/connectors` | JSON snapshot of connector health (auth-gated when a client token is set). Backs the panel. |
+| `POST /admin/connectors/:id/{disable,enable,reset,pin}` · `POST /admin/unpin` | Manual connector controls (auth-gated). |
 
 ## Phase 0 — live verification
 

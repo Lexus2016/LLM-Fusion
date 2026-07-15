@@ -1,4 +1,6 @@
 upstream:
+  # base_url / api_key_env describe the DEFAULT single connector. They are
+  # OPTIONAL when a `connectors:` list (below) is present; required otherwise.
   base_url: https://ollama.com        # Ollama Cloud root
   api_key_env: OLLAMA_API_KEY         # env var holding the Bearer key (never inline)
   api_mode: auto                      # auto | openai | native   (default: auto)
@@ -13,12 +15,57 @@ upstream:
   # per_model_concurrency:
   #   deepseek-v4-pro: 2              # cap a background-traffic carrier
   request_timeout_s: 170              # per upstream call; MUST be < 182 (default: 170)
+  # Connector-pool failover tuning (see `connectors:` below and the /panel):
+  connector_cooldown_s: 60            # SOFT failure (rate_limit/5xx/network/timeout) cooldown
+                                      # before a connector is probed again (default: 60)
+  connector_down_recheck_s: 900       # HARD failure (auth/payment/quota — "billing ended")
+                                      # recheck window before an auto-probe; 0 = never
+                                      # (manual reset only in the panel). (default: 900)
+
+# --- connectors (optional) --------------------------------------------------
+# An ordered pool of upstream accounts/providers the proxy fails over across.
+# When ABSENT, a single connector is synthesised from `upstream.base_url` +
+# `upstream.api_key_env` above (fully backward compatible). When PRESENT, this
+# list IS the pool and is tried top-to-bottom: the first healthy connector
+# serves; on a rate-limit / server / network failure it cools down and the next
+# connector takes over; on an auth (401) / payment (402) / quota failure it is
+# marked DOWN ("billing ended") and skipped until it recovers or you reset it in
+# the panel. Watch it all live at http://127.0.0.1:8080/panel.
+#
+# connectors:
+#   # Two Ollama Cloud accounts — same models, different keys. Rotate on limits.
+#   - id: ollama-primary
+#     provider: ollama
+#     base_url: https://ollama.com
+#     api_key_env: OLLAMA_API_KEY
+#   - id: ollama-backup
+#     provider: ollama
+#     base_url: https://ollama.com
+#     api_key_env: OLLAMA_API_KEY_2
+#
+#   # Any OpenAI-compatible provider via the generic `openai-compat` type.
+#   # OpenRouter shown here; DeepInfra / Together / Novita / Nebius / Groq /
+#   # DeepSeek / Mistral / … all work the same way — just change base_url,
+#   # api_key_env, and model_map. No code change needed.
+#   - id: openrouter-1
+#     provider: openai-compat
+#     base_url: https://openrouter.ai/api/v1
+#     api_key_env: OPENROUTER_API_KEY
+#     extra_headers:                  # optional (OpenRouter ranking headers)
+#       HTTP-Referer: https://localhost
+#       X-Title: llm-fusion
+#     model_map:                      # logical id (used in `models:`) -> provider id
+#       "qwen3-coder:480b": "qwen/qwen3-coder"
+#       "glm-5.2": "z-ai/glm-4.6"
+#     # treat_403_as: down            # some gateways use 403 for no-credits (default: passthrough)
+#     # quota_markers: ["insufficient", "out of credit"]  # opt-in: escalate a matching 429 to DOWN
 
 server:
   bind: 127.0.0.1                     # localhost only (default: 127.0.0.1)
   port: 8080                          # (default: 8080)
   auth_token_env: FUSION_PROXY_TOKEN  # optional; env var holding the shared client token.
                                       # If unset, proxy runs unauthenticated and warns.
+                                      # Also gates the panel's /admin data + actions.
 
 defaults:                             # applied to every model unless overridden per-model
   panel_member_timeout_s: 90          # per panel member (default: 90)

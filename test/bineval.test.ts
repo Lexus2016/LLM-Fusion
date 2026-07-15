@@ -36,6 +36,8 @@ function makeCtx(client: UpstreamClient): StrategyContext {
         api_mode: "openai",
         max_concurrency: 4,
         request_timeout_s: 170,
+        connector_cooldown_s: 60,
+        connector_down_recheck_s: 900,
       },
       server: { bind: "127.0.0.1", port: 8080 },
       defaults: {

@@ -174,8 +174,11 @@ const PricingEntrySchema = z
 
 const UpstreamSchema = z
   .object({
-    base_url: z.string().url(),
-    api_key_env: z.string().min(1),
+    // base_url / api_key_env describe the DEFAULT single connector. They are
+    // optional when a top-level `connectors:` list is present (which supersedes
+    // them); required otherwise (validated in superRefine).
+    base_url: z.string().url().optional(),
+    api_key_env: z.string().min(1).optional(),
     api_mode: z.enum(["auto", "openai", "native"]).default("auto"),
     max_concurrency: z.number().int().min(1).default(4),
     // Per-model concurrency budgets (keyed by REAL upstream model name): a
@@ -186,6 +189,45 @@ const UpstreamSchema = z
     per_model_concurrency_default: z.number().int().min(1).optional(),
     // Strictly below the ~182 s Ollama Cloud server-side ceiling (A-6).
     request_timeout_s: z.number().int().positive().lt(182).default(170),
+    // Connector-pool failover tuning (see connectors + the panel):
+    //  - cooldown for a SOFT failure (rate_limit/server/network/timeout) before a
+    //    connector is probed again;
+    //  - recheck window for a HARD failure (auth/payment/quota) — the "billing
+    //    ended" case — before an automatic probe. 0 = never auto-probe (manual
+    //    reset only).
+    connector_cooldown_s: z.number().int().positive().default(60),
+    connector_down_recheck_s: z.number().int().min(0).default(900),
+  })
+  .strict();
+
+/**
+ * A single upstream connector — one account/endpoint. An ordered list of these
+ * forms the pool the proxy fails over across (multiple Ollama Cloud accounts
+ * and/or other OpenAI-compatible providers). Holds only the env-var NAME of the
+ * key, never the key itself.
+ */
+const ConnectorSchema = z
+  .object({
+    id: z.string().min(1),
+    // `ollama` = native-capable (adds /api/show discovery + /api/chat vision).
+    // `openai-compat` = the generic OpenAI `/v1/chat/completions` provider that
+    // covers OpenRouter, DeepInfra, Together, Novita, Nebius, Groq, DeepSeek, …
+    provider: z.enum(["ollama", "openai-compat"]).default("ollama"),
+    base_url: z.string().url(),
+    api_key_env: z.string().min(1),
+    // Per-connector override of the pool-wide `upstream.request_timeout_s`.
+    request_timeout_s: z.number().int().positive().lt(182).optional(),
+    // Logical→upstream model-id map (e.g. `qwen3-coder:480b`→`qwen/qwen3-coder`
+    // for OpenRouter). Identity when a model is absent from the map.
+    model_map: z.record(z.string(), z.string()).optional(),
+    // Extra request headers (e.g. OpenRouter ranking headers HTTP-Referer/X-Title).
+    extra_headers: z.record(z.string(), z.string()).optional(),
+    // How to treat a 403: `passthrough` (client error, connector stays healthy)
+    // or `down` (some gateways use 403 for no-credits/disabled).
+    treat_403_as: z.enum(["passthrough", "down"]).default("passthrough"),
+    // Opt-in lowercased substrings that escalate a 429 body from a transient
+    // rate-limit to `quota` (connector down). Empty = never escalate on text.
+    quota_markers: z.array(z.string().min(1)).default([]),
   })
   .strict();
 
@@ -223,9 +265,35 @@ export const ConfigSchema = z
     overrides: z.record(z.string(), OverrideSchema).default({}),
     // Optional cost accounting. Absent/empty -> cost_usd stays null.
     pricing: z.record(z.string(), PricingEntrySchema).optional(),
+    // Optional ordered connector pool. When absent, a single connector is
+    // synthesised from `upstream.base_url` + `upstream.api_key_env` (fully
+    // backward compatible). When present, it is the pool and supersedes those.
+    connectors: z.array(ConnectorSchema).min(1).optional(),
   })
   .strict()
   .superRefine((cfg, ctx) => {
+    // Connector pool: either an explicit `connectors:` list, or the single
+    // connector implied by `upstream.base_url` + `upstream.api_key_env`.
+    if (cfg.connectors && cfg.connectors.length > 0) {
+      const seen = new Set<string>();
+      cfg.connectors.forEach((conn, i) => {
+        if (seen.has(conn.id)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["connectors", i, "id"],
+            message: `duplicate connector id '${conn.id}'; each connector id must be unique`,
+          });
+        }
+        seen.add(conn.id);
+      });
+    } else if (!cfg.upstream.base_url || !cfg.upstream.api_key_env) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["upstream", "base_url"],
+        message:
+          "no connectors configured: provide a top-level `connectors:` list, or set both `upstream.base_url` and `upstream.api_key_env`",
+      });
+    }
     // A `smart` model may reference other configured models by name for its
     // `simple` / `fusion` slots; those references must resolve.
     for (const [name, entry] of Object.entries(cfg.models)) {
@@ -302,6 +370,7 @@ function checkSmartReference(
 
 export type Config = z.infer<typeof ConfigSchema>;
 export type ModelConfig = z.infer<typeof ModelSchema>;
+export type ConnectorConfig = z.infer<typeof ConnectorSchema>;
 export type SingleModelConfig = z.infer<typeof SingleModelSchema>;
 export type FailoverModelConfig = z.infer<typeof FailoverModelSchema>;
 export type FusionModelConfig = z.infer<typeof FusionModelSchema>;

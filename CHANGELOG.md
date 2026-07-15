@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Multi-connector pool with automatic health-based failover.** The proxy can now front an ordered pool of upstream **connectors** — several Ollama Cloud accounts and/or other OpenAI-compatible providers — and fail over between them transparently to every strategy (single/failover/fusion/smart). New `PooledUpstreamClient` (implements the existing `UpstreamClient`, injected in place of the single client) + a `ConnectorRegistry` that owns per-connector health. Selection is priority-order: the first `up` connector serves; a `429`/`5xx`/network/timeout **cools** a connector for `connector_cooldown_s` (auto-probed after, single-flight); a `401`/`402`/quota marks it **down** for `connector_down_recheck_s` (the "billing ended" case). Concurrency-correct under interleaving: per-connector **epoch** guard (a late failure can't overwrite a newer success), single-flight probe, and monotonic cooldown. When several connectors fail, the pool surfaces the **most-recoverable** error by severity (`429`>`5xx`>network>`401`/`402`>`404`) so a recoverable request is never turned into a hard auth failure; a `404`/model-not-found advances without touching health; a `400`/`403`(passthrough) returns immediately. `Retry-After` sets the cooldown when present. Design + peer-review notes in `docs/multi-connector-failover-design.md`.
+- **Generic `openai-compat` provider.** Extracted the OpenAI `/v1/chat/completions` path into `OpenAiCompatClient` (`OllamaClient` now extends it, re-adding native `/api/show` + `/api/chat`). One `provider: openai-compat` connector type covers OpenRouter, DeepInfra, Together, Novita, Nebius, Groq, Cerebras, DeepSeek, Mistral, Baseten, … by config alone — `base_url` + `api_key_env` + per-connector `model_map` (their model ids differ from Ollama's) + optional `extra_headers`. Ranked provider comparison and exhausted-account signalling in `docs/providers-research.md`. FAL-AI was researched and **not** added (poor fit for chat: its only OpenAI-compatible path resells OpenRouter and uses `Key` auth; its real value is queue-based media).
+- **Local connector panel.** `GET /panel` — a self-contained dark/light dashboard (no external requests) showing the active connector, cooling/down connectors with reason + last error + cooldown countdown, per-connector request/failure counters, and manual controls: disable, enable, reset, and pin-as-active. Backed by `GET /admin/connectors` (JSON) and `POST /admin/connectors/:id/{disable,enable,reset,pin}` + `POST /admin/unpin`, all auth-gated by the existing client token when configured (the HTML shell carries no secrets).
+- **Config:** new optional `connectors:` list (backward compatible — when absent, one connector is synthesised from `upstream.base_url` + `api_key_env`), plus `upstream.connector_cooldown_s` (default 60) and `upstream.connector_down_recheck_s` (default 900). Validation rejects duplicate ids, a missing connector source, and `native` api_mode on an `openai-compat` connector.
+
 ## [0.1.28] - 2026-07-08
 
 ### Fixed
