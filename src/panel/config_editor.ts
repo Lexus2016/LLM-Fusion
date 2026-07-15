@@ -26,6 +26,11 @@ export interface ConfigEditorDeps {
   logger: Logger;
   /** Whether an api-key env var currently resolves (no secret values exposed). */
   envHas: (name: string) => boolean;
+  /**
+   * Ask a provider group for its live model catalog (for the model picker).
+   * Optional: when absent, the picker falls back to free-typed model ids.
+   */
+  listProviderModels?: (groupId: string, opts: { signal?: AbortSignal }) => Promise<string[]>;
 }
 
 function friendly(err: ZodError): string {
@@ -37,6 +42,12 @@ function friendly(err: ZodError): string {
 
 export function createConfigEditorApp(deps: ConfigEditorDeps): Hono {
   const app = new Hono();
+
+  // Short-lived cache of provider model catalogs. The catalog is stable across a
+  // panel session, so this spares the upstream a round-trip every form open while
+  // still refreshing within a minute. Keyed by group id.
+  const modelCache = new Map<string, { at: number; models: string[] }>();
+  const MODEL_CACHE_TTL_MS = 60_000;
 
   // Current editable config (structured; no secret values — only env-var names).
   app.get("/admin/config", deps.auth, (c) => {
@@ -128,6 +139,30 @@ export function createConfigEditorApp(deps: ConfigEditorDeps): Hono {
     if (!res.ok) return c.json({ error: res.error }, 400);
     deps.logger.info({ provider: id }, "config: provider deleted via panel");
     return c.json({ ok: true });
+  });
+
+  // Live model catalog for a provider group — powers the no-typo model picker.
+  // Returns { models: [...] } (possibly cached). On any upstream failure it still
+  // returns 200 with an empty list + a note, so the form degrades to free-text
+  // rather than blocking the operator.
+  app.get("/admin/config/providers/:id/models", deps.auth, async (c) => {
+    const id = c.req.param("id");
+    if (!deps.listProviderModels) {
+      return c.json({ models: [], note: "live model discovery is not available" });
+    }
+    const cached = modelCache.get(id);
+    if (cached && Date.now() - cached.at < MODEL_CACHE_TTL_MS) {
+      return c.json({ models: cached.models, cached: true });
+    }
+    try {
+      const models = await deps.listProviderModels(id, { signal: AbortSignal.timeout(10_000) });
+      modelCache.set(id, { at: Date.now(), models });
+      return c.json({ models });
+    } catch (e) {
+      const note = e instanceof Error ? e.message : String(e);
+      deps.logger.warn({ provider: id, err: note }, "config: live model discovery failed");
+      return c.json({ models: [], note });
+    }
   });
 
   return app;

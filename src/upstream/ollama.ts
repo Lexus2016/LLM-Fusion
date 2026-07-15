@@ -1,7 +1,7 @@
 import type { ChatCompletionResult, FetchFn } from "../types";
 import { usageFromBody } from "../usage";
 import { NativeStreamingNotImplementedError, UpstreamNetworkError } from "../errors";
-import { OpenAiCompatClient, readBody } from "./openai_compat";
+import { OpenAiCompatClient, parseModelList, readBody } from "./openai_compat";
 
 export interface OllamaClientOptions {
   baseUrl: string;
@@ -29,6 +29,24 @@ export class OllamaClient extends OpenAiCompatClient {
   /** Ollama is the one provider that can answer native `/api/show` discovery. */
   override get supportsNativeShow(): boolean {
     return true;
+  }
+
+  /**
+   * List available models. Ollama Cloud speaks the OpenAI-compat `/v1/models`, so
+   * the inherited path is tried first; if it fails (older/self-hosted Ollama that
+   * only exposes the native API), fall back to `/api/tags` (`{ models: [{ name }] }`).
+   */
+  override async listModels(opts: { signal?: AbortSignal } = {}): Promise<string[]> {
+    try {
+      return await super.listModels(opts);
+    } catch {
+      const url = `${this.baseUrl}/api/tags`;
+      const res = await this.doFetch(url, { method: "GET", headers: this.headers(), signal: opts.signal });
+      if (!res.ok) {
+        throw new UpstreamNetworkError(`/api/tags failed for ${this.baseUrl} (status ${res.status})`);
+      }
+      return parseModelList(await readBody(res));
+    }
   }
 
   override async show(model: string, opts: { signal?: AbortSignal } = {}): Promise<unknown> {

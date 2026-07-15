@@ -49,6 +49,7 @@ export function createPanelApp(deps: PanelDeps): Hono {
         auth: deps.auth,
         logger: deps.logger,
         envHas: deps.envHas,
+        listProviderModels: (id, opts) => deps.router.listGroupModels(id, opts),
       }),
     );
   }

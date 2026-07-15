@@ -381,6 +381,19 @@ export const PANEL_HTML = `<!doctype html>
   function modelNames(){ return cfg && cfg.models ? Object.keys(cfg.models) : []; }
   function reloadConfigSoon(){ setTimeout(loadConfig, 400); } // let the file watcher hot-reload first
 
+  // Live upstream model catalog per provider group (for the no-typo picker).
+  // Only a NON-EMPTY catalog is cached: an empty result (genuine-empty OR a soft
+  // failure — the server returns 200 + {models:[],note} so the form never blocks)
+  // is treated as a cache miss, so a transient outage/unsaved-key retries on the
+  // next form open instead of hiding suggestions for the whole panel session.
+  var provModelsCache={};
+  function fetchProviderModels(groupId, cb){
+    if(!groupId){ cb([]); return; }
+    var cached=provModelsCache[groupId];
+    if(cached&&cached.length){ cb(cached); return; }
+    jget("admin/config/providers/"+encodeURIComponent(groupId)+"/models").then(function(j){ var m=(j&&j.models)||[]; if(m.length) provModelsCache[groupId]=m; cb(m); }).catch(function(){ cb([]); });
+  }
+
   function saveModel(name, obj, done){ jsend("PUT","admin/config/models/"+encodeURIComponent(name), obj).then(function(){ toast("model '"+name+"' saved","ok"); reloadConfigSoon(); if(done)done(true); })
     .catch(function(e){ if(done)done(false,String(e.message||e)); }); }
   function deleteModel(name){ jsend("DELETE","admin/config/models/"+encodeURIComponent(name)).then(function(){ toast("model '"+name+"' deleted","ok"); reloadConfigSoon(); }).catch(function(e){ toast(String(e.message||e),"err"); }); }
@@ -390,6 +403,7 @@ export const PANEL_HTML = `<!doctype html>
 
   // ---- form modal + field builders ----
   var formSave = null;
+  var dlSeq = 0; // unique datalist ids for model-picker suggestions
   function openForm(title, buildBody, onSave){
     document.getElementById("fovl-title").textContent = title;
     var err=document.getElementById("fovl-err"); err.className="ferr"; err.textContent="";
@@ -403,13 +417,14 @@ export const PANEL_HTML = `<!doctype html>
   document.getElementById("fovl-save").onclick = function(){ if (formSave) formSave(); };
 
   function fld(label, hint){ var f=el("div","fld"); f.appendChild(el("label",null,label)); if(hint) f.appendChild(el("div","hint",hint)); return f; }
-  function fText(label, hint, value, mono){ var f=fld(label,hint); var i=el("input"); i.type="text"; if(mono) i.className="mono"; i.value=value==null?"":value; f.appendChild(i); f._get=function(){ return i.value.trim(); }; return f; }
+  function attachSuggest(input, f, suggestions){ if(!suggestions||!suggestions.length) return; var did="dl"+(++dlSeq); var dl=el("datalist"); dl.id=did; suggestions.forEach(function(s){ var o=el("option"); o.value=s; dl.appendChild(o); }); input.setAttribute("list",did); f.appendChild(dl); }
+  function fText(label, hint, value, mono, suggestions){ var f=fld(label,hint); var i=el("input"); i.type="text"; if(mono) i.className="mono"; i.value=value==null?"":value; attachSuggest(i,f,suggestions); f.appendChild(i); f._get=function(){ return i.value.trim(); }; return f; }
   function fSelect(label, hint, value, options){ var f=fld(label,hint); var s=el("select"); options.forEach(function(o){ var op=el("option",null,o.label||o); op.value=(o.value!=null?o.value:o); if((o.value!=null?o.value:o)===value) op.selected=true; s.appendChild(op); }); f.appendChild(s); f._get=function(){ return s.value; }; return f; }
   function fToggle(label, hint, value){ var f=el("div","fld toggle"); var d=el("div"); d.appendChild(el("label",null,label)); if(hint) d.appendChild(el("div","hint",hint)); f.appendChild(d);
     var sw=el("div","sw"+(value?" on":"")); sw.onclick=function(){ sw.classList.toggle("on"); }; f.appendChild(sw); f._get=function(){ return sw.classList.contains("on"); }; return f; }
   function fTags(label, hint, arr, suggestions){ var f=fld(label,hint); var box=el("div","tags"); var vals=(arr||[]).slice();
     function draw(){ box.textContent=""; vals.forEach(function(v,i){ var t=el("span","tag"); t.appendChild(document.createTextNode(v)); var x=el("button",null,"×"); x.type="button"; x.onclick=function(){ vals.splice(i,1); draw(); }; t.appendChild(x); box.appendChild(t); });
-      var add=el("span","addrow"); var inp=el("input"); inp.type="text"; inp.className="mono"; inp.placeholder="add…"; if(suggestions&&suggestions.length){ var dl=el("datalist"); var did="dl"+Math.floor(vals.length+box.childElementCount); dl.id=did; suggestions.forEach(function(s){ var o=el("option"); o.value=s; dl.appendChild(o); }); inp.setAttribute("list",did); add.appendChild(dl); }
+      var add=el("span","addrow"); var inp=el("input"); inp.type="text"; inp.className="mono"; inp.placeholder="add…"; attachSuggest(inp,add,suggestions);
       inp.onkeydown=function(e){ if(e.key==="Enter"){ e.preventDefault(); var v=inp.value.trim(); if(v){ vals.push(v); draw(); } } };
       var b=el("button","act",""); b.type="button"; b.textContent="Add"; b.onclick=function(){ var v=inp.value.trim(); if(v){ vals.push(v); draw(); } };
       add.appendChild(inp); add.appendChild(b); box.appendChild(add); }
@@ -533,27 +548,33 @@ export const PANEL_HTML = `<!doctype html>
       var ids=groupIds();
       fProv=fSelect("Provider group"+(ids.length===1?" (optional)":""),"Which provider serves this model. All its accounts share the same models, so failover stays consistent.", existing&&existing.provider?existing.provider:(ids.length===1?ids[0]:""), providerOptions());
       var host=el("div"); body.appendChild(fName); body.appendChild(fStrat); body.appendChild(fProv); body.appendChild(host);
+      var provModels=[];
       function rebuild(){ host.textContent=""; dyn={}; buildStrategyFields(host, fStrat._get(), existing); }
-      fStrat.querySelector("select").onchange=rebuild; rebuild();
+      function refetch(){ fetchProviderModels(fProv._get(), function(m){ provModels=m; rebuild(); }); }
+      fStrat.querySelector("select").onchange=rebuild;
+      fProv.querySelector("select").onchange=refetch;
+      rebuild();   // render immediately (no suggestions yet, never a blank form)
+      refetch();   // then enrich the model fields with the provider's live catalog
       function buildStrategyFields(h, strat, ex){
-        var sugg=modelNames();
-        if(strat==="single"){ dyn.target=fText("Target model","The one upstream model id this forwards to (e.g. glm-5.2).", ex&&ex.target, true); h.appendChild(dyn.target); }
-        else if(strat==="failover"){ dyn.chain=fTags("Chain","Upstream models tried IN ORDER; advance to the next on failure.", ex&&ex.chain, sugg); h.appendChild(dyn.chain); }
+        var up=provModels;      // real upstream models fetched from the provider's catalog
+        var virt=modelNames();  // configured virtual model names (used by smart routes)
+        if(strat==="single"){ dyn.target=fText("Target model","The one upstream model id this forwards to (e.g. glm-5.2). Pick from the provider's list.", ex&&ex.target, true, up); h.appendChild(dyn.target); }
+        else if(strat==="failover"){ dyn.chain=fTags("Chain","Upstream models tried IN ORDER; advance to the next on failure. Pick from the provider's list.", ex&&ex.chain, up); h.appendChild(dyn.chain); }
         else if(strat==="fusion"){
-          dyn.panel=fTags("Panel (experts)","The models that each answer independently. Mix different model families for decorrelated views.", ex&&ex.panel, sugg); h.appendChild(dyn.panel);
-          dyn.judge=fText("Judge","Ranks the experts' answers and picks the best (reliable structured output helps).", ex&&ex.judge, true); h.appendChild(dyn.judge);
-          dyn.synth=fText("Synthesizer","Writes the final answer from the experts + judge.", ex&&ex.synth, true); h.appendChild(dyn.synth);
-          dyn.adv=fText("Adversarial (optional)","One PANEL member that argues against the others to find flaws. Must be listed in the panel.", ex&&ex.adversarial, true); h.appendChild(dyn.adv);
+          dyn.panel=fTags("Panel (experts)","The models that each answer independently. Mix different model families for decorrelated views. Pick from the provider's list.", ex&&ex.panel, up); h.appendChild(dyn.panel);
+          dyn.judge=fText("Judge","Ranks the experts' answers and picks the best (reliable structured output helps).", ex&&ex.judge, true, up); h.appendChild(dyn.judge);
+          dyn.synth=fText("Synthesizer","Writes the final answer from the experts + judge.", ex&&ex.synth, true, up); h.appendChild(dyn.synth);
+          dyn.adv=fText("Adversarial (optional)","One PANEL member that argues against the others to find flaws. Must be listed in the panel.", ex&&ex.adversarial, true, up); h.appendChild(dyn.adv);
           dyn.tool=fSelect("Tool mode","deliberate = experts discuss in prose, only the synth calls tools. bypass = straight to the synth with tools (faster, no deliberation).", ex?ex.tool_mode:"deliberate",[{label:"deliberate",value:"deliberate"},{label:"bypass",value:"bypass"}]); h.appendChild(dyn.tool);
           dyn.planOnly=fToggle("Full fusion only on planning turns","On: full panel on fresh instructions, synth-only on mid-loop tool-result continuations (cheaper). Off: full fusion every step.", ex?!!ex.fusion_planning_turn_only:false); h.appendChild(dyn.planOnly);
           dyn.web=fToggle("Web search grounding","Run one web search before the panel and inject results as context. Needs TAVILY_API_KEY set on the server.", ex?!!(ex.web_search&&ex.web_search.enabled):false); h.appendChild(dyn.web);
           dyn.bineval=fToggle("Quality evaluation (BinEval)","After the synth, score the answer on binary quality questions; results go into response headers (non-streaming only).", ex?!!(ex.bineval&&ex.bineval.enabled):false); h.appendChild(dyn.bineval);
         }
         else if(strat==="smart"){
-          dyn.router=fText("Router model","A fast model that classifies each request as simple vs deep (needs reliable JSON).", ex&&ex.router, true); h.appendChild(dyn.router);
+          dyn.router=fText("Router model","A fast model that classifies each request as simple vs deep (needs reliable JSON). Pick from the provider's list.", ex&&ex.router, true, up); h.appendChild(dyn.router);
           dyn.def=fSelect("Default route","Used when the router is unsure or errors.", ex?ex.default:"simple",[{label:"simple",value:"simple"},{label:"fusion",value:"fusion"}]); h.appendChild(dyn.def);
-          dyn.simple=fText("Simple route","Name of a single/failover model to use for cheap steps (a model from the Models list).", ex&&typeof ex.simple==="string"?ex.simple:"", true); h.appendChild(dyn.simple);
-          dyn.fusion=fText("Fusion route","Name of a fusion model to use for deep steps (must be in the same provider group).", ex&&typeof ex.fusion==="string"?ex.fusion:"", true); h.appendChild(dyn.fusion);
+          dyn.simple=fText("Simple route","Name of a single/failover model to use for cheap steps (a model from the Models list).", ex&&typeof ex.simple==="string"?ex.simple:"", true, virt); h.appendChild(dyn.simple);
+          dyn.fusion=fText("Fusion route","Name of a fusion model to use for deep steps (must be in the same provider group).", ex&&typeof ex.fusion==="string"?ex.fusion:"", true, virt); h.appendChild(dyn.fusion);
         }
       }
     }, function(){

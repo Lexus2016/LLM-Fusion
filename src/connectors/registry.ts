@@ -46,6 +46,11 @@ export interface ResolvedConnector {
 /** The live client for a connector, plus its native-show capability. */
 export interface ConnectorClient extends UpstreamClient {
   readonly supportsNativeShow: boolean;
+  /**
+   * List the provider's available model ids (for the panel's model picker).
+   * Optional: test doubles and clients without a discovery endpoint may omit it.
+   */
+  listModels?(opts?: { signal?: AbortSignal }): Promise<string[]>;
 }
 
 interface ConnectorRuntime {

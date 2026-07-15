@@ -175,6 +175,20 @@ export class OpenAiCompatClient implements UpstreamClient {
     };
   }
 
+  /**
+   * List the provider's available model ids via the OpenAI-compat `GET /v1/models`
+   * (shape `{ data: [{ id }] }`). Used by the panel's config editor to offer real
+   * model choices instead of free-typed ids. Throws on a non-OK response.
+   */
+  async listModels(opts: { signal?: AbortSignal } = {}): Promise<string[]> {
+    const url = `${this.baseUrl}/v1/models`;
+    const res = await this.doFetch(url, { method: "GET", headers: this.headers(), signal: opts.signal });
+    if (!res.ok) {
+      throw new UpstreamNetworkError(`/v1/models failed for ${this.baseUrl} (status ${res.status})`);
+    }
+    return parseModelList(await readBody(res));
+  }
+
   async show(_model: string, _opts: { signal?: AbortSignal } = {}): Promise<unknown> {
     throw new NotImplementedError(
       "native /api/show capability discovery is not supported by the openai-compat provider",
@@ -204,6 +218,40 @@ export function withIncludeUsage(
   const existing = payload.stream_options;
   const base = typeof existing === "object" && existing !== null ? existing : {};
   return { ...payload, stream_options: { ...base, include_usage: true } };
+}
+
+/**
+ * Extract model ids from an OpenAI-compat `GET /v1/models` body (`{ data: [{ id }] }`).
+ * Tolerant of the two common id fields (`id`, some servers use `name`); returns a
+ * de-duplicated, sorted list of non-empty string ids. Never throws on a malformed
+ * body — an unrecognised shape yields `[]`.
+ */
+export function parseModelList(data: unknown): string[] {
+  const rows = extractModelRows(data);
+  const ids = new Set<string>();
+  for (const row of rows) {
+    if (typeof row === "string") {
+      if (row.length > 0) ids.add(row);
+      continue;
+    }
+    if (row && typeof row === "object") {
+      const rec = row as Record<string, unknown>;
+      const id = rec.id ?? rec.name ?? rec.model;
+      if (typeof id === "string" && id.length > 0) ids.add(id);
+    }
+  }
+  return [...ids].sort((a, b) => a.localeCompare(b));
+}
+
+function extractModelRows(data: unknown): unknown[] {
+  if (Array.isArray(data)) return data;
+  if (data && typeof data === "object") {
+    const rec = data as Record<string, unknown>;
+    // OpenAI-compat: { data: [...] }; Ollama /api/tags: { models: [...] }.
+    if (Array.isArray(rec.data)) return rec.data;
+    if (Array.isArray(rec.models)) return rec.models;
+  }
+  return [];
 }
 
 /** Read a response body as JSON when possible, falling back to text or null. */

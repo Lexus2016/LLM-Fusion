@@ -104,6 +104,31 @@ export class ProviderRouter implements UpstreamRouter {
     return false;
   }
 
+  /** The ids of all configured provider groups, in declaration order. */
+  groupIds(): string[] {
+    return [...this.groups.keys()];
+  }
+
+  /**
+   * Ask a group's provider for its available model ids (for the panel's model
+   * picker). Uses any account that carries a key — model catalogs are identical
+   * across a group's accounts, so a cooling/down account still answers discovery.
+   * Throws when the group is unknown, has no keyed account, or the client cannot
+   * list models. The caller (config editor) turns these into a friendly message.
+   */
+  async listGroupModels(groupId: string, opts: { signal?: AbortSignal } = {}): Promise<string[]> {
+    const rt = this.groups.get(groupId);
+    if (!rt) throw new NoConnectorAvailableError(`unknown provider group '${groupId}'`);
+    const snaps = rt.registry.snapshot();
+    const chosen = snaps.find((s) => s.hasKey) ?? snaps[0];
+    if (!chosen) throw new NoConnectorAvailableError(`provider group '${groupId}' has no accounts`);
+    const client = rt.registry.clientFor(chosen.id);
+    if (!client?.listModels) {
+      throw new NoConnectorAvailableError(`provider group '${groupId}' cannot list models`);
+    }
+    return client.listModels(opts);
+  }
+
   /** Grouped snapshot for the panel: providers, each with its accounts + active. */
   snapshot(): { providers: ProviderGroupSnapshot[] } {
     const providers: ProviderGroupSnapshot[] = [];
