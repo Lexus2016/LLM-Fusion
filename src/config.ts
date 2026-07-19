@@ -176,12 +176,48 @@ const PricingEntrySchema = z
   })
   .strict();
 
+/**
+ * A base_url that carries the upstream API key as `Authorization: Bearer`. A
+ * compromised/edited base_url exfiltrates that key to whatever host it names —
+ * and the panel's no-YAML editor can rewrite it — so we constrain it at the
+ * schema seam: HTTPS only (the key never crosses the wire in cleartext), with an
+ * explicit exception for a loopback http:// host (local Ollama on 127.0.0.1 /
+ * localhost / ::1), and NO embedded userinfo (`https://user:pass@host` is both a
+ * credential-leak and an SSRF-obfuscation vector). Defense-in-depth behind the
+ * admin-API auth/Origin/Host guards, not a substitute for them.
+ */
+const LOOPBACK_HOSTNAME = new RegExp(
+  `^(127\\.(25[0-5]|2[0-4]\\d|1?\\d?\\d)\\.(25[0-5]|2[0-4]\\d|1?\\d?\\d)\\.(25[0-5]|2[0-4]\\d|1?\\d?\\d)|localhost|::1|0:0:0:0:0:0:0:1)$`,
+  "i",
+);
+const baseUrlSchema = z
+  .string()
+  .url()
+  .refine(
+    (u) => {
+      let parsed: URL;
+      try {
+        parsed = new URL(u);
+      } catch {
+        return false;
+      }
+      if (parsed.username || parsed.password) return false; // no embedded credentials
+      if (parsed.protocol === "https:") return true;
+      // Plain http is allowed ONLY for a loopback host (local Ollama). Node's
+      // URL.hostname keeps the brackets on an IPv6 host (`[::1]`), so strip them
+      // before matching — otherwise `http://[::1]:11434` fails the exception.
+      const host = parsed.hostname.replace(/^\[|\]$/g, "");
+      return parsed.protocol === "http:" && LOOPBACK_HOSTNAME.test(host);
+    },
+    { message: "base_url must be https:// (http:// only for a loopback host) and must not embed credentials" },
+  );
+
 const UpstreamSchema = z
   .object({
     // base_url / api_key_env describe the DEFAULT single connector. They are
     // optional when a top-level `connectors:` list is present (which supersedes
     // them); required otherwise (validated in superRefine).
-    base_url: z.string().url().optional(),
+    base_url: baseUrlSchema.optional(),
     api_key_env: z.string().min(1).optional(),
     api_mode: z.enum(["auto", "openai", "native"]).default("auto"),
     max_concurrency: z.number().int().min(1).default(4),
@@ -214,7 +250,7 @@ const AccountSchema = z
     id: z.string().min(1),
     api_key_env: z.string().min(1),
     // Override the provider group's `base_url` for this one account (rare).
-    base_url: z.string().url().optional(),
+    base_url: baseUrlSchema.optional(),
     // Per-account override of the pool-wide `upstream.request_timeout_s`.
     request_timeout_s: z.number().int().positive().lt(182).optional(),
     // Logical→upstream model-id map (e.g. `qwen3-coder:480b`→`qwen/qwen3-coder`).
@@ -247,7 +283,7 @@ const ProviderSchema = z
     type: z.enum(["ollama", "openai-compat"]).default("ollama"),
     // Group-level default base URL; an account may override it. Required unless
     // every account sets its own `base_url` (validated in superRefine).
-    base_url: z.string().url().optional(),
+    base_url: baseUrlSchema.optional(),
     accounts: z.array(AccountSchema).min(1),
   })
   .strict();
@@ -459,6 +495,72 @@ export type SimpleBlockConfig = z.infer<typeof SimpleBlockSchema>;
 export type FusionBlockConfig = z.infer<typeof FusionBlockSchema>;
 export type SimpleModelReference = SimpleBlockConfig | string;
 export type FusionModelReference = FusionBlockConfig | string;
+
+/**
+ * A rate-limit contention hazard surfaced by {@link findPanelContentionOverlaps}:
+ * a `single`/`failover` virtual model resolves to an upstream model that is ALSO
+ * a `panel` member of a `fusion` model in the SAME provider group. Because
+ * contention is per-provider-model, the two share one upstream rate-limit bucket
+ * AND one `per_model_concurrency` gate — so a burst of small-fast traffic through
+ * the single/failover model (e.g. Claude Code's 80-130 background small-model
+ * calls/min via `ANTHROPIC_SMALL_FAST_MODEL`) can 429-starve the live panel
+ * mid-request. See the rate-limit note in `bin/fusion-claude`.
+ */
+export interface PanelContentionOverlap {
+  /** Virtual model (strategy `single` | `failover`) whose target/chain resolves to `target`. */
+  fastModel: string;
+  /** The shared REAL upstream model id (`single.target` or one `failover.chain` entry). */
+  target: string;
+  /** Fusion model whose `panel` lists `target` as a member. */
+  fusionModel: string;
+}
+
+/**
+ * Detect rate-limit contention overlaps in a parsed config: every case where a
+ * `single`/`failover` virtual model's upstream target is ALSO a `fusion` panel
+ * member bound to the SAME provider group. Panel members, `single.target`, and
+ * `failover.chain` entries all live in the same namespace (REAL upstream model
+ * ids), so they compare directly. Judge/synth overlap is a separate, milder case
+ * and is deliberately NOT reported — only panel-member contention, which starves
+ * a live panel, matters here.
+ *
+ * Pure (no I/O); safe to call at startup on a validated config. Returns one entry
+ * per (fastModel, target, fusionModel) pair; an empty array means no contention.
+ */
+export function findPanelContentionOverlaps(cfg: Config): PanelContentionOverlap[] {
+  // Resolve each model's effective provider group exactly as the schema does:
+  // an explicit `provider`, else the sole group when there is exactly one. Two
+  // models contend only when they resolve to the same upstream provider group.
+  const groupIds =
+    cfg.providers && Object.keys(cfg.providers).length > 0
+      ? new Set(Object.keys(cfg.providers))
+      : cfg.upstream.base_url && cfg.upstream.api_key_env
+        ? new Set(["default"])
+        : new Set<string>();
+  const soleGroup = groupIds.size === 1 ? [...groupIds][0] : undefined;
+  const groupOf = (entry: ModelConfig): string | undefined => entry.provider ?? soleGroup;
+
+  const overlaps: PanelContentionOverlap[] = [];
+  for (const [fastModel, entry] of Object.entries(cfg.models)) {
+    // Upstream models this single/failover virtual model resolves to.
+    let targets: readonly string[];
+    if (entry.strategy === "single") targets = [entry.target];
+    else if (entry.strategy === "failover") targets = entry.chain;
+    else continue;
+    const fastGroup = groupOf(entry);
+
+    for (const [fusionModel, other] of Object.entries(cfg.models)) {
+      if (other.strategy !== "fusion") continue;
+      if (groupOf(other) !== fastGroup) continue; // contention is per-provider-model
+      for (const target of targets) {
+        if (other.panel.includes(target)) {
+          overlaps.push({ fastModel, target, fusionModel });
+        }
+      }
+    }
+  }
+  return overlaps;
+}
 
 /** Validate an already-parsed object against the schema. Throws on invalid input. */
 export function parseConfig(raw: unknown): Config {

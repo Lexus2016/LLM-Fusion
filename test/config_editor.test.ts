@@ -40,6 +40,7 @@ async function setup() {
     auth: openAuth,
     logger,
     envHas: () => true,
+    authEnforced: () => true, // these tests exercise the editor, not the transport Host guard
   });
   return { app, path, dir };
 }
@@ -65,6 +66,122 @@ describe("config editor", () => {
     expect(res.status).toBe(200);
     const cfg = await loadConfigFile(path);
     expect(Object.keys(cfg.models)).toContain("fast-kimi");
+  });
+
+  it("415 on a mutating request with a non-JSON body", async () => {
+    const { app } = await setup();
+    const res = await app.request("/admin/config/models/fast-kimi", {
+      method: "PUT",
+      headers: { "content-type": "text/plain" },
+      body: "strategy=single",
+    });
+    expect(res.status).toBe(415);
+  });
+
+  it("GET /admin/config masks extra_headers values (keys preserved)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fusion-cfg-redact-"));
+    const path = join(dir, "fusion.yaml");
+    await writeFile(
+      path,
+      `upstream:
+  base_url: https://mock.test
+  api_key_env: X
+providers:
+  openrouter:
+    type: openai-compat
+    base_url: https://openrouter.ai/api/v1
+    accounts:
+      - id: or-1
+        api_key_env: OPENROUTER_API_KEY
+        extra_headers:
+          authorization: Key super-secret-value
+          x-title: My App
+models:
+  m:
+    strategy: single
+    provider: openrouter
+    target: x
+`,
+      "utf8",
+    );
+    const cfg = await loadConfigFile(path);
+    const app = createConfigEditorApp({
+      getConfig: () => cfg,
+      configPath: path,
+      auth: openAuth,
+      logger,
+      envHas: () => true,
+      authEnforced: () => true, // exercises the editor, not the transport Host guard
+    });
+    const res = await app.request("/admin/config");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const account = body.providers.openrouter.accounts[0];
+    expect(account.extra_headers).toEqual({ authorization: "•••", "x-title": "•••" });
+    expect(JSON.stringify(body)).not.toContain("super-secret-value");
+    // Write path is untouched: the on-disk file still holds the real value.
+    expect(await readFile(path, "utf8")).toContain("super-secret-value");
+  });
+
+  it("PUT of the redacted provider view restores the real extra_headers values", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fusion-cfg-roundtrip-"));
+    const path = join(dir, "fusion.yaml");
+    await writeFile(
+      path,
+      `upstream:
+  base_url: https://mock.test
+  api_key_env: X
+providers:
+  openrouter:
+    type: openai-compat
+    base_url: https://openrouter.ai/api/v1
+    accounts:
+      - id: or-1
+        api_key_env: OPENROUTER_API_KEY
+        treat_403_as: down
+        model_map:
+          x: real-x
+        extra_headers:
+          authorization: Key super-secret-value
+      - id: or-2
+        api_key_env: OPENROUTER_API_KEY_2
+        extra_headers:
+          x-title: other-secret
+models:
+  m:
+    strategy: single
+    provider: openrouter
+    target: x
+`,
+      "utf8",
+    );
+    const cfg = await loadConfigFile(path);
+    const app = createConfigEditorApp({
+      getConfig: () => cfg,
+      configPath: path,
+      auth: openAuth,
+      logger,
+      envHas: () => true,
+      authEnforced: () => true, // exercises the editor, not the transport Host guard
+    });
+    // What the panel does: GET the (redacted) provider, edit an unrelated field,
+    // PUT the whole group back — with one account's extra_headers dropped
+    // entirely (the form has no such field). Also add a brand-new account whose
+    // only header value is the placeholder (nothing real to restore).
+    const view = (await (await app.request("/admin/config")).json()).providers.openrouter;
+    view.base_url = "https://openrouter.ai/api/v2";
+    delete view.accounts[1].extra_headers;
+    view.accounts.push({ id: "or-3", api_key_env: "K3", extra_headers: { "x-stale": "•••" } });
+    const res = await put(app, "/admin/config/providers/openrouter", view);
+    expect(res.status).toBe(200);
+    const text = await readFile(path, "utf8");
+    expect(text).toContain("super-secret-value"); // masked value restored
+    expect(text).toContain("other-secret"); // dropped map restored
+    expect(text).toContain("api/v2"); // the actual edit landed
+    expect(text).toContain("real-x"); // account-level passthrough (model_map) survives
+    expect(text).toContain("treat_403_as"); // account-level passthrough survives
+    expect(text).not.toContain("•••"); // no placeholder ever persisted
+    expect(text).not.toContain("x-stale"); // unrestorable placeholder dropped, not written
   });
 
   it("rejects an invalid model and leaves the file untouched", async () => {

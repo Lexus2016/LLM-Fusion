@@ -1,11 +1,12 @@
 import { describe, it, expect } from "vitest";
+import { z } from "zod";
 import { OllamaClient } from "../src/upstream/ollama";
 import { singleStrategy } from "../src/strategies/single";
 import { detectIncompleteToolTurn } from "../src/strategies/tool_turn_guard";
 import { parseConfig } from "../src/config";
 import { createLogger } from "../src/logging";
 import { CapabilityService } from "../src/capabilities";
-import { mockFetch, jsonResponse, sseResponse, sseThenError } from "./helpers";
+import { mockFetch, jsonResponse, sseResponse, sseThenError, streamErrorImmediate } from "./helpers";
 import { createResilience } from "../src/concurrency";
 import type { Resilience } from "../src/concurrency";
 import type { ChatCompletionRequest, StrategyContext, UpstreamClient } from "../src/types";
@@ -425,6 +426,110 @@ describe("single strategy — tool-turn completeness guard", () => {
     expect(text).toContain("[DONE]");
   });
 
+  it("buffers streaming tool_call fragments so a length-cut + recovery yields VALID index-0 JSON on the client (corruption regression)", async () => {
+    // The confirmed silent-corruption bug: the guard forwarded truncated tool-call
+    // arg fragments LIVE, then recovery re-emitted a fresh call restarting at
+    // index:0. An index-keyed client (openai-python, Vercel AI SDK, OpenCode)
+    // concatenated the truncated old args with the recovered args -> invalid JSON.
+    // Option B buffers tool_call deltas, so the client only ever sees the clean
+    // recovered call. This test accumulates arguments BY INDEX like a real client
+    // and asserts JSON.parse SUCCEEDS.
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: (_u, init) => {
+            const body = String(init?.body ?? "");
+            if (body.includes("Emit the tool call NOW")) {
+              // Recovery retry emits a COMPLETE call, restarting at index:0.
+              return sseResponse([
+                { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_2", type: "function", function: { name: "write", arguments: '{"path":"guide.html","content":"short"}' } }] } }] },
+                { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+              ]);
+            }
+            // Output-cap truncation: index-0 args split across two chunks, cut
+            // before the JSON closes, terminal chunk says "length".
+            return sseResponse([
+              { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "write", arguments: '{"path":"guide.html","content":"<html><h1>Guide</h1><p>truncat' } }] } }] },
+              { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: "ed at the output cap" } }] } }] },
+              { choices: [{ delta: {}, finish_reason: "length" }] },
+            ]);
+          },
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(
+      ctxWith(client, { model: "fast-glm", stream: true, tools: TOOLS, messages: [{ role: "user", content: "write the full guide" }] }),
+    );
+    if (!res.body) throw new Error("expected a stream body");
+
+    // Minimal client-shaped chunk schema (no `as`, no `any`).
+    const ClientChunk = z
+      .object({
+        choices: z
+          .array(
+            z.object({
+              delta: z
+                .object({
+                  tool_calls: z
+                    .array(
+                      z.object({
+                        index: z.number().optional(),
+                        function: z.object({ arguments: z.string().optional() }).passthrough().optional(),
+                      }).passthrough(),
+                    )
+                    .optional(),
+                })
+                .passthrough()
+                .optional(),
+            }).passthrough(),
+          )
+          .optional(),
+      })
+      .passthrough();
+
+    // Reconstruct the client's per-index argument accumulation.
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let raw = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      raw += decoder.decode(value, { stream: true });
+    }
+    const argsByIndex = new Map<number, string>();
+    for (const line of raw.split("\n")) {
+      const t = line.trimStart();
+      if (!t.startsWith("data:")) continue;
+      const payload = t.slice("data:".length).trim();
+      if (payload === "[DONE]" || payload.length === 0) continue;
+      let obj: unknown;
+      try {
+        obj = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      const parsed = ClientChunk.safeParse(obj);
+      if (!parsed.success) continue;
+      const calls = parsed.data.choices?.[0]?.delta?.tool_calls;
+      if (!Array.isArray(calls)) continue;
+      for (const c of calls) {
+        const idx = typeof c.index === "number" ? c.index : 0;
+        const prev = argsByIndex.get(idx) ?? "";
+        argsByIndex.set(idx, prev + (typeof c.function?.arguments === "string" ? c.function.arguments : ""));
+      }
+    }
+
+    const assembled = argsByIndex.get(0) ?? "";
+    // The bug produced `{"path":..."truncat...ed at the output cap{"path":...}` —
+    // JSON.parse throws. With buffering the client sees only the recovered call.
+    expect(() => JSON.parse(assembled)).not.toThrow();
+    expect(JSON.parse(assembled)).toEqual({ path: "guide.html", content: "short" });
+    expect(raw).toContain("[DONE]");
+  });
+
   it("leaves an INTACT length-capped streaming tool call alone (args parse -> runnable, no retry)", async () => {
     let calls = 0;
     const client = new OllamaClient({
@@ -452,7 +557,7 @@ describe("single strategy — tool-turn completeness guard", () => {
     expect(text).toContain('"finish_reason":"length"'); // original terminal chunk forwarded
   });
 
-  it("recovers a MID-FLIGHT upstream cut (the Ollama Cloud 'terminated' failure) into a streamed retry", async () => {
+  it("recovers a MID-FLIGHT upstream cut that happens BEFORE anything was forwarded", async () => {
     const client = new OllamaClient({
       baseUrl: "https://mock.test",
       apiKey: "k",
@@ -468,8 +573,35 @@ describe("single strategy — tool-turn completeness guard", () => {
                 { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
               ]);
             }
-            // Original turn: preamble + partial tool-call args, then the upstream
-            // connection dies mid-generation (no terminal chunk ever arrives).
+            // Original turn: the upstream connection dies before the first token
+            // (the Ollama Cloud "terminated" failure). Nothing reached the client,
+            // so the recovery retry IS the whole answer — safe to splice in.
+            return streamErrorImmediate("terminated");
+          },
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(
+      ctxWith(client, { model: "fast-glm", stream: true, tools: TOOLS, messages: [{ role: "user", content: "напиши великий посібник" }] }),
+    );
+    const text = await res.text(); // must NOT throw — the guard converts the error into a recovered stream
+    expect(text).toContain('"content\\":\\"part 1\\"'); // recovery emitted the complete call
+    expect(text).toContain('"finish_reason":"tool_calls"');
+    expect(text).toContain("[DONE]");
+  });
+
+  it("propagates a mid-flight cut as a stream ERROR after partial output was forwarded (no spliced duplicate)", async () => {
+    let calls = 0;
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: () => {
+            calls += 1;
+            // Preamble + partial tool-call args, then the upstream dies
+            // mid-generation (no terminal chunk ever arrives).
             return sseThenError(
               [
                 { choices: [{ delta: { role: "assistant", content: "Створюю посібник — частина 1:" } }] },
@@ -484,11 +616,239 @@ describe("single strategy — tool-turn completeness guard", () => {
     const res = await singleStrategy.execute(
       ctxWith(client, { model: "fast-glm", stream: true, tools: TOOLS, messages: [{ role: "user", content: "напиши великий посібник" }] }),
     );
-    const text = await res.text(); // must NOT throw — the guard converts the error into a recovered stream
-    expect(text).toContain("Створюю посібник"); // live-forwarded preamble kept
-    expect(text).toContain('"content\\":\\"part 1\\"'); // recovery emitted the complete call
+    // The preamble and the truncated tool-call fragments were already forwarded
+    // live, so a recovery retry would splice a full replacement turn onto them —
+    // duplicated prose, and the retry's tool call restarts at index:0 so the
+    // client would concatenate the truncated old arguments with the new ones
+    // into invalid JSON. The guard must error the stream honestly instead
+    // (failover's committed-stream semantics) and never fire the retry.
+    if (!res.body) throw new Error("expected a stream body");
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    let streamErr: unknown = null;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+      }
+    } catch (err) {
+      streamErr = err;
+    }
+    if (!(streamErr instanceof Error)) throw new Error("expected the stream to error");
+    expect(streamErr.message).toBe("terminated");
+    expect(text).toContain("Створюю посібник"); // partial output was delivered before the failure
+    expect(calls).toBe(1); // no recovery retry was attempted after partial delivery
+  });
+
+  it("recovers when the upstream ends CLEANLY mid-tool-arguments (no finish_reason chunk) — FINDING A", async () => {
+    // The upstream streams a tool-call whose args are truncated, then closes the
+    // SSE stream cleanly (just [DONE]) with NO finish_reason chunk. The buffered
+    // call is unparseable; the guard must RECOVER a complete call instead of
+    // emitting the truncated one to the client (which would drop the tool call
+    // and stall the agent loop).
+    let calls = 0;
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: (_u, init) => {
+            calls += 1;
+            const body = String(init?.body ?? "");
+            if (body.includes("Emit the tool call NOW")) {
+              return sseResponse([
+                { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_r", type: "function", function: { name: "write", arguments: '{"path":"guide.html","content":"recovered"}' } }] } }] },
+                { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+              ]);
+            }
+            // Truncated tool-call args split across two chunks, then a CLEAN close
+            // ([DONE]) with no finish_reason chunk at all.
+            return sseResponse([
+              { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "write", arguments: '{"path":"guide.html","content":"<html><h1>Gui' } }] } }] },
+              { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: "de</h1><p>truncat" } }] } }] },
+            ]);
+          },
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(
+      ctxWith(client, { model: "fast-glm", stream: true, tools: TOOLS, messages: [{ role: "user", content: "write the full guide" }] }),
+    );
+    const text = await res.text();
+    expect(calls).toBe(2); // recovery retry fired (original + retry)
+    expect(text).toContain('"content\\":\\"recovered\\"'); // the recovered COMPLETE call
     expect(text).toContain('"finish_reason":"tool_calls"');
+    expect(text).not.toContain("truncat"); // the broken buffered fragment never reached the client
     expect(text).toContain("[DONE]");
+  });
+
+  it("recovers a mid-flight cut that happens after ONLY buffered tool-call fragments (nothing client-visible) — FINDING B", async () => {
+    // The upstream emits a truncated tool-call fragment (BUFFERED, never forwarded)
+    // then dies mid-flight with no content ever reaching the client. Because option
+    // B withholds tool fragments, the client is uncommitted — the guard must RECOVER
+    // a clean call, not error the stream.
+    let calls = 0;
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: (_u, init) => {
+            calls += 1;
+            const body = String(init?.body ?? "");
+            if (body.includes("Emit the tool call NOW")) {
+              return sseResponse([
+                { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_r", type: "function", function: { name: "write", arguments: '{"path":"guide.html","content":"recovered"}' } }] } }] },
+                { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+              ]);
+            }
+            // Only a truncated tool-call fragment, then the upstream terminates.
+            return sseThenError(
+              [
+                { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_x", type: "function", function: { name: "write", arguments: '{"path":"guide.html","content":"<html>' } }] } }] },
+              ],
+              "terminated",
+            );
+          },
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(
+      ctxWith(client, { model: "fast-glm", stream: true, tools: TOOLS, messages: [{ role: "user", content: "напиши великий посібник" }] }),
+    );
+    const text = await res.text(); // must NOT throw — the cut was recoverable
+    expect(calls).toBe(2); // original + recovery retry
+    expect(text).toContain('"content\\":\\"recovered\\"'); // clean recovered call delivered
+    expect(text).toContain('"finish_reason":"tool_calls"');
+    expect(text).not.toContain("<html>"); // the buffered truncated fragment never reached the client
+    expect(text).toContain("[DONE]");
+  });
+
+  it("delivers the buffered tool call when the upstream errors AFTER the terminal chunk was held (post-terminal cut) — FINDING C", async () => {
+    // The terminal (finish_reason) chunk arrives and is held, THEN the upstream
+    // errors before [DONE]. The buffered COMPLETE tool call must still reach the
+    // client — otherwise it sees a terminal chunk with no tool call (actionless).
+    let calls = 0;
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: () => {
+            calls += 1;
+            return sseThenError(
+              [
+                { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_c", type: "function", function: { name: "write", arguments: '{"path":"guide.html","content":"done"}' } }] } }] },
+                { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+              ],
+              "terminated",
+            );
+          },
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(
+      ctxWith(client, { model: "fast-glm", stream: true, tools: TOOLS, messages: [{ role: "user", content: "make guide.html" }] }),
+    );
+    const text = await res.text(); // must NOT throw — terminal was already held, deliver it
+    expect(calls).toBe(1); // no recovery — the buffered call was complete
+    expect(text).toContain('"content\\":\\"done\\"'); // buffered tool call delivered
+    expect(text).toContain('"finish_reason":"tool_calls"'); // held terminal chunk delivered
+    expect(text).toContain("[DONE]");
+  });
+
+  it("RECOVERS a BROKEN terminal turn when the upstream errors AFTER the terminal chunk was held (post-terminal cut) — FINDING D", async () => {
+    // The terminal finish_reason:"length" chunk arrives (buffered args are TRUNCATED),
+    // THEN the connection errors before [DONE]. The turn is a normal finish that only
+    // lost its trailing [DONE], so the shared terminal reconciliation must RECOVER the
+    // broken call — NOT forward a dead/actionless terminal chunk.
+    let calls = 0;
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: (_u, init) => {
+            calls += 1;
+            const body = String(init?.body ?? "");
+            if (body.includes("Emit the tool call NOW")) {
+              return sseResponse([
+                { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_r", type: "function", function: { name: "write", arguments: '{"path":"guide.html","content":"recovered"}' } }] } }] },
+                { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+              ]);
+            }
+            // Truncated tool-call args + a terminal finish_reason:"length" chunk, THEN
+            // the upstream errors before the trailing [DONE].
+            return sseThenError(
+              [
+                { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_b", type: "function", function: { name: "write", arguments: '{"path":"guide.html","content":"<html><h1>trunc' } }] } }] },
+                { choices: [{ delta: {}, finish_reason: "length" }] },
+              ],
+              "terminated",
+            );
+          },
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(
+      ctxWith(client, { model: "fast-glm", stream: true, tools: TOOLS, messages: [{ role: "user", content: "write the full guide" }] }),
+    );
+    const text = await res.text(); // must NOT throw — the held terminal is reconciled
+    expect(calls).toBe(2); // recovery retry fired (original + retry)
+    expect(text).toContain('"content\\":\\"recovered\\"'); // the recovered COMPLETE call
+    expect(text).toContain('"finish_reason":"tool_calls"'); // recovery's terminal, not the dead "length"
+    expect(text).not.toContain('"finish_reason":"length"'); // the broken terminal was NOT forwarded
+    expect(text).not.toContain("trunc"); // the truncated buffered fragment never reached the client
+    expect(text).toContain("[DONE]");
+  });
+
+  it("forwards the content of a MIXED content+tool_calls chunk (tool_calls stripped) and keeps the recovery decision consistent — FINDING E", async () => {
+    // A SINGLE delta chunk carries BOTH content ("partial answer ") AND a truncated
+    // tool call, then the stream ends CLEANLY (no finish_reason chunk). The content
+    // must reach the client (it is recorded in `content` state); if it were only
+    // buffered, `nothingReachedClient()` would wrongly report the client committed —
+    // losing the text while still declining recovery. The truncated tool fragment
+    // must NOT be forwarded raw. Because the content genuinely reached the client,
+    // the guard correctly declines a splice-recovery (which would duplicate the
+    // prose) and closes honestly — the text is delivered exactly once, not lost.
+    let calls = 0;
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: () => {
+            calls += 1;
+            // One mixed chunk (content + truncated tool-call args), then a clean [DONE]
+            // with no finish_reason chunk at all.
+            return sseResponse([
+              { choices: [{ delta: { role: "assistant", content: "partial answer ", tool_calls: [{ index: 0, id: "call_m", type: "function", function: { name: "write", arguments: '{"path":"guide.html","content":"<html><h1>tr' } }] } }] },
+            ]);
+          },
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(
+      ctxWith(client, { model: "fast-glm", stream: true, tools: TOOLS, messages: [{ role: "user", content: "answer then write" }] }),
+    );
+    const text = await res.text();
+    // (a) the content part of the mixed chunk reached the client...
+    expect(text).toContain("partial answer");
+    // ...exactly once (not duplicated by a spurious recovery splice)...
+    expect((text.match(/partial answer/g) ?? []).length).toBe(1);
+    // ...and the truncated tool-call fragment was NEVER forwarded raw.
+    expect(text).not.toContain("<html><h1>tr");
+    // (b) recovery decision is consistent with what the client actually saw: content
+    //     is committed, so the guard closes honestly WITHOUT a recovery retry.
+    expect(calls).toBe(1);
+    expect((text.match(/data: \[DONE\]/g) ?? []).length).toBe(1);
   });
 
   it("recovers a narrate-and-stop STREAMING turn into the announced tool call", async () => {
@@ -585,9 +945,38 @@ describe("single strategy — tool-turn completeness guard", () => {
     expect(calls).toBe(1); // no recovery retry fired
   });
 
-  it("emits exactly ONE [DONE] even when the upstream ends with [DONE] but no finish_reason chunk", async () => {
+  it("emits exactly ONE [DONE] and NO recovery when the upstream ends with [DONE] but no finish_reason chunk AFTER forwarded content", async () => {
     // Post-release review finding: the guard used to forward the upstream [DONE]
     // and then append its own after the terminal-less recovery — double framing.
+    // H6 follow-up: with partial content already forwarded, the recovery itself
+    // was the splice — it re-delivered the whole answer a second time. Now the
+    // guard just closes with its own single [DONE].
+    let calls = 0;
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: () => {
+            calls += 1;
+            // Anomalous upstream: content chunks, then [DONE] with NO finish_reason chunk.
+            return sseResponse([{ choices: [{ delta: { role: "assistant", content: "partial" } }] }]);
+          },
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(
+      ctxWith(client, { model: "fast-glm", stream: true, tools: TOOLS, messages: [{ role: "user", content: "x" }] }),
+    );
+    const text = await res.text();
+    const doneCount = (text.match(/data: \[DONE\]/g) ?? []).length;
+    expect(doneCount).toBe(1); // canonical framing: exactly one [DONE], appended by the guard
+    expect(calls).toBe(1); // no recovery retry — "partial" already reached the client
+    expect((text.match(/partial/g) ?? []).length).toBe(1); // delivered once, not duplicated
+  });
+
+  it("recovers when the upstream ends with [DONE] but no finish_reason chunk BEFORE anything was forwarded", async () => {
     const client = new OllamaClient({
       baseUrl: "https://mock.test",
       apiKey: "k",
@@ -602,8 +991,9 @@ describe("single strategy — tool-turn completeness guard", () => {
                 { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
               ]);
             }
-            // Anomalous upstream: content chunks, then [DONE] with NO finish_reason chunk.
-            return sseResponse([{ choices: [{ delta: { role: "assistant", content: "partial" } }] }]);
+            // Empty upstream stream: [DONE] with no chunks at all. Nothing reached
+            // the client, so the recovery retry is the whole answer — safe to run.
+            return sseResponse([]);
           },
         },
       ]),
@@ -612,8 +1002,9 @@ describe("single strategy — tool-turn completeness guard", () => {
       ctxWith(client, { model: "fast-glm", stream: true, tools: TOOLS, messages: [{ role: "user", content: "x" }] }),
     );
     const text = await res.text();
+    expect(text).toContain('"name":"write"'); // the recovered tool call
     const doneCount = (text.match(/data: \[DONE\]/g) ?? []).length;
-    expect(doneCount).toBe(1); // canonical framing: exactly one [DONE], appended by the guard
+    expect(doneCount).toBe(1);
     expect(text.indexOf("[DONE]")).toBeGreaterThan(text.indexOf('"name":"write"')); // recovery BEFORE the single [DONE]
   });
 

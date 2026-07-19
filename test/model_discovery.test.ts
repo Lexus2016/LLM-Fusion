@@ -147,6 +147,7 @@ function editor(listProviderModels?: ConfigEditorListModels) {
     auth: openAuth,
     logger,
     envHas: () => true,
+    authEnforced: () => true, // exercises model discovery, not the transport Host guard
     listProviderModels,
   });
 }

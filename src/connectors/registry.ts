@@ -76,7 +76,8 @@ interface ConnectorRuntime {
 export interface RegistryOptions {
   /** Cooldown for soft (`cooling`) failures before a probe. Default 60 s. */
   cooldownMs?: number;
-  /** Recheck window for hard (`down`) failures before a probe. Default 900 s. */
+  /** Recheck window for hard (`down`) failures before a probe. Default 900 s.
+   * `0` = never re-probe; only a manual reset/enable revives the connector. */
   downRecheckMs?: number;
   /** Injectable clock (epoch ms). Default `Date.now`. */
   now?: () => number;
@@ -102,6 +103,8 @@ export interface ConnectorSnapshot {
   stateChangedAt: number;
   cooldownUntil: number | null;
   cooldownRemainingMs: number | null;
+  /** Hard-down parked by `connector_down_recheck_s: 0` — only reset/enable revives. */
+  parked: boolean;
   consecutiveFailures: number;
   totalRequests: number;
   totalFailures: number;
@@ -233,8 +236,11 @@ export class ConnectorRegistry {
   ): void {
     const r = this.byId.get(id);
     if (!r) return;
-    r.probeInFlight = false;
     if (r.epoch !== epoch) return; // stale attempt — a newer success/action won
+    // The attempt belongs to the current epoch: it owns any probe slot, so the
+    // slot is released here (and only here — a stale failure above must NOT
+    // free a slot a newer probe is holding).
+    r.probeInFlight = false;
     const now = this.now();
     r.totalRequests += 1;
     r.totalFailures += 1;
@@ -244,7 +250,15 @@ export class ConnectorRegistry {
     if (r.state === "off") return; // respect a manual disable that raced this call
     const hard = isHardReason(reason);
     const cooldownMs = opts.cooldownMs ?? (hard ? this.downRecheckMs : this.cooldownMs);
-    const nextUntil = Math.max(r.cooldownUntil, now + cooldownMs);
+    // `connector_down_recheck_s: 0` is the documented "never re-probe — manual
+    // reset only" contract for a HARD down, not "probe immediately" (now + 0
+    // would make the cooldown elapse instantly). Park the connector at an
+    // unreachable cooldown; only reset()/enable() revives it. Note the park is
+    // monotonic like every other cooldown: once at Infinity, a later explicit
+    // Retry-After cannot UN-park it (Math.max stays Infinity) — that is the
+    // point of "manual reset only".
+    const parked = hard && opts.cooldownMs === undefined && this.downRecheckMs === 0;
+    const nextUntil = parked ? Number.POSITIVE_INFINITY : Math.max(r.cooldownUntil, now + cooldownMs);
     if (r.state === "down" && !hard) {
       // Worst-of: a soft failure never downgrades a hard `down`; only extend.
       r.cooldownUntil = nextUntil;
@@ -343,7 +357,10 @@ export class ConnectorRegistry {
     const active = this.activeId();
     return this.runtimes.map((r) => {
       const cooling = r.state === "cooling" || r.state === "down";
-      const remaining = cooling ? Math.max(0, r.cooldownUntil - now) : null;
+      // A parked connector sits at cooldownUntil=Infinity; report a null
+      // remaining (JSON can't carry Infinity anyway) and let `parked` say why.
+      const parked = cooling && r.cooldownUntil === Number.POSITIVE_INFINITY;
+      const remaining = cooling && !parked ? Math.max(0, r.cooldownUntil - now) : null;
       return {
         id: r.cfg.id,
         group: r.cfg.group,
@@ -358,6 +375,7 @@ export class ConnectorRegistry {
         stateChangedAt: r.stateChangedAt,
         cooldownUntil: cooling ? r.cooldownUntil : null,
         cooldownRemainingMs: remaining,
+        parked,
         consecutiveFailures: r.consecutiveFailures,
         totalRequests: r.totalRequests,
         totalFailures: r.totalFailures,

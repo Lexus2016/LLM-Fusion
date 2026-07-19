@@ -23,6 +23,16 @@ function jsonResult(usage: Usage): ChatCompletionResult {
   return { kind: "json", status: 200, data: {}, usage };
 }
 
+function streamResultWithUsage(usage: Promise<Usage>): ChatCompletionResult {
+  return {
+    kind: "stream",
+    status: 200,
+    body: null,
+    contentType: "text/event-stream",
+    usage,
+  };
+}
+
 describe("UsageAccumulator — multiple streamed calls", () => {
   it("sums tokens across two streamed calls in finalize()", async () => {
     const acc = new UsageAccumulator();
@@ -67,6 +77,26 @@ describe("UsageAccumulator — multiple streamed calls", () => {
     expect(second.upstreamCalls).toBe(first.upstreamCalls);
     expect(second.totalTokens).toBe(first.totalTokens);
     expect(second.totalTokens).toBe(42); // folded exactly once — not 84
+  });
+
+  it("finalize() does not double-count when two calls overlap on the same pending stream", async () => {
+    let resolve: ((u: Usage) => void) | undefined;
+    const usage = new Promise<Usage>((r) => {
+      resolve = r;
+    });
+    const acc = new UsageAccumulator();
+    acc.record("m1", streamResultWithUsage(usage));
+
+    const first = acc.finalize();
+    const second = acc.finalize();
+    if (!resolve) throw new Error("usage promise not wired");
+    resolve({ promptTokens: 10, completionTokens: 5, totalTokens: 15 });
+
+    const r1 = await first;
+    const r2 = await second;
+    expect(r1.totalTokens).toBe(15);
+    expect(r2.totalTokens).toBe(15);
+    expect(acc.snapshot().totalTokens).toBe(15); // folded exactly once, not 30
   });
 });
 

@@ -156,16 +156,16 @@ export const smartStrategy: Strategy = {
     // error — exactly the step that benefits from deliberation — so route straight
     // to fusion, skipping the router round-trip. OpenRouter Fusion structurally
     // cannot do this: it is invoked out-of-loop and never sees the tool result.
+    // Use executeFusionWithFallback so a panel failure degrades to simple instead
+    // of surfacing as a 502; the fallback already forces full deliberation by
+    // clearing fusion_planning_turn_only, which is exactly what the escalation
+    // needs to avoid a mid-loop degrade back to synth-only.
     if (cfg.escalate_on_tool_error && latestToolResultIsError(ctx.request)) {
       ctx.logger.info(
         { model: ctx.request.model, route: "fusion", reason: "tool_error_escalation" },
         "smart: latest tool result looks like a failure; escalating to fusion",
       );
-      // Force full deliberation: planning-turn-only would otherwise degrade this
-      // mid-loop step (a tool message is present) back to synth-only, defeating
-      // the escalation. The escalation IS the decision to deliberate mid-loop.
-      const modelConfig = { ...resolveFusion(ctx, cfg), fusion_planning_turn_only: false };
-      return fusionStrategy.execute({ ...ctx, modelConfig });
+      return executeFusionWithFallback(ctx, cfg);
     }
 
     const route = await classify(ctx, cfg);

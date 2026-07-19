@@ -207,6 +207,18 @@ describe("anthropic translation", () => {
     expect(openAi.top_p).toBe(0.9);
   });
 
+  it("maps Anthropic stop_sequences and top_k to OpenAI stop and top_k", () => {
+    const req: AnthropicRequest = {
+      model: "anthropic-fast",
+      messages: [{ role: "user", content: "hi" }],
+      stop_sequences: ["\n\nHuman:", "\n\nAssistant:"],
+      top_k: 40,
+    };
+    const openAi = anthropicToOpenAiRequest(req);
+    expect(openAi.stop).toEqual(["\n\nHuman:", "\n\nAssistant:"]);
+    expect(openAi.top_k).toBe(40);
+  });
+
   it("maps an OpenAI response with content to an Anthropic message", () => {
     const openAi = {
       id: "r-1",
@@ -295,6 +307,36 @@ describe("anthropic translation", () => {
       costUsd: null,
     });
     expect(anthropic).toMatchObject({ stop_reason: "max_tokens" });
+  });
+
+  it("maps a NON-length finish with unparseable tool args to max_tokens, not tool_use", () => {
+    // A truncated stream can terminate on "stop" (or null), not just "length".
+    // The tool input still didn't parse, so it must not be reported runnable —
+    // else Claude Code executes an empty-input tool call.
+    const openAi = {
+      id: "r-3b",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [{ id: "tu-3b", function: { name: "write_file", arguments: '{"path":"a.html","content":"<htm' } }],
+          },
+          finish_reason: "stop",
+        },
+      ],
+    };
+    const anthropic = openAiToAnthropicResponse(openAi, "anthropic-fast", {
+      upstreamCalls: 1,
+      promptTokens: 4,
+      completionTokens: 5,
+      totalTokens: 9,
+      costUsd: null,
+    });
+    expect(anthropic).toMatchObject({
+      stop_reason: "max_tokens", // NOT "tool_use"
+      content: [{ type: "tool_use", id: "tu-3b", name: "write_file", input: {} }],
+    });
   });
 
   it("keeps stop_reason:tool_use when a length-cut turn still carries a COMPLETE tool call", () => {

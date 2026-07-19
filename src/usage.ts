@@ -149,9 +149,8 @@ export class UsageAccumulator {
         pending.map(async (p) => {
           const usageVal = await p.usage;
           const idx = this.pendingStreams.indexOf(p);
-          if (idx !== -1) {
-            this.pendingStreams.splice(idx, 1);
-          }
+          if (idx === -1) return; // already claimed by an overlapping finalize() call
+          this.pendingStreams.splice(idx, 1);
           this.records.push({ model: p.model, usage: usageVal });
         }),
       );

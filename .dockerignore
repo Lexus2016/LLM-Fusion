@@ -10,3 +10,4 @@ docs
 Dockerfile
 .dockerignore
 dist
+fusion.yaml.bak-*

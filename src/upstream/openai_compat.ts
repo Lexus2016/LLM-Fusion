@@ -83,6 +83,11 @@ export class OpenAiCompatClient implements UpstreamClient {
     init: RequestInit,
     opts: { phaseTimeoutOnly?: boolean } = {},
   ): Promise<Response> {
+    // Never follow redirects: undici re-sends explicit Authorization headers to
+    // the redirect target, which would leak the upstream key to an
+    // attacker-controlled host (the same guard src/web.ts applies to Tavily).
+    // A redirect surfaces as a network error instead.
+    const noRedirect: RequestInit = { ...init, redirect: "error" };
     // Per-call timeout. Two shapes:
     //  - default (non-stream): the timeout covers the whole request incl. body
     //    read, via `AbortSignal.timeout` (unref'd, does not keep the event loop
@@ -99,9 +104,9 @@ export class OpenAiCompatClient implements UpstreamClient {
       const phaseAbort = new AbortController();
       const handle = setTimeout(() => phaseAbort.abort(), this.timeoutMs);
       handle.unref?.();
-      const signal = init.signal ? AbortSignal.any([init.signal, phaseAbort.signal]) : phaseAbort.signal;
+      const signal = noRedirect.signal ? AbortSignal.any([noRedirect.signal, phaseAbort.signal]) : phaseAbort.signal;
       try {
-        const res = await this.fetchFn(url, { ...init, signal });
+        const res = await this.fetchFn(url, { ...noRedirect, signal });
         // Headers received — stop the hard timeout so the streaming body is not
         // truncated once the model starts delivering.
         clearTimeout(handle);
@@ -111,7 +116,7 @@ export class OpenAiCompatClient implements UpstreamClient {
         if (phaseAbort.signal.aborted) {
           throw new UpstreamTimeoutError(`upstream request to ${url} timed out after ${this.timeoutMs}ms`);
         }
-        if (init.signal?.aborted) {
+        if (noRedirect.signal?.aborted) {
           throw new UpstreamTimeoutError(`upstream request to ${url} was cancelled by the caller`);
         }
         const message = err instanceof Error ? err.message : "upstream request failed";
@@ -119,14 +124,14 @@ export class OpenAiCompatClient implements UpstreamClient {
       }
     }
     const timeout = AbortSignal.timeout(this.timeoutMs);
-    const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+    const signal = noRedirect.signal ? AbortSignal.any([noRedirect.signal, timeout]) : timeout;
     try {
-      return await this.fetchFn(url, { ...init, signal });
+      return await this.fetchFn(url, { ...noRedirect, signal });
     } catch (err) {
       if (timeout.aborted) {
         throw new UpstreamTimeoutError(`upstream request to ${url} timed out after ${this.timeoutMs}ms`);
       }
-      if (init.signal?.aborted) {
+      if (noRedirect.signal?.aborted) {
         throw new UpstreamTimeoutError(`upstream request to ${url} was cancelled by the caller`);
       }
       const message = err instanceof Error ? err.message : "upstream request failed";
@@ -184,6 +189,9 @@ export class OpenAiCompatClient implements UpstreamClient {
     const url = `${this.baseUrl}/v1/models`;
     const res = await this.doFetch(url, { method: "GET", headers: this.headers(), signal: opts.signal });
     if (!res.ok) {
+      // Consume the error body before throwing: an unread body makes the
+      // keep-alive socket ineligible for reuse.
+      await res.text();
       throw new UpstreamNetworkError(`/v1/models failed for ${this.baseUrl} (status ${res.status})`);
     }
     return parseModelList(await readBody(res));

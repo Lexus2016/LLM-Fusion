@@ -158,6 +158,7 @@ export const AnthropicRequestSchema = z
     temperature: z.number().optional(),
     top_p: z.number().optional(),
     top_k: z.number().int().optional(),
+    stop_sequences: z.array(z.string()).optional(),
     stream: z.boolean().optional(),
     metadata: z.unknown().optional(),
     thinking: z.unknown().optional(),
@@ -227,6 +228,10 @@ export function anthropicToOpenAiRequest(req: AnthropicRequest): ChatCompletionR
   if (req.max_tokens != null) openAi.max_tokens = req.max_tokens;
   if (req.temperature != null) openAi.temperature = req.temperature;
   if (req.top_p != null) openAi.top_p = req.top_p;
+  if (req.top_k != null) openAi.top_k = req.top_k;
+  if (req.stop_sequences && req.stop_sequences.length > 0) {
+    openAi.stop = req.stop_sequences;
+  }
 
   return openAi;
 }
@@ -493,6 +498,15 @@ function finishReasonToAnthropic(
   recovery?: { toolInputsComplete?: boolean },
 ): string | null {
   const hasToolBlocks = contentBlocks.some((b) => b.type === "tool_use");
+  // A tool call whose input JSON did NOT parse to completion must never be
+  // reported as runnable, whatever the upstream finish_reason — a truncated
+  // stream can terminate on "stop" or null (not just "length"). Report
+  // "max_tokens" so the client recovers instead of executing partial/empty
+  // tool input. This generalizes the length-cut guard below to every terminal
+  // state (the `=== false` keeps callers that pass no recovery info unchanged).
+  if (hasToolBlocks && recovery?.toolInputsComplete === false) {
+    return "max_tokens";
+  }
   // A length-cut turn is only runnable when every tool call's input JSON
   // actually parsed to completion (the cap can land exactly after a finished
   // call). Otherwise the tool input is missing its tail, and reporting

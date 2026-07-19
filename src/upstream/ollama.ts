@@ -43,6 +43,8 @@ export class OllamaClient extends OpenAiCompatClient {
       const url = `${this.baseUrl}/api/tags`;
       const res = await this.doFetch(url, { method: "GET", headers: this.headers(), signal: opts.signal });
       if (!res.ok) {
+        // Consume the error body before throwing (keep-alive socket reuse).
+        await res.text();
         throw new UpstreamNetworkError(`/api/tags failed for ${this.baseUrl} (status ${res.status})`);
       }
       return parseModelList(await readBody(res));

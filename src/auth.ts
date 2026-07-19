@@ -15,6 +15,23 @@ function tokensMatch(provided: string, token: string): boolean {
 }
 
 /**
+ * Resolve the client token from the configured env var. Three states:
+ *  - no `auth_token_env` configured → `undefined` (auth intentionally off);
+ *  - configured and set → the value (which may be "" — the middleware
+ *    hard-errors on that below);
+ *  - configured but UNSET (e.g. a misnamed/typo'd var) → "" as well: fail
+ *    CLOSED through the same "configured but empty" 500 path instead of
+ *    silently disabling auth while the operator believes it is on.
+ */
+export function resolveAuthToken(
+  envName: string | undefined,
+  env: Record<string, string | undefined>,
+): string | undefined {
+  if (!envName) return undefined;
+  return env[envName] ?? "";
+}
+
+/**
  * Optional client-token auth.
  *
  * If a token is configured (via `server.auth_token_env` resolved to a non-empty

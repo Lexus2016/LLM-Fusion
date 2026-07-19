@@ -295,6 +295,34 @@ describe("smart strategy", () => {
     expect(called).not.toContain("deepseek");
   });
 
+  it("escalation falls back to simple when the fusion panel fails (H7 follow-up)", async () => {
+    // Escalation used to call fusionStrategy.execute directly; a panel failure
+    // propagated as 502 instead of degrading to simple like the router-chosen
+    // fusion path does. After the fix the escalation routes through the same
+    // executeFusionWithFallback helper, so a sick upstream still yields a 200.
+    let panelCalls = 0;
+    const up = makeUpstream((body) => {
+      const model = String(body.model ?? "");
+      if (PANEL.includes(model)) {
+        panelCalls += 1;
+        return jsonResponse({ error: "prompt too long; exceeded max context length" }, 400);
+      }
+      if (model === "deepseek") {
+        return jsonResponse({ choices: [{ message: { content: "escalated-fallback" } }] });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${model}` } }] });
+    });
+    const res = await smartStrategy.execute(
+      ctx(up.client, reqWithToolResult("smart-inline", "Error: connection refused"), "smart-inline"),
+    );
+    expect(res.status).toBe(200);
+    expect(up.routerBodies()).toHaveLength(0); // router skipped
+    expect(panelCalls).toBeGreaterThan(0); // escalation did try fusion
+    expect(up.modelsCalled()).toContain("deepseek"); // then fell back to simple
+    const text = await res.text();
+    expect(text).toContain("escalated-fallback");
+  });
+
   it("escalate_on_tool_error=false defers to the router even on a failing tool result", async () => {
     const up = makeUpstream(chatWith(routeSimple));
     const res = await smartStrategy.execute(

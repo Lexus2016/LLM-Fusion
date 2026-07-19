@@ -76,9 +76,9 @@ models:
   # --- fusion strategy (Phase 3) ---
   fusion-1:
     strategy: fusion
-    panel: [glm-5.2, kimi-k2.7-code, deepseek-v4-pro]
+    panel: [glm-5.2, kimi-k2.7-code, deepseek-v4-flash]
     judge: glm-5.2
-    synth: deepseek-v4-pro
+    synth: kimi-k2.7-code
     # tool_mode — how requests that carry tools/function-calls are handled (fusion only):
     #   deliberate (default): panel members deliberate in PROSE with the tools STRIPPED;
     #     only the synth model is given the real tool schema and emits one canonical
@@ -189,17 +189,24 @@ models:
 
   fusion-coder:                       # programming / planning / audit — fusion (multiple viewpoints)
     strategy: fusion
-    panel: [glm-5.2, kimi-k2.7-code, mistral-large-3:675b]  # GLM + Moonshot + Mistral (Western decorrelator;
-                                                    # 262K ctx — replaced gpt-oss:120b whose 131K window capped the
-                                                    # whole virtual model's advertised context at 131K).
-                                                    # NOT gemini here: a Gemini panel member 400s ("thought_signature")
-                                                    # on tool-call history from other models and is dropped silently.
+    panel: [kimi-k2.7-code, deepseek-v4-flash, gemini-3-flash-preview, qwen3-coder-next]
+                                      # since v0.1.28: 4-model panel; glm-5.2 dropped to judge+synth
+                                      # only (see CHANGELOG 0.1.28 bench — the fused answer beat every
+                                      # panel member on the 9/15 tasks unaffected by the since-fixed
+                                      # synth-narration bug). gemini-3-flash-preview is BACK as the
+                                      # Western decorrelator: it previously 400'd ("missing
+                                      # thought_signature in functionCall parts") on foreign tool-call
+                                      # history (v0.1.27), but a 2026-07-08 spot-check with synthetic
+                                      # multi-turn tool history (with and without an active tools
+                                      # schema) did NOT reproduce the 400 — watch the `tool-turn
+                                      # terminal state` log line in real agent-loop sessions.
     judge: glm-5.2                    # most reliable structured-JSON of the field -> fewer judge-parse failures
     synth: glm-5.2                    # since v0.1.23 (fusion-lift bench): as synth, kimi emitted draft-style
                                       # output and dragged the composite below every solo; with glm-5.2 the
                                       # fused model beats every member. kimi stays on the panel.
     tool_mode: deliberate
-    fusion_planning_turn_only: true  # full panel on the planning turn, synth-only mid-loop (cost knob)
+    fusion_planning_turn_only: false # full panel on every fresh user instruction; synth-only only
+                                     # on mid-loop tool-result continuations (this is what ships)
 
   fusion-researcher:                  # research / analysis / reports — fusion for breadth
     strategy: fusion
@@ -215,11 +222,18 @@ models:
     default: simple
     escalate_on_tool_error: true      # a failing tool result (test failure / error) -> straight to fusion;
                                       # error-recovery is exactly where multiple viewpoints earn their cost
-    simple: { target: kimi-k2.7-code }   # mechanical steps (read / grep / run). MUST accept tool-call history from
-                                         # OTHER models in the loop: gemini-3-flash-preview rejects it with 400
-                                         # "Function call is missing a thought_signature in functionCall parts" (a
-                                         # Gemini-only requirement) because the loop's tool_calls come from the kimi
-                                         # synth, not Gemini — which breaks the agent session. kimi handles it cleanly.
+    simple: { target: glm-5.2, request_overrides: { reasoning_effort: "none" } }
+                                      # mechanical steps (read / grep / run). Two constraints, in order:
+                                      # 1. MUST accept tool-call history from OTHER models in the loop:
+                                      #    gemini-3-flash-preview rejects it with 400 "Function call is
+                                      #    missing a thought_signature in functionCall parts" (a Gemini-only
+                                      #    requirement), which breaks the agent session.
+                                      # 2. MUST have a large context window: agent sessions grow past 200K
+                                      #    (a real session overflowed kimi's 262K -> 502). glm-5.2 (1M) is
+                                      #    the only context-safe choice; do NOT swap in kimi for speed.
+                                      # reasoning_effort:"none" stops glm deliberating for minutes on
+                                      # mechanical steps (measured: reasoning 1692->0 chars, 6s->2s,
+                                      # tool-calling intact — see the single strategy above).
     fusion: fusion-coder              # substantive steps -> the coder panel. When the router routes a step to
                                       # fusion, the FULL panel runs even mid-loop (planning_turn_only is overridden)
 

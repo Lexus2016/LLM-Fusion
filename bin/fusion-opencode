@@ -10,7 +10,9 @@
 # What it does:
 #   1. starts the proxy (npm start) if it is not already answering on /health;
 #   2. ensures the `fusion` provider exists in your global OpenCode config
-#      (idempotent merge — only the `fusion` key is written, everything else is kept);
+#      (idempotent merge — only the `fusion` key is written, everything else is kept;
+#      an existing config is backed up to opencode.json.bak-<UTC ts> first, a malformed
+#      one aborts instead of being overwritten, and the file is chmod 0600);
 #   3. launches OpenCode with `-m fusion/<model>`.
 #
 # Env:
@@ -60,22 +62,36 @@ fi
 OC_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json"
 mkdir -p "$(dirname "$OC_CFG")"
 FUSION_PROXY_URL="$PROXY_URL" python3 - "$OC_CFG" <<'PY'
-import json, os, sys
+import datetime, json, os, shutil, sys
 path = sys.argv[1]
 proxy = os.environ.get("FUSION_PROXY_URL", "http://127.0.0.1:8080")
-api_key = os.environ.get("FUSION_PROXY_TOKEN") or "local-no-auth"
+# Write apiKey only from a real source: FUSION_PROXY_TOKEN when set, else the
+# key already stored in the file, else the harmless "local-no-auth" placeholder
+# (the unauthenticated proxy accepts any non-empty key, and OpenCode's
+# openai-compatible provider expects SOME apiKey to be present).
+# Unconditionally rewriting it meant: run once WITH FUSION_PROXY_TOKEN, later
+# without -> the stored token was silently overwritten and OpenCode started 401ing.
+api_key = os.environ.get("FUSION_PROXY_TOKEN")
 cfg = {}
-if os.path.exists(path):
+existed = os.path.exists(path)
+if existed:
     try:
         with open(path) as f:
             cfg = json.load(f)
-    except Exception:
-        cfg = {}
+    except Exception as err:
+        # NEVER fall back to {} here: writing that back would silently wipe the
+        # user's other providers/agents/keybinds. Abort and touch nothing.
+        print(
+            f"[fusion-opencode] ERROR: {path} exists but is not valid JSON ({err}).\n"
+            f"[fusion-opencode] refusing to overwrite it — fix or remove the file manually, then re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 cfg.setdefault("$schema", "https://opencode.ai/config.json")
-cfg.setdefault("provider", {})["fusion"] = {
+fusion = {
     "npm": "@ai-sdk/openai-compatible",
     "name": "Fusion Proxy",
-    "options": {"baseURL": proxy.rstrip("/") + "/v1", "apiKey": api_key},
+    "options": {"baseURL": proxy.rstrip("/") + "/v1"},
     "models": {
         "fusion-coder": {"name": "Fusion Coder"},
         "fusion-researcher": {"name": "Fusion Researcher"},
@@ -85,8 +101,24 @@ cfg.setdefault("provider", {})["fusion"] = {
         "fast-glm": {"name": "Fast GLM"},
     },
 }
+prev_fusion = cfg.get("provider", {}).get("fusion", {})
+prev_key = prev_fusion.get("options", {}).get("apiKey") if isinstance(prev_fusion, dict) else None
+if api_key:
+    fusion["options"]["apiKey"] = api_key
+elif isinstance(prev_key, str) and prev_key:
+    fusion["options"]["apiKey"] = prev_key
+else:
+    fusion["options"]["apiKey"] = "local-no-auth"
+cfg.setdefault("provider", {})["fusion"] = fusion
+# Back up an existing config before overwriting it (it is the user's file,
+# not ours — a bad write must never be unrecoverable).
+if existed:
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    shutil.copy2(path, f"{path}.bak-{stamp}")
 with open(path, "w") as f:
     json.dump(cfg, f, indent=2)
+# The file carries the client token — 0600 like fusion-claude's settings file.
+os.chmod(path, 0o600)
 print(f"[fusion-opencode] ensured `fusion` provider in {path}", file=sys.stderr)
 PY
 

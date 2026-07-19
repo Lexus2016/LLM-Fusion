@@ -240,6 +240,87 @@ describe("ConnectorRegistry", () => {
     expect(reg.snapshot()[0]).toMatchObject({ state: "up", reason: null });
   });
 
+  it("down_recheck 0 parks a hard down forever: acquire never probes; reset() revives (H10)", () => {
+    let t = 1000;
+    const reg = registry(
+      [{ id: "a", client: new FakeClient(() => jsonResult(200)) }],
+      { now: () => t, downRecheckMs: 0 },
+    );
+    const a = reg.acquire("a");
+    if (!a.ok) throw new Error("expected ok");
+    reg.recordFailure("a", a.epoch, "payment"); // hard down
+    expect(snap(reg).state).toBe("down");
+    t += 1_000_000; // far in the future — cooldownUntil is Infinity
+    expect(reg.acquire("a").ok).toBe(false); // no probe admitted
+    // Manual reset is the only way back up.
+    reg.reset("a");
+    expect(snap(reg).state).toBe("up");
+    expect(reg.acquire("a").ok).toBe(true);
+  });
+
+  it("an explicit cooldown override still wins when down_recheck is 0 (H10)", () => {
+    let t = 1000;
+    const reg = registry(
+      [{ id: "a", client: new FakeClient(() => jsonResult(200)) }],
+      { now: () => t, downRecheckMs: 0 },
+    );
+    const a = reg.acquire("a");
+    if (!a.ok) throw new Error("expected ok");
+    reg.recordFailure("a", a.epoch, "quota", { cooldownMs: 5_000 }); // hard, but explicit Retry-After
+    expect(snap(reg).state).toBe("down");
+    expect(reg.acquire("a").ok).toBe(false);
+    t += 5_000; // explicit cooldown elapsed
+    const probe = reg.acquire("a");
+    expect(probe.ok).toBe(true);
+    if (probe.ok) expect(probe.probe).toBe(true);
+  });
+
+  it("a stale failure cannot free the probe slot of a newer in-flight probe", () => {
+    // Regression: recordFailure used to clear probeInFlight BEFORE the epoch
+    // guard. If the probe slot was re-acquired by a newer attempt after a
+    // success, a late failure from the OLD epoch would clobber it and allow a
+    // second concurrent probe.
+    let t = 1000;
+    const reg = registry(
+      [{ id: "a", client: new FakeClient(() => jsonResult(200)) }],
+      { now: () => t, cooldownMs: 1_000 },
+    );
+    // Two concurrent up-state attempts at epoch 0.
+    const attemptA = reg.acquire("a");
+    const attemptB = reg.acquire("a");
+    if (!attemptA.ok || !attemptB.ok) throw new Error("expected ok");
+
+    // A fails -> cooling. The epoch does NOT change on failure.
+    reg.recordFailure("a", attemptA.epoch, "rate_limit");
+    expect(snap(reg).state).toBe("cooling");
+
+    t = 2_000;
+    const probe1 = reg.acquire("a");
+    if (!probe1.ok) throw new Error("expected probe1 to be admitted");
+    expect(probe1.probe).toBe(true);
+
+    // P1 succeeds -> epoch 1, state up.
+    reg.recordSuccess("a", probe1.epoch, 10);
+    expect(snap(reg).state).toBe("up");
+
+    // A newer attempt C at epoch 1 fails soft -> cooling again.
+    const attemptC = reg.acquire("a");
+    if (!attemptC.ok) throw new Error("expected ok");
+    reg.recordFailure("a", attemptC.epoch, "server_error");
+    expect(snap(reg).state).toBe("cooling");
+
+    // Cooldown elapses; probe P2 admitted at epoch 1.
+    t = 3_000;
+    const probe2 = reg.acquire("a");
+    if (!probe2.ok) throw new Error("expected probe2 to be admitted");
+    expect(probe2.probe).toBe(true);
+
+    // B's late failure from epoch 0 arrives while P2 is in flight.
+    reg.recordFailure("a", attemptB.epoch, "rate_limit");
+
+    // P2's slot must still be reserved: a second probe is not admitted.
+    expect(reg.acquire("a").ok).toBe(false);
+  });
   it("activeId is the first up connector; pin overrides order", () => {
     let t = 1000;
     const reg = registry(

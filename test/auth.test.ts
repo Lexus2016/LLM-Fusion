@@ -5,6 +5,7 @@ import { CapabilityService } from "../src/capabilities";
 import { parseConfig } from "../src/config";
 import { createLogger } from "../src/logging";
 import { mockFetch, jsonResponse } from "./helpers";
+import { resolveAuthToken } from "../src/auth";
 
 const logger = createLogger({ level: "silent" });
 const config = parseConfig({
@@ -81,5 +82,21 @@ describe("auth", () => {
   it("allows /v1/models with the correct bearer", async () => {
     const res = await getModels(app("secret"), { authorization: "Bearer secret" });
     expect(res.status).toBe(200);
+  });
+});
+
+describe("resolveAuthToken (entrypoint wiring)", () => {
+  it("returns undefined when no env var is configured (auth intentionally off)", () => {
+    expect(resolveAuthToken(undefined, {})).toBeUndefined();
+  });
+
+  it("returns the value when the configured env var is set", () => {
+    expect(resolveAuthToken("FUSION_PROXY_TOKEN", { FUSION_PROXY_TOKEN: "secret" })).toBe("secret");
+  });
+
+  it("fails closed (empty string) when the configured env var is UNSET", () => {
+    // A misnamed/typo'd env var must not silently disable auth; "" routes to
+    // the middleware's 500 "configured but empty" path.
+    expect(resolveAuthToken("MISSING_VAR", {})).toBe("");
   });
 });

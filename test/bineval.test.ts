@@ -321,6 +321,102 @@ describe("runBineval", () => {
     expect(result).toBeNull();
     expect(resilience.breaker.canAttempt("eval-model")).toBe(true);
   });
+
+  function statusClient(status: number): UpstreamClient {
+    return {
+      chatCompletions: async () => ({
+        kind: "json",
+        status,
+        data: { error: "x" },
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      }),
+      show: async () => ({}),
+      chatNative: async () => ({
+        kind: "json",
+        status: 200,
+        data: {},
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      }),
+    };
+  }
+
+  it("releases the half-open probe on a 4xx response so the model is not jammed until restart (H8)", async () => {
+    // Mirrors the single-strategy half-open test: open the breaker with
+    // availability failures, then probe with a 4xx. Before the fix the 4xx
+    // recorded NO outcome, so the reserved probe stuck and every later call
+    // fast-failed on `canAttempt` — the model was dead process-wide.
+    let now = 1_000_000;
+    const resilience = createResilience({
+      maxConcurrency: 4,
+      failureThreshold: 2,
+      cooldownMs: 30_000,
+      now: () => now,
+      sleep: async () => {},
+    });
+    const run = (client: UpstreamClient) =>
+      runBineval(makeCtx(client), resilience, "eval-model", "request text", "output text", DEFAULT_DIMENSIONS, realTimer, 1000);
+    await run(statusClient(503)); // 1st 5xx
+    await run(statusClient(503)); // 2nd 5xx -> open
+    expect(resilience.breaker.getState("eval-model")).toBe("open");
+
+    now += 30_000; // cooldown elapses -> half-open; the next call is the probe
+    expect(resilience.breaker.getState("eval-model")).toBe("half-open");
+
+    const out = await run(statusClient(400)); // 4xx: the model ANSWERED
+    expect(out).toBeNull();
+
+    expect(resilience.breaker.getState("eval-model")).not.toBe("open");
+    expect(resilience.breaker.canAttempt("eval-model")).toBe(true);
+  });
+
+  it("counts a client disconnect mid-probe as probe-abandoned, not a health failure (H9)", async () => {
+    let now = 1_000_000;
+    const resilience = createResilience({
+      maxConcurrency: 4,
+      failureThreshold: 2,
+      cooldownMs: 30_000,
+      now: () => now,
+      sleep: async () => {},
+    });
+    const run = (client: UpstreamClient) =>
+      runBineval(makeCtx(client), resilience, "eval-model", "request text", "output text", DEFAULT_DIMENSIONS, realTimer, 1000);
+    await run(statusClient(503));
+    await run(statusClient(503));
+    expect(resilience.breaker.getState("eval-model")).toBe("open");
+    now += 30_000;
+
+    // The half-open probe is cancelled by a CLIENT disconnect: the abort throws
+    // out of the upstream call with the client signal already aborted.
+    const ac = new AbortController();
+    const abortingClient: UpstreamClient = {
+      chatCompletions: async () => {
+        ac.abort();
+        throw new DOMException("aborted", "AbortError");
+      },
+      show: async () => ({}),
+      chatNative: async () => ({
+        kind: "json",
+        status: 200,
+        data: {},
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      }),
+    };
+    const out = await runBineval(
+      { ...makeCtx(abortingClient), signal: ac.signal },
+      resilience,
+      "eval-model",
+      "request text",
+      "output text",
+      DEFAULT_DIMENSIONS,
+      realTimer,
+      1000,
+    );
+    expect(out).toBeNull();
+    // Not a health failure: the breaker did NOT re-open and the probe slot is
+    // free again (a recordFailure here would have re-opened it).
+    expect(resilience.breaker.getState("eval-model")).toBe("half-open");
+    expect(resilience.breaker.canAttempt("eval-model")).toBe(true);
+  });
 });
 
 // --- Integration: full fusion strategy with bineval wired in ---------------

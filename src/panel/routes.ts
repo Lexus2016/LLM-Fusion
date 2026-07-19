@@ -3,7 +3,7 @@ import type { MiddlewareHandler } from "hono";
 import type { Logger } from "pino";
 import type { Config } from "../config";
 import type { ProviderRouter } from "../connectors/provider_router";
-import { createConfigEditorApp } from "./config_editor";
+import { createConfigEditorApp, makeAdminApiGuard } from "./config_editor";
 import { PANEL_HTML } from "./page";
 
 /**
@@ -30,12 +30,17 @@ export interface PanelDeps {
   getConfig?: () => Config;
   configPath?: string;
   envHas?: (name: string) => boolean;
+  /** Whether client auth is enforced — controls admin Host pinning (see makeAdminApiGuard). */
+  authEnforced?: () => boolean;
 }
 
 const ACTIONS = new Set(["disable", "enable", "reset", "pin", "unpin"]);
 
 export function createPanelApp(deps: PanelDeps): Hono {
   const app = new Hono();
+
+  // Origin/Host + content-type guard on the whole admin API (see config_editor).
+  app.use("/admin/*", makeAdminApiGuard({ authEnforced: deps.authEnforced }));
 
   app.get("/panel", (c) => c.html(PANEL_HTML));
 
@@ -49,6 +54,7 @@ export function createPanelApp(deps: PanelDeps): Hono {
         auth: deps.auth,
         logger: deps.logger,
         envHas: deps.envHas,
+        authEnforced: deps.authEnforced,
         listProviderModels: (id, opts) => deps.router.listGroupModels(id, opts),
       }),
     );

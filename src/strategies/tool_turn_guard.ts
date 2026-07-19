@@ -346,6 +346,24 @@ const StreamChunkSchema = z
   .passthrough();
 
 /**
+ * Deep-clone an SSE chunk with any `delta.tool_calls` removed. Option B withholds
+ * tool-call fragments from the live stream and re-emits ONE assembled call at the
+ * end; if a terminal (finish_reason) chunk ALSO carried tool-call fragments, the
+ * raw fragment must be stripped before that held chunk is forwarded — otherwise an
+ * index-keyed client would concatenate it onto the assembled/recovered arguments,
+ * reintroducing the exact corruption this guard prevents. Best-effort: returns the
+ * clone unchanged when the shape is not the expected chunk shape.
+ */
+function stripToolCallsFromChunk(chunk: unknown): unknown {
+  const clone = JSON.parse(JSON.stringify(chunk));
+  const choice = Array.isArray(clone?.choices) ? clone.choices[0] : undefined;
+  if (choice && typeof choice.delta === "object" && choice.delta !== null) {
+    delete choice.delta.tool_calls;
+  }
+  return clone;
+}
+
+/**
  * Streaming completeness guard for the single route. Every chunk before the
  * terminal (finish_reason-carrying) one is forwarded live and unchanged — a
  * healthy stream is byte-identical to plain passthrough, so first-token latency
@@ -358,7 +376,10 @@ const StreamChunkSchema = z
  * observed "terminated" ~5 min into a large-file write), a TransformStream's
  * flush() never runs, so a pipeThrough guard is structurally blind to exactly
  * the failure that stalls the agent loop. Reading the upstream ourselves lets
- * the catch branch run the SAME streaming recovery for a mid-flight cut.
+ * the catch branch react to a mid-flight cut at all: recover when NOTHING was
+ * forwarded to the client yet, or fail the stream honestly when it was — a
+ * spliced replacement turn would duplicate prose and corrupt the client's
+ * tool-call argument assembly (see finishAfterCut).
  */
 export function makeToolTurnGuardStream(
   ctx: StrategyContext,
@@ -380,6 +401,18 @@ export function makeToolTurnGuardStream(
   let terminalFinishReason: string | null = null;
   let terminalLine: string | null = null;
 
+  /**
+   * True when nothing that COMMITS THE CLIENT to this turn has reached it yet —
+   * only then can a recovery retry replace the turn wholesale. Recovery-eligibility
+   * is judged on client-VISIBLE bytes only: content/reasoning that reached the
+   * client cannot be unsent, so a replacement spliced after it would duplicate the
+   * prose. Tool-call fragments are BUFFERED (option B: never forwarded live), so
+   * they are NOT client-visible — a mid-stream cut after only tool fragments is
+   * still cleanly recoverable (nothing to concatenate). Role-only deltas and SSE
+   * comments/keepalives are content-free and likewise never block recovery.
+   */
+  const nothingReachedClient = (): boolean => content === "" && reasoning === "";
+
   const ToolCallDeltaSchema = z
     .object({
       index: z.number().optional(),
@@ -397,6 +430,92 @@ export function makeToolTurnGuardStream(
     if (parsed.data.function?.name) cur.name = parsed.data.function.name;
     if (typeof parsed.data.function?.arguments === "string") cur.args += parsed.data.function.arguments;
     toolCallAcc.set(idx, cur);
+  };
+
+  /**
+   * Message-shaped view of the buffered tool call(s) (`{id,type,function}`), or
+   * undefined when none were buffered. Used to judge completeness via
+   * `toolCallArgsBroken` / `detectIncompleteToolTurn` before deciding whether to
+   * emit the assembled call or recover.
+   */
+  const buildAssembledCalls = ():
+    | { id?: string; type: string; function: { name?: string; arguments: string } }[]
+    | undefined =>
+    toolCallAcc.size > 0
+      ? [...toolCallAcc.values()].map((c) => ({
+          id: c.id,
+          type: "function",
+          function: { name: c.name, arguments: c.args },
+        }))
+      : undefined;
+
+  /**
+   * STRICT runnability check for the mid-flight-cut SALVAGE path only. On a cut
+   * (no finish_reason) we cannot tell an empty-arguments no-arg tool call from a
+   * call truncated BEFORE its arguments began — so, unlike `toolCallArgsBroken`
+   * (which ignores empty args, correct for a CLEAN finish where empty means a
+   * no-arg tool), salvage requires every call to have a name AND non-empty
+   * arguments that parse as JSON. Anything short of that recovers instead — the
+   * safe choice, since re-asking yields a clean call rather than executing a tool
+   * with empty/partial input.
+   */
+  const assembledCallsRunnable = (
+    calls: { function: { name?: string; arguments: string } }[],
+  ): boolean =>
+    calls.length > 0 &&
+    calls.every((c) => {
+      if (!c.function.name || c.function.arguments.length === 0) return false;
+      try {
+        JSON.parse(c.function.arguments);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+
+  /**
+   * Emittability check for a CLEAN terminal/end (finishNormally / reconcile). Looser
+   * than `assembledCallsRunnable`: an empty-arguments call is fine here (a genuinely
+   * finished no-arg tool sends `arguments: ""`), but a call is NOT emittable if it
+   * lacks a name or carries non-empty arguments that do not parse — those go to
+   * recovery. Complements `detectIncompleteToolTurn`, which only inspects broken
+   * args for `finish_reason:"length"`; this catches a broken/nameless call under
+   * ANY finish reason (e.g. a truncated `finish_reason:"tool_calls"`).
+   */
+  const assembledCallsEmittable = (
+    calls: { function: { name?: string; arguments: string } }[],
+  ): boolean =>
+    calls.length > 0 &&
+    calls.every((c) => {
+      if (!c.function.name) return false;
+      if (c.function.arguments.length === 0) return true; // no-arg tool on a clean finish
+      try {
+        JSON.parse(c.function.arguments);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+
+  /**
+   * Emit the buffered tool call(s) as ONE reconstructed OpenAI streaming delta
+   * chunk (option B). Partial fragments were withheld from the live stream, so the
+   * client receives each call's `arguments` exactly once, already complete — an
+   * index-keyed accumulator (openai-python, Vercel AI SDK, OpenCode) can no longer
+   * concatenate a truncated fragment with a recovered one. Returns true when a
+   * chunk was emitted (i.e. at least one call was buffered).
+   */
+  const emitAssembledToolCalls = (controller: SseSink): boolean => {
+    if (toolCallAcc.size === 0) return false;
+    const tool_calls = [...toolCallAcc.entries()].map(([index, c]) => ({
+      index,
+      id: c.id,
+      type: "function",
+      function: { name: c.name, arguments: c.args },
+    }));
+    const chunk = { choices: [{ index: 0, delta: { tool_calls } }] };
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+    return true;
   };
 
   const handleLine = (line: string, controller: SseSink): void => {
@@ -432,43 +551,69 @@ export function makeToolTurnGuardStream(
     }
     const choice = parsed.data.choices?.[0];
     const delta = choice?.delta;
+    let hadToolCalls = false;
+    let hadVisibleText = false;
     if (delta) {
-      if (typeof delta.content === "string") content += delta.content;
-      if (typeof delta.reasoning === "string") reasoning += delta.reasoning;
-      if (typeof delta.reasoning_content === "string") reasoning += delta.reasoning_content;
-      if (Array.isArray(delta.tool_calls)) for (const tc of delta.tool_calls) accumulateToolCallDelta(tc);
+      if (typeof delta.content === "string") {
+        content += delta.content;
+        if (delta.content.length > 0) hadVisibleText = true;
+      }
+      if (typeof delta.reasoning === "string") {
+        reasoning += delta.reasoning;
+        if (delta.reasoning.length > 0) hadVisibleText = true;
+      }
+      if (typeof delta.reasoning_content === "string") {
+        reasoning += delta.reasoning_content;
+        if (delta.reasoning_content.length > 0) hadVisibleText = true;
+      }
+      if (Array.isArray(delta.tool_calls)) {
+        hadToolCalls = true;
+        for (const tc of delta.tool_calls) accumulateToolCallDelta(tc);
+      }
     }
     if (choice?.finish_reason != null) {
       terminalFinishReason = choice.finish_reason;
-      terminalLine = line;
+      // Hold the terminal chunk until reconciliation. If it ALSO carried tool-call
+      // fragments, strip them from the held line — the assembled call is emitted
+      // separately (option B); forwarding the raw fragment here would let an
+      // index-keyed client concatenate it onto the assembled/recovered arguments.
+      terminalLine = hadToolCalls ? `data: ${JSON.stringify(stripToolCallsFromChunk(obj))}` : line;
+      return;
+    }
+    if (hadToolCalls) {
+      // Option B: NEVER forward a tool-call fragment live — a length-cut mid-args
+      // truncation would otherwise reach the client and the recovery retry (which
+      // restarts at index:0) would make the client concatenate truncated + recovered
+      // `arguments` into invalid JSON. The buffered call is re-emitted whole at the
+      // terminal reconciliation. BUT a MIXED chunk that ALSO carries content/reasoning
+      // must still deliver that text (tool_calls stripped) — otherwise `content`/
+      // `reasoning` state would record text the client never saw, corrupting the
+      // `nothingReachedClient()` recovery decision (it would think the client was
+      // committed and wrongly decline a safe recovery / error). Pure tool-call
+      // fragments (no visible text) are suppressed as before. Same single-"\n"
+      // framing as the raw-line path — the following blank separator line completes
+      // the "\n\n" SSE frame, so this never double-frames.
+      if (hadVisibleText) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(stripToolCallsFromChunk(obj))}\n`));
+      }
       return;
     }
     controller.enqueue(encoder.encode(line + "\n"));
   };
 
-  /** Normal end-of-stream reconciliation (the old flush logic). */
-  const finishNormally = async (controller: SseSink): Promise<void> => {
-    buffer += decoder.decode();
-    if (buffer.length > 0) handleLine(buffer, controller);
-    const assembledCalls =
-      toolCallAcc.size > 0
-        ? [...toolCallAcc.values()].map((c) => ({
-            id: c.id,
-            type: "function",
-            function: { name: c.name, arguments: c.args },
-          }))
-        : undefined;
-    if (terminalLine === null) {
-      // Stream ENDED (cleanly) with no finish_reason chunk — same shape as an
-      // upstream cut, so recover the same way instead of stalling the client.
-      ctx.logger.warn(
-        { stage: "single", model: target, tool_calls: toolCallAcc.size, content_len: content.length, reasoning_len: reasoning.length },
-        "single: tool stream ended without a terminal chunk; running streaming recovery",
-      );
-      await runStreamingRecoveryWithKeepalive(ctx, resilience, target, originalBody, "upstream_cut", controller, encoder);
-      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-      return;
-    }
+  /**
+   * Terminal reconciliation for a HELD finish_reason chunk. Reconstruct the turn,
+   * judge completeness, then either emit the assembled call + terminal + [DONE]
+   * (complete) OR run streaming recovery (broken_tool_call / empty / intent_tail),
+   * failing open to the original terminal. Shared by BOTH the normal end-of-stream
+   * path and finishAfterCut's post-terminal branch: once the finish_reason chunk is
+   * in hand the turn is a normal finish that merely lost its trailing [DONE] (to a
+   * late upstream error, in the cut case), so the SAME reconciliation applies — a
+   * broken terminal turn must RECOVER, never ship a dead/actionless terminal.
+   * Does NOT close the stream (the caller owns that). `terminal` is the held line.
+   */
+  const reconcileTerminalTurn = async (controller: SseSink, terminal: string): Promise<void> => {
+    const assembledCalls = buildAssembledCalls();
     const reconstructed = {
       choices: [
         {
@@ -477,7 +622,12 @@ export function makeToolTurnGuardStream(
         },
       ],
     };
-    const incomplete = detectIncompleteToolTurn(reconstructed);
+    const incomplete =
+      detectIncompleteToolTurn(reconstructed) ??
+      // detectIncompleteToolTurn only inspects broken args for finish_reason
+      // "length"; a truncated/nameless call under any OTHER finish (e.g.
+      // "tool_calls") would otherwise be emitted as runnable. Catch it here.
+      (assembledCalls && !assembledCallsEmittable(assembledCalls) ? ("broken_tool_call" as const) : null);
     // Terminal-state instrumentation: one line per tool-carrying stream, so a
     // real-session stall is diagnosable from the log alone (finish_reason,
     // whether calls/args survived, and what the turn's tail looked like).
@@ -495,23 +645,98 @@ export function makeToolTurnGuardStream(
       "single: tool-turn terminal state",
     );
     if (incomplete === null) {
-      // SSE events are blank-line delimited: terminalLine is a single split line
-      // with its trailing "\n" already stripped, so it needs "\n\n" to close its
-      // own event before [DONE] opens the next one.
-      controller.enqueue(encoder.encode(terminalLine + "\n\n"));
+      // Complete/runnable turn: emit the buffered tool call(s) as ONE assembled
+      // chunk BEFORE the terminal + [DONE], so the client sees each call's
+      // arguments exactly once, already whole (option B). A no-op when the turn
+      // carried no tool calls (honest length-cut prose, narrate-and-stop that
+      // passed, plain answer) — content was already streamed live.
+      emitAssembledToolCalls(controller);
+      // SSE events are blank-line delimited: `terminal` is a single split line with
+      // its trailing "\n" already stripped, so it needs "\n\n" to close its own
+      // event before [DONE] opens the next one.
+      controller.enqueue(encoder.encode(terminal + "\n\n"));
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       return;
     }
+    // Incomplete (broken_tool_call / empty / intent_tail): the buffered call is
+    // broken or absent — do NOT emit it. Because nothing was forwarded for the
+    // tool call, the recovery splices a FRESH call and the client sees only the
+    // clean recovered arguments (no concatenation) — this PRESERVES recovery.
     const recovered = await runStreamingRecoveryWithKeepalive(ctx, resilience, target, originalBody, incomplete, controller, encoder);
     if (!recovered) {
-      // fail open: the retry never reached the client — deliver the original turn
-      controller.enqueue(encoder.encode(terminalLine + "\n\n"));
+      // Fail open: the retry never reached the client — deliver the original
+      // terminal so the turn ends honestly (its finish_reason signals the cut).
+      // Only re-emit the buffered call if it is actually RUNNABLE — never hand the
+      // client a nameless/truncated tool call to execute. A broken one is dropped
+      // (the terminal chunk already tells the client the turn was truncated).
+      if (assembledCalls && assembledCallsEmittable(assembledCalls)) emitAssembledToolCalls(controller);
+      controller.enqueue(encoder.encode(terminal + "\n\n"));
     }
     controller.enqueue(encoder.encode("data: [DONE]\n\n"));
   };
 
-  /** Mid-flight upstream failure: recover instead of stalling the agent loop. */
-  const finishAfterCut = async (controller: SseSink, err: unknown): Promise<void> => {
+  /** Normal end-of-stream reconciliation (the old flush logic). */
+  const finishNormally = async (controller: SseSink): Promise<void> => {
+    buffer += decoder.decode();
+    if (buffer.length > 0) handleLine(buffer, controller);
+    const assembledCalls = buildAssembledCalls();
+    if (terminalLine === null) {
+      // Stream ENDED (cleanly) with no finish_reason chunk.
+      if (assembledCalls && assembledCallsEmittable(assembledCalls)) {
+        // A COMPLETE buffered tool call, withheld from the live stream (option B).
+        // A clean end means the call IS the turn's result, so deliver it now — no
+        // recovery (that would restart at index:0 and duplicate the call).
+        emitAssembledToolCalls(controller);
+        ctx.logger.warn(
+          { stage: "single", model: target, tool_calls: toolCallAcc.size },
+          "single: tool stream ended without a terminal chunk; delivered the buffered tool call(s)",
+        );
+      } else if (nothingReachedClient()) {
+        // Either the buffered call is TRUNCATED (clean end MID-arguments) or the
+        // stream was empty — and nothing reached the client, so recover a complete
+        // turn instead of emitting an unparseable call / stalling the agent loop.
+        ctx.logger.warn(
+          { stage: "single", model: target, tool_calls: toolCallAcc.size },
+          "single: tool stream ended without a terminal chunk before anything reached the client; running streaming recovery",
+        );
+        await runStreamingRecoveryWithKeepalive(
+          ctx,
+          resilience,
+          target,
+          originalBody,
+          assembledCalls ? "broken_tool_call" : "upstream_cut",
+          controller,
+          encoder,
+        );
+      } else {
+        // Content/reasoning already reached the client: a recovery would deliver
+        // the whole answer a SECOND time, so close with our own [DONE]. A broken
+        // buffered call (if any) is DROPPED rather than sending the client invalid
+        // JSON spliced after the prose.
+        ctx.logger.warn(
+          { stage: "single", model: target, content_len: content.length, reasoning_len: reasoning.length, tool_calls: toolCallAcc.size },
+          "single: tool stream ended without a terminal chunk after partial output was forwarded; closing without recovery",
+        );
+      }
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      return;
+    }
+    // A finish_reason chunk was held back — run the shared terminal reconciliation.
+    await reconcileTerminalTurn(controller, terminalLine);
+  };
+
+  /**
+   * Mid-flight upstream failure. Recovery is safe ONLY when nothing that commits
+   * the client to this turn has reached it yet (then the retry IS the whole
+   * answer). Content/reasoning that was already delivered cannot be unsent, so a
+   * replacement turn spliced after it would duplicate prose — that case is
+   * propagated honestly via `controller.error` (matching failover.ts's
+   * committed-stream semantics) and the client's own retry kicks in. Tool-call
+   * fragments are BUFFERED (option B, never forwarded), so a cut after ONLY tool
+   * fragments left the client uncommitted and IS recoverable. This function takes
+   * over ending the stream in every path (close, or error).
+   */
+  const finishAfterCut = async (controller: ReadableStreamDefaultController<Uint8Array>, err: unknown): Promise<void> => {
     ctx.logger.warn(
       {
         stage: "single",
@@ -521,17 +746,47 @@ export function makeToolTurnGuardStream(
         reasoning_len: reasoning.length,
         err: err instanceof Error ? err.message : String(err),
       },
-      "single: upstream tool stream cut mid-flight; running streaming recovery",
+      "single: upstream tool stream cut mid-flight",
     );
-    if (ctx.signal?.aborted) return; // the CLIENT is gone — nobody to recover for
-    if (terminalLine !== null) {
-      // Cut happened after the terminal chunk was already held back — deliver it.
-      controller.enqueue(encoder.encode(terminalLine + "\n\n"));
-      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+    if (ctx.signal?.aborted) {
+      controller.close(); // the CLIENT is gone — nobody to recover for
       return;
     }
-    await runStreamingRecoveryWithKeepalive(ctx, resilience, target, originalBody, "upstream_cut", controller, encoder);
-    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+    if (terminalLine !== null) {
+      // Cut happened after the terminal chunk was already held back: the turn is a
+      // normal finish that merely lost its trailing [DONE] to a late upstream error.
+      // Run the SAME terminal reconciliation as finishNormally — emit a complete
+      // call, or RECOVER a broken/empty one — instead of forwarding a dead terminal.
+      await reconcileTerminalTurn(controller, terminalLine);
+      controller.close();
+      return;
+    }
+    // A COMPLETE buffered tool call survived the cut (upstream emitted the whole
+    // call before dying, just not a finish_reason chunk): SALVAGE it — it was
+    // withheld from the live stream (option B), so there is nothing to concatenate
+    // and any content was already streamed. Mirrors finishNormally's clean-end
+    // complete-call path, and covers the mixed content+complete-call case too
+    // (which would otherwise error after forwarding content). Only a BROKEN/absent
+    // buffered call falls through to recovery / honest error below.
+    const assembledCalls = buildAssembledCalls();
+    if (assembledCalls && assembledCallsRunnable(assembledCalls)) {
+      emitAssembledToolCalls(controller);
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+      return;
+    }
+    if (nothingReachedClient()) {
+      // Nothing client-visible reached the client (buffered tool fragments do not
+      // count — they were never forwarded) and the buffered call, if any, is
+      // broken: recover a clean turn instead of stalling the loop.
+      await runStreamingRecoveryWithKeepalive(ctx, resilience, target, originalBody, "upstream_cut", controller, encoder);
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+      return;
+    }
+    // Content/reasoning already delivered and no complete call to salvage: fail the
+    // stream honestly (a splice would duplicate the delivered prose).
+    controller.error(err instanceof Error ? err : new Error(String(err)));
   };
 
   return new ReadableStream<Uint8Array>({
@@ -549,10 +804,11 @@ export function makeToolTurnGuardStream(
         }
       } catch (err) {
         try {
+          // finishAfterCut ends the stream itself (close on recovery/abort,
+          // error on an honest mid-stream failure — close() after error() would throw).
           await finishAfterCut(controller, err);
         } finally {
           void reader.cancel().catch(() => {});
-          controller.close();
         }
         return;
       }

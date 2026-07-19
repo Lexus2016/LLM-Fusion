@@ -34,8 +34,8 @@ OpenCode shortcut: `./bin/fusion-opencode fusion-coder` (starts the proxy + wire
 - **Verify before claiming done.** `npm test` (vitest, offline mock upstream — no key, no network) and `npm run typecheck` (`tsc --noEmit`) must both pass.
 - **Live checks** that hit the real API run only with a key: `npm run smoke`.
 - **No build step / no `dist`.** Edit `src/*.ts`; `tsx` runs them directly. Do not add a compile step.
-- **No typecasting.** No `as` in TypeScript — fix the types at the source.
-- **Config is hot-reloaded** from `fusion.yaml`; an invalid edit is rejected and the previous config kept. Changing the `upstream:` block needs a restart. Full annotated reference: [`fusion.example.yaml`](./fusion.example.yaml).
+- **Avoid typecasting.** No `as` casts in new TypeScript — fix the types at the source where practical (some legacy casts remain, e.g. in `src/strategies/fusion.ts`; don't add more).
+- **Config is hot-reloaded** from `fusion.yaml`; an invalid edit is rejected and the previous config kept. Model/routing changes apply live, and `providers:` changes rebuild the provider router in place (no restart — see the `manager.onReload` handler in `src/index.ts`). The process-level `upstream:` connection knobs (`max_concurrency`, `request_timeout_s`, `connector_cooldown_s`, `connector_down_recheck_s`) are read once at startup and still need a restart. Full annotated reference: [`fusion.example.yaml`](./fusion.example.yaml).
 - **Secrets:** the Ollama key lives in `.env` / the `OLLAMA_API_KEY` env var only. Never inline it in code, config, logs, or commits.
 
 ## Layout

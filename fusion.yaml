@@ -3,34 +3,66 @@
 # See fusion.example.yaml for the fully annotated reference (every option + defaults).
 
 upstream:
-  base_url: https://ollama.com        # Ollama Cloud root
-  api_key_env: OLLAMA_API_KEY         # env var holding the Bearer key (never inline the key)
-  api_mode: openai                    # Phase 0 confirmed: /v1 chat + SSE + tool_calls all work (auto | openai | native)
-  max_concurrency: 8                  # global p-limit across all in-flight calls (default: 4)
-  per_model_concurrency:              # per-model gates INSIDE the global limit: a burst on one
-    deepseek-v4-pro: 2                # model queues at its own gate instead of head-of-line
-                                      # blocking interactive turns. deepseek-v4-pro carries the
-                                      # Claude Code background small-model bursts (80-130/min);
-                                      # 2 slots keep them flowing without occupying the queue.
-  request_timeout_s: 170              # per upstream call; MUST be < 182 (default: 170).
-                                      # Raised from 120 -> 170: a full fusion-coder/researcher path
-                                      # (panel -> judge -> synth -> bineval) on a heavy prompt can
-                                      # exceed 120s at the synth stage and 504 before bineval attaches
-                                      # its headers. 170 leaves a safety margin under the ~182s upstream
-                                      # ceiling and lets the synth + bineval stages finish.
+  # base_url + api_key_env now live under `providers:` below (new format).
+  # These remain pool-wide settings shared by every provider/account.
+  api_mode: openai # Phase 0 confirmed: /v1 chat + SSE + tool_calls all work (auto | openai | native)
+  max_concurrency: 8 # global p-limit across all in-flight calls (default: 4)
+  per_model_concurrency:
+    # per-model gates INSIDE the global limit: a burst on one
+    deepseek-v4-pro: 2
+      # model queues at its own gate instead of head-of-line
+      # blocking interactive turns. deepseek-v4-pro carries the
+      # Claude Code background small-model bursts (80-130/min);
+      # 2 slots keep them flowing without occupying the queue.
+  request_timeout_s: 180
+    # per upstream call; MUST be < 182 (default: 170).
+    # Raised from 120 -> 170: a full fusion-coder/researcher path
+    # (panel -> judge -> synth -> bineval) on a heavy prompt can
+    # exceed 120s at the synth stage and 504 before bineval attaches
+    # its headers. 170 leaves a safety margin under the ~182s upstream
+    # ceiling and lets the synth + bineval stages finish.
+
+# Provider groups (NEW format). Failover happens across the ACCOUNTS of ONE
+# provider (same models), so a fusion stays consistent when an account degrades.
+# A virtual model binds to a group via `provider:`; with a single group it is
+# optional, so every model below auto-binds to this one. Manage it all live at
+# http://127.0.0.1:8080/panel
+providers:
+  ollama-cloud:
+    # provider group id (referenced by models' `provider:`)
+    type: ollama # ollama | openai-compat
+    base_url: https://ollama.com # Ollama Cloud root (group default)
+    accounts:
+      # failover across these — same models, different keys
+      - id: ollama-1
+        api_key_env: OLLAMA_API_KEY # env var holding the Bearer key (never inline)
+      # Add a SECOND Ollama account to rotate on limits / billing (same models):
+      # - id: ollama-2
+      #   api_key_env: OLLAMA_API_KEY_2
+      # A DIFFERENT provider = its own group with DIFFERENT models, e.g. OpenRouter.
+      # Models bound to it need `provider: openrouter` and this group's model ids:
+      # openrouter:
+      #   type: openai-compat
+      #   base_url: https://openrouter.ai/api/v1
+      #   accounts:
+      #     - id: openrouter-1
+      #       api_key_env: OPENROUTER_API_KEY
+      #       model_map: { "glm-5.2": "z-ai/glm-4.6", "kimi-k2.7-code": "moonshotai/kimi-k2" }
 
 server:
-  bind: 127.0.0.1                     # localhost only. For Docker set 0.0.0.0 here
-                                      # (or run with FUSION_BIND=0.0.0.0) so the host can reach it.
+  bind: 127.0.0.1
+    # localhost only. For Docker set 0.0.0.0 here
+    # (or run with FUSION_BIND=0.0.0.0) so the host can reach it.
   port: 8080
   # auth_token_env: FUSION_PROXY_TOKEN  # optional: when set, clients must send
-                                        # Authorization: Bearer <value-of-that-env-var>.
-                                        # Unset = unauthenticated (localhost single-user) + startup warning.
+  # Authorization: Bearer <value-of-that-env-var>.
+  # Unset = unauthenticated (localhost single-user) + startup warning.
 
-defaults:                             # applied to every model unless overridden per-model
-  panel_member_timeout_s: 90          # per panel member (default: 90)
-  judge_timeout_s: 120                # judge stage (default: 60)
-  min_panel_success: 2                # min successful panel answers, else 502 (default: 1)
+defaults:
+  # applied to every model unless overridden per-model
+  panel_member_timeout_s: 90 # per panel member (default: 90)
+  judge_timeout_s: 120 # judge stage (default: 60)
+  min_panel_success: 2 # min successful panel answers, else 502 (default: 1)
 
 models:
   # single — 1:1 passthrough to one fast model.
@@ -47,22 +79,6 @@ models:
   fast-deepseek:
     strategy: single
     target: deepseek-v4-pro
-
-  # fusion — panel -> judge -> synth across three models (the deliberate path).
-  fusion-1:
-    strategy: fusion
-    panel: [glm-5.2, kimi-k2.7-code, deepseek-v4-flash]
-    judge: glm-5.2
-    synth: kimi-k2.7-code
-
-  # smart — an LLM router decides per request: cheap single vs deep fusion.
-  smart-1:
-    strategy: smart
-    router: glm-5.2                   # fast classifier: empirically fastest (~1.3s) + only reliable-JSON small/mid model
-                                      # (router shoot-out 2026-06-27). nemotron-3-ultra was ~2.4x slower + timed out under load.
-    default: simple                   # route used when the router is unsure / errors
-    simple: fast-kimi                 # string ref to the single model above
-    fusion: fusion-1                  # string ref to the fusion model above
 
   # =========================================================================
   # Task-specialized virtual models — assembled from an empirical model shoot-out
@@ -86,7 +102,7 @@ models:
   #   watch the `tool-turn terminal state` log line in real agent-loop sessions.
   fusion-coder:
     strategy: fusion
-    panel: [kimi-k2.7-code, deepseek-v4-flash, gemini-3-flash-preview, qwen3-coder-next]
+    panel: [ kimi-k2.7-code, deepseek-v4-pro, gemini-3-flash-preview, qwen3-coder-next ]
     # panel: [kimi-k2.7-code, minimax-m3, gpt-oss:120b]   # earlier 3-model alternative, unused
     # Benchmark (bench/fusion-bench.mjs, 15/15 tasks, this panel): the fused answer beat
     # every panel member AND solo glm-5.2 on the 9/15 tasks that completed cleanly
@@ -99,17 +115,19 @@ models:
     # long, rambling generations that eat its own token budget; no per-panel-member
     # request_overrides mechanism exists yet to throttle it (only single/smart.simple
     # support request_overrides — see src/config.ts).
-    judge: glm-5.2                    # most reliable structured-JSON (router shoot-out) -> fewer judge-parse failures
-    synth: glm-5.2                    # CHANGED 2026-07-07 (fusion-lift bench, docs/llm-fusion-audit.md):
-                                      # as synth, kimi emitted 17-19k-char draft-style output on factual/
-                                      # reasoning tasks and dragged fusion to 0.71 (below every solo);
-                                      # with glm-5.2 as synth the same pipeline scored 0.99 vs 0.89 for
-                                      # the best solo — the fused model finally EXCEEDS every member.
-                                      # kimi stays on the panel (its material remains valuable input).
+    judge: glm-5.2 # most reliable structured-JSON (router shoot-out) -> fewer judge-parse failures
+    synth: glm-5.2
+      # CHANGED 2026-07-07 (fusion-lift bench, docs/llm-fusion-audit.md):
+      # as synth, kimi emitted 17-19k-char draft-style output on factual/
+      # reasoning tasks and dragged fusion to 0.71 (below every solo);
+      # with glm-5.2 as synth the same pipeline scored 0.99 vs 0.89 for
+      # the best solo — the fused model finally EXCEEDS every member.
+      # kimi stays on the panel (its material remains valuable input).
     tool_mode: deliberate
-    fusion_planning_turn_only: false  # full panel on EVERY fresh user instruction (a new task /
-                                      # refinement / module — even days into one chat); synth-only
-                                      # only on mid-loop tool-result continuations (cost knob)
+    fusion_planning_turn_only: false
+      # full panel on EVERY fresh user instruction (a new task /
+      # refinement / module — even days into one chat); synth-only
+      # only on mid-loop tool-result continuations (cost knob)
     # Optional BinEval post-synth quality evaluation (non-streaming responses only).
     # Adds one extra evaluator call after the synth stage and returns per-dimension
     # scores in response headers: X-Fusion-Bineval-Score, X-Fusion-Bineval-Dimensions,
@@ -117,17 +135,19 @@ models:
     # Useful for factual consistency checks on research / report outputs.
     bineval:
       enabled: true
-      model: deepseek-v4-pro  # CHANGED 2026-07-07: glm-5.2 became the coder SYNTH (v0.1.23),
-                              # so a glm evaluator would self-grade its own answers.
-                              # deepseek-v4-pro sits outside this pipeline entirely
-                              # (bineval runs rarely — non-streaming responses only —
-                              # so sharing the capped background-traffic model is fine).
-      threshold: 0.7          # overall score below this marks the output as low-quality
-      timeout_s: 60           # per-evaluation timeout; defaults to defaults.judge_timeout_s
+      model: deepseek-v4-pro
+        # CHANGED 2026-07-07: glm-5.2 became the coder SYNTH (v0.1.23),
+        # so a glm evaluator would self-grade its own answers.
+        # deepseek-v4-pro sits outside this pipeline entirely
+        # (bineval runs rarely — non-streaming responses only —
+        # so sharing the capped background-traffic model is fine).
+      threshold: 0.7 # overall score below this marks the output as low-quality
+      timeout_s: 60 # per-evaluation timeout; defaults to defaults.judge_timeout_s
       # Custom binary questions (optional; omit to use the built-in defaults):
       dimensions:
         - dimension: factual_consistency
-          question: "Does the answer contain only claims well-supported by the request and accepted facts?"
+          question: "Does the answer contain only claims well-supported by the request and
+            accepted facts?"
 
     # Optional web grounding for the panel (research freshness). The proxy runs
     # ONE Tavily search before the panel fans out and injects the cleaned results
@@ -139,25 +159,26 @@ models:
     # A failed search degrades silently to an ungrounded panel. Respects
     # fusion_planning_turn_only (no web search on mid-loop tool-result turns).
     web_search:
-      enabled: false           # OFF for the coder (2026-07-07): agent tool-loops route here, and
-                               # grounding added ~12s of pre-panel silence per deliberate turn
-                               # (measured 12.7s of a 28.7s time-to-first-byte) while searching
-                               # for things like "create page.html" — pure latency, no value.
-                               # fusion-researcher keeps grounding ON (freshness matters there).
-      max_results: 3           # Tavily results to fetch (1-10)
-      timeout_s: 20            # per-search timeout (< 60)
-      max_context_chars: 4000  # cap on the injected context block
+      enabled: true
+        # OFF for the coder (2026-07-07): agent tool-loops route here, and
+        # grounding added ~12s of pre-panel silence per deliberate turn
+        # (measured 12.7s of a 28.7s time-to-first-byte) while searching
+        # for things like "create page.html" — pure latency, no value.
+        # fusion-researcher keeps grounding ON (freshness matters there).
+      max_results: 5 # Tavily results to fetch (1-10)
+      timeout_s: 10 # per-search timeout (< 60)
+      max_context_chars: 4000 # cap on the injected context block
 
   # fusion-researcher — research, analysis, reports. Fusion for breadth.
   #   P2: kimi 15 (flawless, BEST WRITER) | glm-5.2 14 (fast, best framing) |
   #   gpt-oss:120b 13 (most exhaustive coverage + Western lineage).
   fusion-researcher:
     strategy: fusion
-    panel: [kimi-k2.7-code, glm-5.2, gpt-oss:120b]
+    panel: [ kimi-k2.7-code, glm-5.2, gpt-oss:120b ]
     judge: glm-5.2
-    synth: kimi-k2.7-code             # scored 15/15; cleanest report-ready prose
+    synth: kimi-k2.7-code # scored 15/15; cleanest report-ready prose
     tool_mode: deliberate
-    fusion_planning_turn_only: false  # research isn't a mechanical loop — full deliberation each step is the value
+    fusion_planning_turn_only: false # research isn't a mechanical loop — full deliberation each step is the value
     # Optional BinEval post-synth quality evaluation (non-streaming responses only).
     # Adds one extra evaluator call after the synth stage and returns per-dimension
     # scores in response headers: X-Fusion-Bineval-Score, X-Fusion-Bineval-Dimensions,
@@ -165,13 +186,23 @@ models:
     # Useful for factual consistency checks on research / report outputs.
     bineval:
       enabled: true
-      model: glm-5.2          # evaluator model; defaults to the fusion judge model
-      threshold: 0.7          # overall score below this marks the output as low-quality
-      timeout_s: 60           # per-evaluation timeout; defaults to defaults.judge_timeout_s
+      model: deepseek-v4-pro
+        # CHANGED 2026-07-08: glm-5.2 is BOTH a researcher panel member
+        # and the judge, so it was grading an answer it helped write and
+        # adjudicate — not literal self-grading (kimi is the synth) but a
+        # real correlation risk. deepseek-v4-flash sits outside this
+        # pipeline entirely (not panel/judge/synth here) and on a synthetic
+        # fabrication probe matched deepseek-v4-pro's correct verdict at
+        # roughly half the latency (~3.7s vs ~6.7s) and fewer tokens.
+        # deepseek-v3.2 was also tried and rejected: 42-49s, 3-4x more
+        # tokens, no better discrimination on the same probe.
+      threshold: 0.7 # overall score below this marks the output as low-quality
+      timeout_s: 60 # per-evaluation timeout; defaults to defaults.judge_timeout_s
       # Custom binary questions (optional; omit to use the built-in defaults):
       dimensions:
         - dimension: factual_consistency
-          question: "Does the answer contain only claims well-supported by the request and accepted facts?"
+          question: "Does the answer contain only claims well-supported by the request and
+            accepted facts?"
 
     # Optional web grounding for the panel (research freshness). The proxy runs
     # ONE Tavily search before the panel fans out and injects the cleaned results
@@ -184,33 +215,17 @@ models:
     # fusion_planning_turn_only (no web search on mid-loop tool-result turns).
     web_search:
       enabled: true
-      max_results: 3           # Tavily results to fetch (1-10)
-      timeout_s: 20            # per-search timeout (< 60)
-      max_context_chars: 4000  # cap on the injected context block
+      max_results: 10 # Tavily results to fetch (1-10)
+      timeout_s: 30 # per-search timeout (< 60)
+      max_context_chars: 8000 # cap on the injected context block
   # fusion-agents — autonomous agent loops. Smart routing: keep the cheap 80%
   #   cheap, escalate the hard 20%. P3 tool-calling was reliable on ALL models
   #   (<2s, correct first action) -> agent choice = planning quality + cost,
   #   NOT tool-calling.
   fusion-agents:
     strategy: smart
-    router: glm-5.2                   # router shoot-out winner (fast + reliable JSON classifier)
+    provider: ollama-cloud
+    router: glm-5.2
     default: simple
-    escalate_on_tool_error: true      # a failing tool result (test failure / error / exception) -> straight to
-                                      # fusion: error-recovery is exactly where multiple viewpoints earn their cost
-    simple:
-      target: glm-5.2                 # mechanical steps (read / grep / run). Constraints, in order:
-                                      # 1. MUST accept tool-call history produced by OTHER models in the loop:
-                                      #    gemini-3-flash-preview rejects it with 400 "Function call is missing a
-                                      #    thought_signature in functionCall parts" — a Gemini-only requirement.
-                                      # 2. MUST have a large context window: agent sessions grow past 200K
-                                      #    (a real session overflowed kimi's 262K -> 502). glm-5.2 (1M) is the
-                                      #    only context-safe choice; do NOT swap in kimi for speed.
-      request_overrides:
-        reasoning_effort: "none"      # A/B-measured 2026-07-08: glm-5.2 on "continue writing" turns sank into
-                                      # ~5-min near-silent deliberation and Ollama Cloud terminates streams at
-                                      # ~5 min -> dead turn. With reasoning_effort:"none": reasoning 1692->0 chars,
-                                      # 6s->2s latency, tool-calling intact (2/2 correct calls, finish=tool_calls).
-                                      # Mechanical steps don't need deliberation — that's what the router's
-                                      # fusion escalation is for. The tool-turn guard still covers what remains.
-    fusion: fusion-coder              # substantive steps -> the coder panel. The router's decision to deliberate
-                                      # forces the FULL panel here (planning_turn_only is overridden mid-loop)
+    simple: fast-glm
+    fusion: fusion-coder

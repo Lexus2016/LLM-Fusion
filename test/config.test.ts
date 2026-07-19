@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseConfig, createConfigManager } from "../src/config";
+import { parseConfig, createConfigManager, findPanelContentionOverlaps } from "../src/config";
 import { createLogger } from "../src/logging";
 import { mkdtempSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -44,6 +44,39 @@ describe("config", () => {
     expect(() =>
       parseConfig({ ...minimal, upstream: { ...minimal.upstream, request_timeout_s: 182 } }),
     ).toThrow();
+  });
+
+  describe("base_url hardening (the key rides on it as Bearer)", () => {
+    const withBase = (base_url: string) =>
+      parseConfig({ ...minimal, upstream: { ...minimal.upstream, base_url } });
+
+    it("accepts https and a loopback http base_url (incl. bracketed IPv6 ::1)", () => {
+      expect(() => withBase("https://ollama.com")).not.toThrow();
+      expect(() => withBase("http://127.0.0.1:11434")).not.toThrow();
+      expect(() => withBase("http://localhost:11434")).not.toThrow();
+      expect(() => withBase("http://[::1]:11434")).not.toThrow(); // URL.hostname keeps brackets
+    });
+
+    it("rejects a non-loopback http:// base_url (cleartext key + exfiltration sink)", () => {
+      expect(() => withBase("http://evil.example.com/collect")).toThrow();
+    });
+
+    it("rejects userinfo embedded in base_url (credential-leak / SSRF obfuscation)", () => {
+      const at = "@";
+      expect(() => withBase(`https://u:p${at}ollama.com`)).toThrow();
+      expect(() => withBase(`https://tok${at}ollama.com`)).toThrow();
+    });
+
+    it("applies the same rule to per-account base_url", () => {
+      expect(() =>
+        parseConfig({
+          ...minimal,
+          providers: {
+            g: { type: "ollama", accounts: [{ id: "a", api_key_env: "K", base_url: "http://attacker.tld" }] },
+          },
+        }),
+      ).toThrow();
+    });
   });
 
   it("accepts per-model concurrency budgets and rejects non-positive values", () => {
@@ -144,6 +177,89 @@ describe("config", () => {
         },
       }),
     ).toThrow(/more than once/);
+  });
+});
+
+describe("panel contention detector (findPanelContentionOverlaps)", () => {
+  it("flags a single model whose target is a fusion panel member (same group)", () => {
+    // Mirrors the real fusion.yaml hazard: fast-deepseek -> deepseek-v4-pro,
+    // which is also a fusion-coder panel member.
+    const cfg = parseConfig({
+      ...minimal,
+      models: {
+        "fast-deepseek": { strategy: "single", target: "deepseek-v4-pro" },
+        "fusion-coder": {
+          strategy: "fusion",
+          panel: ["kimi-k2.7-code", "deepseek-v4-pro", "qwen3-coder-next"],
+          judge: "glm-5.2",
+          synth: "glm-5.2",
+        },
+      },
+    });
+    expect(findPanelContentionOverlaps(cfg)).toEqual([
+      { fastModel: "fast-deepseek", target: "deepseek-v4-pro", fusionModel: "fusion-coder" },
+    ]);
+  });
+
+  it("returns empty for a clean config with no target/panel overlap", () => {
+    const cfg = parseConfig({
+      ...minimal,
+      models: {
+        "fast-deepseek": { strategy: "single", target: "deepseek-v4-pro" },
+        "fusion-coder": {
+          strategy: "fusion",
+          panel: ["kimi-k2.7-code", "qwen3-coder-next"],
+          judge: "glm-5.2",
+          synth: "glm-5.2",
+        },
+      },
+    });
+    expect(findPanelContentionOverlaps(cfg)).toEqual([]);
+  });
+
+  it("flags a failover chain entry that is a fusion panel member", () => {
+    const cfg = parseConfig({
+      ...minimal,
+      models: {
+        resilient: { strategy: "failover", chain: ["glm-5.2", "deepseek-v4-pro"] },
+        "fusion-coder": {
+          strategy: "fusion",
+          panel: ["deepseek-v4-pro", "kimi-k2.7-code"],
+          judge: "glm-5.2",
+          synth: "glm-5.2",
+        },
+      },
+    });
+    expect(findPanelContentionOverlaps(cfg)).toEqual([
+      { fastModel: "resilient", target: "deepseek-v4-pro", fusionModel: "fusion-coder" },
+    ]);
+  });
+
+  it("does not flag overlap when the models are in different provider groups", () => {
+    // Same upstream model id on both sides, but bound to distinct provider groups:
+    // separate rate-limit buckets, so no contention.
+    const cfg = parseConfig({
+      upstream: minimal.upstream,
+      providers: {
+        g1: { type: "ollama", base_url: "https://ollama.com", accounts: [{ id: "a1", api_key_env: "K1" }] },
+        g2: {
+          type: "openai-compat",
+          base_url: "https://openrouter.ai/api/v1",
+          accounts: [{ id: "a2", api_key_env: "K2" }],
+        },
+      },
+      models: {
+        "fast-deepseek": { strategy: "single", provider: "g1", target: "deepseek-v4-pro" },
+        "fusion-coder": {
+          strategy: "fusion",
+          provider: "g2",
+          panel: ["deepseek-v4-pro", "kimi-k2.7-code"],
+          judge: "glm-5.2",
+          synth: "glm-5.2",
+        },
+      },
+    });
+    expect(findPanelContentionOverlaps(cfg)).toEqual([]);
   });
 });
 

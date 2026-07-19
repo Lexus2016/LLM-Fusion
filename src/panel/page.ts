@@ -346,7 +346,7 @@ export const PANEL_HTML = `<!doctype html>
       var isR=(a.state==="cooling"||a.state==="down"||a.state==="off"); show(reason,isR);
       if (isR){ var hard=a.state==="down"; setClass(reason,"reason "+(hard?"hard":a.state==="off"?"":"soft")); setText(why,a.reason||(a.state==="off"?"manual":a.state));
         var he=!!a.lastError; show(errEl,he); var s=he?" · ":""; if(sep.nodeValue!==s) sep.nodeValue=s; if(he) setText(errEl,a.lastError);
-        if (a.cooldownRemainingMs!=null&&a.cooldownRemainingMs>0) setText(cd,(hard?"recheck in ":"probe in ")+secs(a.cooldownRemainingMs)); else if(a.state!=="off") setText(cd,"probing on next request"); else setText(cd,""); }
+        if (a.parked) setText(cd,"parked — manual reset only"); else if (a.cooldownRemainingMs!=null&&a.cooldownRemainingMs>0) setText(cd,(hard?"recheck in ":"probe in ")+secs(a.cooldownRemainingMs)); else if(a.state!=="off") setText(cd,"probing on next request"); else setText(cd,""); }
       setText(mReq,fmtInt(a.totalRequests)); setText(mFail,fmtInt(a.totalFailures)); setText(mSucc,pct(a.totalFailures,a.totalRequests));
       setText(mOk,rel(a.lastSuccessAt)); setText(mBad,rel(a.lastFailureAt)); setText(mLat,a.lastLatencyMs!=null?a.lastLatencyMs+"ms":"—");
       var b=!!busy[a.id]; var key=a.state+"|"+(a.active?1:0)+"|"+(a.pinned?1:0)+"|"+(b?1:0);

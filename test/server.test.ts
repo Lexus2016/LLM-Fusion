@@ -288,7 +288,7 @@ describe("server", () => {
     expect(text.match(/fusion-usage/g)?.length).toBe(1); // exactly one usage chunk
   });
 
-  it("gracefully completes the stream with usage and [DONE] even when the upstream stream fails mid-way", async () => {
+  it("propagates a mid-way upstream stream failure to the client instead of faking a clean [DONE]", async () => {
     const errorStream = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"part1"}}]}\n\n'));
@@ -314,12 +314,21 @@ describe("server", () => {
       body: JSON.stringify({ model: "fast-glm", stream: true, messages: [{ role: "user", content: "hi" }] }),
     });
     expect(res.headers.get("content-type")).toContain("text/event-stream");
-    const text = await res.text();
-    expect(text).toContain("part1");
-    expect(text).toContain("fusion-usage");
-    expect(text).toContain("[DONE]");
-    expect(text.match(/\[DONE\]/g)?.length).toBe(1);
-    expect(text.match(/fusion-usage/g)?.length).toBe(1);
+    // The body must reject (no synthetic usage chunk + [DONE] tail presenting
+    // the truncation as a successful end-of-turn).
+    await expect(res.text()).rejects.toThrow("upstream connection broken");
+  });
+
+  it("rejects an oversized request body with an OpenAI-shaped 413", async () => {
+    const huge = "x".repeat(51 * 1024 * 1024);
+    const res = await postChat(makeApp(), {
+      model: "fast-glm",
+      messages: [{ role: "user", content: huge }],
+    });
+    expect(res.status).toBe(413);
+    const body = await res.json();
+    expect(body.error.type).toBe("invalid_request_error");
+    expect(body.error.message).toMatch(/body too large/);
   });
 });
 

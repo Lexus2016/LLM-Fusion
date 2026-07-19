@@ -4,7 +4,7 @@
 
 > **Three models argue over your prompt, a judge scores their answers, and one final model writes the reply you actually see.**
 
-llm-fusion is a small proxy you run on your own machine, in front of [Ollama Cloud](https://ollama.com). Your coding tool connects to it the way it would connect to any single model — same API, same streaming, same tool calls. The difference is hidden behind the model name: ask for `fusion-coder` and you get a panel of three models answering in parallel, a judge comparing what they said, and a synthesizer writing the final answer. Answers to hard questions come out noticeably stronger than what any one of those models produces alone.
+llm-fusion is a small proxy you run on your own machine, in front of [Ollama Cloud](https://ollama.com). Your coding tool connects to it the way it would connect to any single model — same API, same streaming, same tool calls. The difference is hidden behind the model name: ask for `fusion-coder` and you get a panel of four models answering in parallel, a judge comparing what they said, and a synthesizer writing the final answer. On hard questions, that panel gives you several decorrelated viewpoints from different model families instead of one, an impartial judge that adjudicates their disagreements and flags fragile or hallucinated claims, and a synthesizer that reconciles them into a single answer — plus within-provider failover and completeness guards that keep a single stalled or rate-limited model from ending the turn.
 
 Running that panel on every request would be expensive, so there is also `fusion-agents`: a fast router looks at each request and decides whether it deserves the full panel or just one cheap call. Reading a file gets one call. Recovering from a failed test run gets the whole panel.
 
@@ -168,14 +168,14 @@ Three **task-specialized** presets ship in `fusion.yaml`, each assembled from an
 
 | Call this model | For | Strategy | How it is built |
 |---|---|---|---|
-| **`fusion-coder`** | programming, planning, code audit | `fusion` | panel `glm-5.2` + `kimi-k2.7-code` + `mistral-large-3:675b` → judge `glm-5.2` → synth `glm-5.2` |
+| **`fusion-coder`** | programming, planning, code audit | `fusion` | panel `kimi-k2.7-code` + `deepseek-v4-flash` + `gemini-3-flash-preview` + `qwen3-coder-next` → judge `glm-5.2` → synth `glm-5.2` |
 | **`fusion-researcher`** | research, analysis, reports | `fusion` | panel `kimi-k2.7-code` + `glm-5.2` + `gpt-oss:120b` → judge `glm-5.2` → synth `kimi-k2.7-code` |
 | **`fusion-agents`** | autonomous agent loops | `smart` | router `glm-5.2`; easy steps → `glm-5.2`, hard / error-recovery steps → the `fusion-coder` panel |
 
 Two rules came straight out of the data:
 
 - **Coding uses fusion, not a single model.** Architecture and planning genuinely benefit from multiple viewpoints. (A pure code *audit* — just enumerating issues — is the one coding-shaped task a single model wins, and it is not representative of programming.)
-- **Panels mix model lineages on purpose.** `glm`/`kimi`/`deepseek`/`minimax`/`qwen` are all Chinese labs and share blind spots; every panel adds a Western decorrelator — `mistral-large-3:675b` (Mistral) on the coder panel (since v0.1.26+: it also lifts the advertised context window from 131K to 262K), `gpt-oss:120b` (OpenAI lineage) on the researcher panel — so panel errors are less correlated; that is the whole point of a panel. (Gemini was the original decorrelator but rejects tool-call history produced by other models with a `thought_signature` error on every mid-loop step, so it was replaced.)
+- **Panels mix model lineages on purpose.** `glm`/`kimi`/`deepseek`/`minimax`/`qwen` are all Chinese labs and share blind spots; every panel adds a Western decorrelator — `gemini-3-flash-preview` (Google) on the coder panel and `gpt-oss:120b` (OpenAI lineage) on the researcher panel — so panel errors are less correlated; that is the whole point of a panel. (Gemini was removed in v0.1.27 because it 400'd with "missing thought_signature in functionCall parts" on foreign tool-call history, but a 2026-07-08 spot-check with synthetic multi-turn tool history did not reproduce the error, so it is back in v0.1.28; watch the `tool-turn terminal state` log line in real agent-loop sessions.)
 
 The original generic presets (`fusion-1`, `smart-1`, `fast-glm` / `fast-kimi` / `fast-deepseek`) still ship for ad-hoc use.
 
@@ -320,7 +320,7 @@ That is how llm-fusion keeps long agent loops affordable without sacrificing del
 
 ## llm-fusion vs OpenRouter Fusion
 
-Both run a prompt through a panel of models plus a judge/synth step to produce a stronger answer. The difference is **where, when, and how** that pipeline runs.
+Both run a prompt through a panel of models plus a judge/synth step to reconcile several viewpoints into one answer. The difference is **where, when, and how** that pipeline runs.
 
 | | **llm-fusion** | **OpenRouter Fusion** |
 |---|---|---|
@@ -369,7 +369,7 @@ models:
   # fusion — panel -> judge -> synth; programming, planning, code audit
   fusion-coder:
     strategy: fusion
-    panel: [glm-5.2, kimi-k2.7-code, mistral-large-3:675b]
+    panel: [kimi-k2.7-code, deepseek-v4-flash, gemini-3-flash-preview, qwen3-coder-next]
     judge: glm-5.2
     synth: glm-5.2
     tool_mode: deliberate
@@ -407,7 +407,7 @@ Strategy cheat-sheet for the `models:` map:
 - **`fusion`** → `{ strategy: fusion, panel: [...], judge: <model>, synth: <model> }`
 - **`smart`** → `{ strategy: smart, router: <model>, default: simple|fusion, simple: <single-block-or-ref>, fusion: <fusion-block-or-ref> }`
 
-Config is **hot-reloaded**: edit `fusion.yaml` and routing/model changes apply live (an invalid edit is rejected and the previous config kept). Changing the `upstream` block — base URL, key env, concurrency — needs a restart.
+Config is **hot-reloaded**: edit `fusion.yaml` and model/routing changes apply live, and `providers:` edits rebuild the connector pools in place (an invalid edit is rejected and the previous config kept). Only the process-level `upstream:` knobs — `max_concurrency`, `request_timeout_s`, connector cooldowns — are read once at startup and need a restart.
 
 ## Environment variables
 
@@ -416,11 +416,12 @@ The proxy reads plain environment variables. It also **auto-loads a local `.env`
 | Variable | Required | Default | Purpose |
 |----------|----------|---------|---------|
 | `OLLAMA_API_KEY` | Yes, for live use | — | The Ollama Cloud Bearer key. The name is whatever `upstream.api_key_env` points to (default `OLLAMA_API_KEY`). Held server-side only; never sent to clients or logged. |
-| `FUSION_PROXY_TOKEN` | No | unset | When `server.auth_token_env: FUSION_PROXY_TOKEN` is set in the config, clients must send `Authorization: Bearer <this value>`. Unset ⇒ the proxy is unauthenticated (localhost single-user) and warns at startup. |
+| `FUSION_PROXY_TOKEN` | No | unset | When `server.auth_token_env: FUSION_PROXY_TOKEN` is set in the config, clients must send `Authorization: Bearer <this value>`. If the config names the var but it is UNSET (e.g. a typo), auth fails closed — every request gets a 500 and startup logs an error — rather than silently disabling auth. |
 | `FUSION_CONFIG` | No | `./fusion.yaml` | Path to the config file to load. |
 | `LOG_PRETTY` | No | unset | `LOG_PRETTY=1` enables human-readable pretty logs (otherwise structured JSON). |
 | `LOG_LEVEL` | No | `info` | pino log level (`debug`, `info`, `warn`, …). |
 | `FUSION_BIND` | No | `server.bind` | Overrides the bind address without editing the config (used by the Docker image). |
+| `FUSION_ALLOW_OPEN` | No | unset | The proxy refuses to start on a non-loopback bind with no client auth (e.g. Docker without `FUSION_PROXY_TOKEN`). Set `FUSION_ALLOW_OPEN=1` to override — only behind your own auth gateway. |
 | `FUSION_SYNTH_RECOVERY_PING_MS` | No | `5000` | Interval of the SSE `: keepalive` comments emitted while a synth recovery retry runs inside a stream. Positive number; anything else falls back to the default. |
 
 A `.env.example` cannot be committed here (sandbox guard). Create your own `.env` in the project root with these literal contents:

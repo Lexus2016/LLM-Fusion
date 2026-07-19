@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import type { Logger } from "pino";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -79,6 +80,17 @@ export function createApp(deps: AppDeps): Hono {
 
   app.get("/health", (c) => c.json({ status: "ok" }));
 
+  // Inbound body cap on the JSON API. Generous (vision requests carry base64
+  // images), but an unbounded body is a memory-exhaustion DoS on any
+  // non-loopback deployment. Over the cap → the OpenAI-shaped 413.
+  app.use(
+    "/v1/*",
+    bodyLimit({
+      maxSize: 50 * 1024 * 1024,
+      onError: () => toErrorResponse(new FusionError("request body too large", 413, "invalid_request_error")),
+    }),
+  );
+
   // Local connector panel + admin API (mounted only when a router is wired).
   if (deps.router) {
     app.route(
@@ -90,6 +102,7 @@ export function createApp(deps: AppDeps): Hono {
         getConfig: deps.getConfig,
         configPath: deps.configPath,
         envHas: deps.envHas,
+        authEnforced: () => Boolean(deps.getAuthToken()),
       }),
     );
   }
@@ -217,6 +230,7 @@ export function createApp(deps: AppDeps): Hono {
         strategy,
         pricing: config.pricing,
         logger: reqLogger,
+        clientSignal: c.req.raw.signal,
       });
       reqLogger.info(
         { model, status: decorated.status, ms: Date.now() - startedAt, stream },
@@ -244,6 +258,8 @@ interface UsageMeta {
   strategy: string;
   pricing: PricingMap | undefined;
   logger: Logger;
+  /** Client request signal — distinguishes a client disconnect from an upstream failure. */
+  clientSignal?: AbortSignal;
 }
 
 /**
@@ -297,15 +313,27 @@ async function decorateUsage(res: Response, usage: UsageAccumulator, meta: Usage
           }
           await writer.close();
         } catch (err) {
-          meta.logger.warn(
-            { err: err instanceof Error ? err.message : String(err) },
-            "upstream stream connection failed mid-way; closing gracefully to client",
-          );
           void reader.cancel().catch(() => {});
+          if (meta.clientSignal?.aborted) {
+            // The CLIENT went away — the upstream was fine and there is nobody
+            // left to propagate anything to. Not an upstream failure.
+            meta.logger.debug("client disconnected mid-stream");
+          } else {
+            // A mid-stream upstream failure must LOOK like a failure: aborting
+            // the transform errors the readable, so the client's fetch body
+            // rejects. A graceful close here would let flush() append a
+            // synthetic usage chunk + [DONE], presenting truncation as a
+            // successful end-of-turn — and silently nullifying the failover
+            // strategy's deliberate committed-stream error (spec §10.5).
+            meta.logger.warn(
+              { err: err instanceof Error ? err.message : String(err) },
+              "upstream stream failed mid-way; propagating the error to the client",
+            );
+          }
           try {
-            await writer.close();
+            await writer.abort(err);
           } catch {
-            // ignore
+            // ignore — the stream may already be errored/cancelled
           }
         }
       };

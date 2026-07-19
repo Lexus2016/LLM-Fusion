@@ -199,6 +199,14 @@ export async function runBineval(
       ),
     );
   } catch (err) {
+    // Client disconnect is not an evaluator health failure: do not trip the
+    // breaker. Still release any reserved half-open probe so the model can be
+    // probed again. Detect via the client signal, not the error name — a stage
+    // timeout also aborts the fetch and must still count as a failure.
+    if (ctx.signal?.aborted) {
+      resilience.breaker.recordProbeAbandoned(model);
+      return null;
+    }
     resilience.breaker.recordFailure(model);
     ctx.usage?.recordError(model);
     ctx.logger.warn(
@@ -213,6 +221,11 @@ export async function runBineval(
   if (result.kind !== "json" || result.status >= 400) {
     if (result.kind !== "json" || result.status >= 500 || result.status === 429) {
       resilience.breaker.recordFailure(model);
+    } else {
+      // A 4xx non-availability means the model answered, so it is healthy —
+      // release any half-open probe so it is not jammed open until process
+      // restart (same rationale as single.ts).
+      resilience.breaker.recordSuccess(model);
     }
     ctx.logger.warn(
       { model, status: result.kind === "json" ? result.status : undefined },

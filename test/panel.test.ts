@@ -66,7 +66,7 @@ describe("panel routes", () => {
   });
 
   it("GET /admin/providers returns grouped snapshot", async () => {
-    const app = createPanelApp({ router: makeRouter(["a", "b"]), auth: openAuth, logger });
+    const app = createPanelApp({ router: makeRouter(["a", "b"]), auth: openAuth, logger, authEnforced: () => true });
     const res = await app.request("/admin/providers");
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -78,7 +78,7 @@ describe("panel routes", () => {
 
   it("POST disable → account off and the group's active moves on", async () => {
     const router = makeRouter(["a", "b"]);
-    const app = createPanelApp({ router, auth: openAuth, logger });
+    const app = createPanelApp({ router, auth: openAuth, logger, authEnforced: () => true });
     const res = await app.request("/admin/connectors/a/disable", { method: "POST" });
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -93,7 +93,7 @@ describe("panel routes", () => {
     const acq = reg.acquire("a");
     if (!acq.ok) throw new Error("expected ok");
     reg.recordFailure("a", acq.epoch, "payment"); // a is down
-    const app = createPanelApp({ router, auth: openAuth, logger });
+    const app = createPanelApp({ router, auth: openAuth, logger, authEnforced: () => true });
 
     await app.request("/admin/connectors/a/reset", { method: "POST" });
     expect(reg.snapshot().find((s) => s.id === "a")?.state).toBe("up");
@@ -106,14 +106,106 @@ describe("panel routes", () => {
   });
 
   it("unknown action → 400, unknown account → 404", async () => {
-    const app = createPanelApp({ router: makeRouter(["a"]), auth: openAuth, logger });
+    const app = createPanelApp({ router: makeRouter(["a"]), auth: openAuth, logger, authEnforced: () => true });
     expect((await app.request("/admin/connectors/a/frobnicate", { method: "POST" })).status).toBe(400);
     expect((await app.request("/admin/connectors/zzz/disable", { method: "POST" })).status).toBe(404);
   });
 
+  describe("admin origin/content-type guard", () => {
+    it("passes a loopback request with no Origin (curl/scripts)", async () => {
+      const app = createPanelApp({ router: makeRouter(["a"]), auth: openAuth, logger });
+      const res = await app.request("/admin/providers", { headers: { host: "127.0.0.1:8080" } });
+      expect(res.status).toBe(200);
+    });
+
+    it("403 (fail-closed) when auth is off and the Host header is absent", async () => {
+      // A missing Host must not slip past the loopback pin — else a non-browser
+      // client (HTTP/1.0, curl --http1.0) bypasses it on an ALLOW_OPEN deployment.
+      const app = createPanelApp({ router: makeRouter(["a"]), auth: openAuth, logger });
+      const res = await app.request("/admin/providers");
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toMatch(/loopback/);
+    });
+
+    it("403 when Origin host does not match Host", async () => {
+      const app = createPanelApp({ router: makeRouter(["a"]), auth: openAuth, logger });
+      const res = await app.request("/admin/providers", {
+        headers: { origin: "http://evil.example.com", host: "127.0.0.1:8080" },
+      });
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toMatch(/origin/);
+    });
+
+    it("passes when Origin matches Host", async () => {
+      const app = createPanelApp({ router: makeRouter(["a"]), auth: openAuth, logger });
+      const res = await app.request("/admin/providers", {
+        headers: { origin: "http://127.0.0.1:8080", host: "127.0.0.1:8080" },
+      });
+      expect(res.status).toBe(200);
+    });
+
+    it("403 when auth is off and Host is not a loopback name (DNS-rebinding)", async () => {
+      // The rebinding vector: evil.tld rebinds to 127.0.0.1, so Origin==Host and
+      // the content-type is allowed — only pinning Host to loopback stops it.
+      const app = createPanelApp({ router: makeRouter(["a"]), auth: openAuth, logger });
+      const res = await app.request("/admin/providers", {
+        headers: { origin: "http://evil.example.com:8080", host: "evil.example.com:8080" },
+      });
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toMatch(/loopback/);
+    });
+
+    it("does NOT falsely pass a `127.`-prefixed non-loopback Host (F3 class)", async () => {
+      const app = createPanelApp({ router: makeRouter(["a"]), auth: openAuth, logger });
+      const res = await app.request("/admin/providers", {
+        headers: { origin: "http://127.evil.com:8080", host: "127.evil.com:8080" },
+      });
+      expect(res.status).toBe(403);
+    });
+
+    it("allows a non-loopback Host when auth IS enforced (front-with-your-own-auth)", async () => {
+      const app = createPanelApp({
+        router: makeRouter(["a"]),
+        auth: openAuth,
+        logger,
+        authEnforced: () => true,
+      });
+      const res = await app.request("/admin/providers", {
+        headers: { origin: "https://proxy.internal", host: "proxy.internal" },
+      });
+      expect(res.status).toBe(200);
+    });
+
+    it("415 on a mutating request with a non-JSON body", async () => {
+      const app = createPanelApp({ router: makeRouter(["a"]), auth: openAuth, logger });
+      const res = await app.request("/admin/connectors/a/disable", {
+        method: "POST",
+        headers: { host: "127.0.0.1:8080", "content-type": "text/plain" },
+        body: "action=disable",
+      });
+      expect(res.status).toBe(415);
+    });
+
+    it("415 on a chunked body with no content-type (transfer-encoding bypass)", async () => {
+      const app = createPanelApp({ router: makeRouter(["a"]), auth: openAuth, logger });
+      const res = await app.request("/admin/connectors/a/disable", {
+        method: "POST",
+        headers: { host: "127.0.0.1:8080", "transfer-encoding": "chunked" },
+      });
+      expect(res.status).toBe(415);
+    });
+
+    it("allows bodyless mutations without a content-type", async () => {
+      const app = createPanelApp({ router: makeRouter(["a"]), auth: openAuth, logger });
+      const res = await app.request("/admin/connectors/a/disable", { method: "POST", headers: { host: "127.0.0.1:8080" } });
+      expect(res.status).toBe(200);
+    });
+  });
+
   it("admin routes are auth-gated; the HTML shell is not", async () => {
     const auth = createAuthMiddleware(() => "secret-token");
-    const app = createPanelApp({ router: makeRouter(["a"]), auth, logger });
+    // auth IS enforced here, so the loopback Host pin is off (the token is the gate).
+    const app = createPanelApp({ router: makeRouter(["a"]), auth, logger, authEnforced: () => true });
 
     expect((await app.request("/panel")).status).toBe(200); // ungated shell
     expect((await app.request("/admin/providers")).status).toBe(401);
