@@ -66,6 +66,7 @@ export const PANEL_HTML = `<!doctype html>
     border-bottom:2px solid transparent; padding:9px 14px; cursor:pointer; margin-bottom:-1px}
   .tab-btn:hover{color:var(--fg)}
   .tab-btn.on{color:var(--fg); border-bottom-color:var(--accent)}
+  .tab-btn:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:6px}
   .tab{display:none} .tab.on{display:block; animation:rise .18s ease both}
 
   .summary{display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:24px}
@@ -184,6 +185,7 @@ export const PANEL_HTML = `<!doctype html>
   .sw:after{content:""; position:absolute; top:3px; left:3px; width:22px; height:22px; border-radius:50%;
     background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.35); transition:left .18s cubic-bezier(.2,0,0,1)}
   .sw.on{background:var(--accent)} .sw.on:after{left:23px}
+  .fld.toggle:focus-visible{outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-bg)}
   .rows{display:flex; flex-direction:column; gap:6px}
   .kv{display:flex; gap:6px} .kv input{flex:1}
   .tags{display:flex; flex-wrap:wrap; gap:6px; align-items:center}
@@ -209,10 +211,10 @@ export const PANEL_HTML = `<!doctype html>
     <span class="updated"><span id="hb" class="heartbeat"></span><span id="updated">connecting…</span></span>
   </header>
 
-  <div class="tabs">
-    <button class="tab-btn on" data-tab="monitor">Monitor</button>
-    <button class="tab-btn" data-tab="providers">Providers</button>
-    <button class="tab-btn" data-tab="models">Models</button>
+  <div class="tabs" role="tablist" aria-label="Panel sections">
+    <button class="tab-btn on" data-tab="monitor" id="tabbtn-monitor" role="tab" aria-selected="true" aria-controls="tab-monitor">Monitor</button>
+    <button class="tab-btn" data-tab="providers" id="tabbtn-providers" role="tab" aria-selected="false" aria-controls="tab-providers" tabindex="-1">Providers</button>
+    <button class="tab-btn" data-tab="models" id="tabbtn-models" role="tab" aria-selected="false" aria-controls="tab-models" tabindex="-1">Models</button>
   </div>
 
   <form id="tokenbar" onsubmit="return false;">
@@ -221,26 +223,26 @@ export const PANEL_HTML = `<!doctype html>
     <button class="act" id="tokensave" type="submit">Save</button>
   </form>
 
-  <div id="tab-monitor" class="tab on">
+  <div id="tab-monitor" class="tab on" role="tabpanel" aria-labelledby="tabbtn-monitor" tabindex="0">
     <section id="summary" class="summary"></section>
     <section id="providers"></section>
     <div id="empty-mon" class="empty" style="display:none">No providers reported.</div>
   </div>
 
-  <div id="tab-providers" class="tab">
+  <div id="tab-providers" class="tab" role="tabpanel" aria-labelledby="tabbtn-providers" tabindex="0">
     <div class="sect-head"><h2>Providers &amp; accounts</h2><span class="spacer"></span><button class="act primary" id="add-provider">+ Add provider</button></div>
     <div id="providers-editor"></div>
     <div id="empty-prov" class="empty" style="display:none">No providers configured.</div>
   </div>
 
-  <div id="tab-models" class="tab">
+  <div id="tab-models" class="tab" role="tabpanel" aria-labelledby="tabbtn-models" tabindex="0">
     <div class="sect-head"><h2>Models</h2><span class="spacer"></span><button class="act primary" id="add-model">+ Create model</button></div>
     <div id="models-editor"></div>
     <div id="empty-models" class="empty" style="display:none">No models configured.</div>
   </div>
 
   <div id="ovl" class="ovl">
-    <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="ovl-title-txt">
       <h3 id="ovl-title"><span class="idot"></span><span id="ovl-title-txt">Confirm</span></h3>
       <p id="ovl-msg"></p>
       <div class="row"><button class="act" id="ovl-cancel" type="button">Cancel</button><button class="act danger" id="ovl-ok" type="button">Confirm</button></div>
@@ -248,7 +250,7 @@ export const PANEL_HTML = `<!doctype html>
   </div>
 
   <div id="fovl" class="ovl">
-    <div class="modal wide" role="dialog" aria-modal="true">
+    <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="fovl-title">
       <h3><span id="fovl-title">Form</span></h3>
       <p id="fovl-err" class="ferr"></p>
       <div id="fovl-body"></div>
@@ -256,7 +258,7 @@ export const PANEL_HTML = `<!doctype html>
     </div>
   </div>
 
-  <div id="toasts"></div>
+  <div id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
 
 <script>
 (function(){
@@ -301,7 +303,9 @@ export const PANEL_HTML = `<!doctype html>
 
   // --- confirm modal ------------------------------------------------------
   var pendingYes = null;
+  var confirmPrevFocus = null;
   function confirmAction(title, msgHtml, danger, onYes){
+    confirmPrevFocus = document.activeElement;
     document.getElementById("ovl-title-txt").textContent = title;
     document.getElementById("ovl-title").className = danger ? "danger" : "";
     document.getElementById("ovl-msg").innerHTML = msgHtml;
@@ -309,10 +313,12 @@ export const PANEL_HTML = `<!doctype html>
     pendingYes = onYes; document.getElementById("ovl").classList.add("on");
     document.getElementById("ovl-cancel").focus();
   }
-  function closeConfirm(){ document.getElementById("ovl").classList.remove("on"); pendingYes = null; }
+  function closeConfirm(){ document.getElementById("ovl").classList.remove("on"); pendingYes = null;
+    if(confirmPrevFocus&&confirmPrevFocus.focus) confirmPrevFocus.focus(); confirmPrevFocus=null; }
   document.getElementById("ovl-cancel").onclick = closeConfirm;
   document.getElementById("ovl-ok").onclick = function(){ var f=pendingYes; closeConfirm(); if (f) f(); };
   document.getElementById("ovl").onclick = function(e){ if (e.target===this) closeConfirm(); };
+  document.getElementById("ovl").addEventListener("keydown", function(e){ trapTab(this, e); });
 
   // --- monitor tab (health) ----------------------------------------------
   function allAccounts(provs){ var out=[]; provs.forEach(function(p){ p.accounts.forEach(function(a){ out.push(a); }); }); return out; }
@@ -418,34 +424,57 @@ export const PANEL_HTML = `<!doctype html>
 
   // ---- form modal + field builders ----
   var formSave = null;
-  var dlSeq = 0; // unique datalist ids for model-picker suggestions
+  var formPrevFocus = null;
+  var dlSeq = 0; // unique field/datalist ids
+  var FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+  // Keep Tab inside an open modal so keyboard focus never escapes behind the overlay.
+  function trapTab(container, e){ if(e.key!=="Tab") return; var f=container.querySelectorAll(FOCUSABLE); if(!f.length) return; var first=f[0], last=f[f.length-1];
+    if(e.shiftKey && document.activeElement===first){ e.preventDefault(); last.focus(); }
+    else if(!e.shiftKey && document.activeElement===last){ e.preventDefault(); first.focus(); } }
   function openForm(title, buildBody, onSave){
+    formPrevFocus = document.activeElement;
     document.getElementById("fovl-title").textContent = title;
     var err=document.getElementById("fovl-err"); err.className="ferr"; err.textContent="";
     var body=document.getElementById("fovl-body"); body.textContent=""; buildBody(body);
     formSave = onSave; document.getElementById("fovl").classList.add("on");
+    var first=body.querySelector(FOCUSABLE); if(first) first.focus();
   }
-  function closeForm(){ document.getElementById("fovl").classList.remove("on"); formSave=null; }
+  function closeForm(){ document.getElementById("fovl").classList.remove("on"); formSave=null;
+    if(formPrevFocus&&formPrevFocus.focus) formPrevFocus.focus(); formPrevFocus=null; }
   function formError(msg){ var e=document.getElementById("fovl-err"); e.textContent=msg; e.className="ferr on"; }
   document.getElementById("fovl-cancel").onclick = closeForm;
   document.getElementById("fovl").onclick = function(e){ if (e.target===this) closeForm(); };
+  document.getElementById("fovl").addEventListener("keydown", function(e){ trapTab(this, e); });
   document.getElementById("fovl-save").onclick = function(){ if (formSave) formSave(); };
 
-  function fld(label, hint){ var f=el("div","fld"); f.appendChild(el("label",null,label)); if(hint) f.appendChild(el("div","hint",hint)); return f; }
-  function attachSuggest(input, f, suggestions){ if(!suggestions||!suggestions.length) return; var did="dl"+(++dlSeq); var dl=el("datalist"); dl.id=did; suggestions.forEach(function(s){ var o=el("option"); o.value=s; dl.appendChild(o); }); input.setAttribute("list",did); f.appendChild(dl); }
-  function fText(label, hint, value, mono, suggestions){ var f=fld(label,hint); var i=el("input"); i.type="text"; if(mono) i.className="mono"; i.value=value==null?"":value; attachSuggest(i,f,suggestions); f.appendChild(i); f._get=function(){ return i.value.trim(); }; return f; }
-  function fSelect(label, hint, value, options){ var f=fld(label,hint); var s=el("select"); options.forEach(function(o){ var op=el("option",null,o.label||o); op.value=(o.value!=null?o.value:o); if((o.value!=null?o.value:o)===value) op.selected=true; s.appendChild(op); }); f.appendChild(s); f._get=function(){ return s.value; }; return f; }
-  function fToggle(label, hint, value){ var f=el("div","fld toggle"); var d=el("div","tgtxt"); d.appendChild(el("label",null,label)); if(hint) d.appendChild(el("div","hint",hint)); f.appendChild(d);
-    var sw=el("div","sw"+(value?" on":"")); f.appendChild(sw); f.onclick=function(){ sw.classList.toggle("on"); }; f._get=function(){ return sw.classList.contains("on"); }; return f; }
-  function fTags(label, hint, arr, suggestions){ var f=fld(label,hint); var box=el("div","tags"); var vals=(arr||[]).slice();
+  function fld(label, hint){ var f=el("div","fld"); var l=el("label",null,label); f.appendChild(l); f._label=l; if(hint){ var h=el("div","hint",hint); h.id="fh"+(++dlSeq); f._hintId=h.id; f.appendChild(h); } return f; }
+  // Always create the datalist (even when empty) and return a fill(list) updater,
+  // so the provider catalog can be refreshed IN PLACE without rebuilding the field
+  // (which would destroy focus / cursor / a half-typed tag).
+  function attachSuggest(input, f, suggestions){ var did="dl"+(++dlSeq); var dl=el("datalist"); dl.id=did; input.setAttribute("list",did); f.appendChild(dl);
+    function fill(list){ dl.textContent=""; (list||[]).forEach(function(s){ var o=el("option"); o.value=s; dl.appendChild(o); }); }
+    fill(suggestions); return fill; }
+  function fText(label, hint, value, mono, suggestions){ var f=fld(label,hint); var i=el("input"); i.type="text"; i.id="fi"+(++dlSeq); if(f._label)f._label.htmlFor=i.id; if(f._hintId)i.setAttribute("aria-describedby",f._hintId); if(mono) i.className="mono"; i.value=value==null?"":value; f._setSuggest=attachSuggest(i,f,suggestions); f.appendChild(i); f._get=function(){ return i.value.trim(); }; return f; }
+  function fSelect(label, hint, value, options){ var f=fld(label,hint); var s=el("select"); s.id="fi"+(++dlSeq); if(f._label)f._label.htmlFor=s.id; if(f._hintId)s.setAttribute("aria-describedby",f._hintId); options.forEach(function(o){ var op=el("option",null,o.label||o); op.value=(o.value!=null?o.value:o); if((o.value!=null?o.value:o)===value) op.selected=true; s.appendChild(op); }); f.appendChild(s); f._get=function(){ return s.value; }; return f; }
+  function fToggle(label, hint, value){ var f=el("div","fld toggle"); var d=el("div","tgtxt");
+    var lab=el("label",null,label); lab.id="tgl"+(++dlSeq); d.appendChild(lab);
+    var hid=""; if(hint){ hid="tgh"+dlSeq; var hn=el("div","hint",hint); hn.id=hid; d.appendChild(hn); } f.appendChild(d);
+    var sw=el("div","sw"+(value?" on":"")); sw.setAttribute("aria-hidden","true"); f.appendChild(sw);
+    f.setAttribute("role","switch"); f.setAttribute("tabindex","0"); f.setAttribute("aria-checked", value?"true":"false"); f.setAttribute("aria-labelledby", lab.id); if(hid) f.setAttribute("aria-describedby", hid);
+    function set(on){ sw.classList.toggle("on", !!on); f.setAttribute("aria-checked", on?"true":"false"); }
+    f.onclick=function(){ set(!sw.classList.contains("on")); };
+    f.addEventListener("keydown", function(e){ if(e.key===" "||e.key==="Spacebar"||e.key==="Enter"){ e.preventDefault(); set(!sw.classList.contains("on")); } });
+    f._get=function(){ return sw.classList.contains("on"); }; return f; }
+  function fTags(label, hint, arr, suggestions){ var f=fld(label,hint); var box=el("div","tags"); var vals=(arr||[]).slice(); var sugg=(suggestions||[]).slice(); var curFill=null;
     function draw(){ box.textContent=""; vals.forEach(function(v,i){ var t=el("span","tag"); t.appendChild(document.createTextNode(v)); var x=el("button",null,"×"); x.type="button"; x.onclick=function(){ vals.splice(i,1); draw(); }; t.appendChild(x); box.appendChild(t); });
-      var add=el("span","addrow"); var inp=el("input"); inp.type="text"; inp.className="mono"; inp.placeholder="add…"; attachSuggest(inp,add,suggestions);
+      var add=el("span","addrow"); var inp=el("input"); inp.type="text"; inp.className="mono"; inp.placeholder="add…"; inp.setAttribute("aria-label","Add to "+label); curFill=attachSuggest(inp,add,sugg);
       inp.onkeydown=function(e){ if(e.key==="Enter"){ e.preventDefault(); var v=inp.value.trim(); if(v){ vals.push(v); draw(); } } };
       var b=el("button","act",""); b.type="button"; b.textContent="Add"; b.onclick=function(){ var v=inp.value.trim(); if(v){ vals.push(v); draw(); } };
       add.appendChild(inp); add.appendChild(b); box.appendChild(add); }
-    draw(); f.appendChild(box); f._get=function(){ return vals.slice(); }; return f; }
+    draw(); f.appendChild(box); f._get=function(){ return vals.slice(); };
+    f._setSuggest=function(list){ sugg=(list||[]).slice(); if(curFill) curFill(sugg); }; return f; }
   function fKV(label, hint, obj){ var f=fld(label,hint); var wrap=el("div","rows"); var pairs=Object.keys(obj||{}).map(function(k){ return [k,obj[k]]; });
-    function draw(){ wrap.textContent=""; pairs.forEach(function(p,i){ var row=el("div","kv"); var k=el("input"); k.type="text"; k.className="mono"; k.placeholder="from"; k.value=p[0]; var v=el("input"); v.type="text"; v.className="mono"; v.placeholder="to"; v.value=p[1];
+    function draw(){ wrap.textContent=""; pairs.forEach(function(p,i){ var row=el("div","kv"); var k=el("input"); k.type="text"; k.className="mono"; k.placeholder="from"; k.setAttribute("aria-label",label+" key"); k.value=p[0]; var v=el("input"); v.type="text"; v.className="mono"; v.placeholder="to"; v.setAttribute("aria-label",label+" value"); v.value=p[1];
       k.oninput=function(){ p[0]=k.value; }; v.oninput=function(){ p[1]=v.value; }; var x=el("button","act",""); x.type="button"; x.textContent="×"; x.onclick=function(){ pairs.splice(i,1); draw(); };
       row.appendChild(k); row.appendChild(v); row.appendChild(x); wrap.appendChild(row); });
       var add=el("button","act",""); add.type="button"; add.textContent="+ Add mapping"; add.onclick=function(){ pairs.push(["",""]); draw(); }; wrap.appendChild(add); }
@@ -564,8 +593,14 @@ export const PANEL_HTML = `<!doctype html>
       fProv=fSelect("Provider group"+(ids.length===1?" (optional)":""),"Which provider serves this model. All its accounts share the same models, so failover stays consistent.", existing&&existing.provider?existing.provider:(ids.length===1?ids[0]:""), providerOptions());
       var host=el("div"); body.appendChild(fName); body.appendChild(fStrat); body.appendChild(fProv); body.appendChild(host);
       var provModels=[];
+      // Refresh the provider catalog into the fields' suggestion lists IN PLACE.
+      // NEVER rebuild on a refetch — destroying/recreating the fields would drop
+      // focus, cursor position, and a half-typed tag in the add-box. Only the
+      // upstream-model fields carry the provider catalog; smart's simple/fusion
+      // routes suggest VIRTUAL model names, which don't change with the provider.
+      function applySuggest(){ ["target","chain","panel","judge","synth","adv","router"].forEach(function(k){ if(dyn[k]&&dyn[k]._setSuggest) dyn[k]._setSuggest(provModels); }); }
       function rebuild(){ host.textContent=""; dyn={}; buildStrategyFields(host, fStrat._get(), existing); }
-      function refetch(){ fetchProviderModels(fProv._get(), function(m){ provModels=m; rebuild(); }); }
+      function refetch(){ fetchProviderModels(fProv._get(), function(m){ provModels=m; applySuggest(); }); }
       fStrat.querySelector("select").onchange=rebuild;
       fProv.querySelector("select").onchange=refetch;
       rebuild();   // render immediately (no suggestions yet, never a blank form)
@@ -613,13 +648,21 @@ export const PANEL_HTML = `<!doctype html>
   document.getElementById("add-model").onclick=function(){ modelForm(null,null); };
 
   // --- tabs ---------------------------------------------------------------
+  var TAB_ORDER=["monitor","providers","models"];
   function switchTab(t){ activeTab=t;
-    ["monitor","providers","models"].forEach(function(x){ var on=x===t;
+    TAB_ORDER.forEach(function(x){ var on=x===t;
       document.getElementById("tab-"+x).className="tab"+(on?" on":""); });
-    var btns=document.querySelectorAll(".tab-btn"); Array.prototype.forEach.call(btns,function(b){ b.className="tab-btn"+(b.getAttribute("data-tab")===t?" on":""); });
+    var btns=document.querySelectorAll(".tab-btn"); Array.prototype.forEach.call(btns,function(b){ var on=b.getAttribute("data-tab")===t; b.className="tab-btn"+(on?" on":""); b.setAttribute("aria-selected", on?"true":"false"); b.tabIndex=on?0:-1; });
     if((t==="providers"||t==="models") && !cfg){ loadConfig().catch(function(e){ if(String(e.message)!=="auth") toast("could not load config: "+e.message,"err"); }); }
   }
-  Array.prototype.forEach.call(document.querySelectorAll(".tab-btn"),function(b){ b.onclick=function(){ switchTab(b.getAttribute("data-tab")); }; });
+  Array.prototype.forEach.call(document.querySelectorAll(".tab-btn"),function(b){
+    b.onclick=function(){ switchTab(b.getAttribute("data-tab")); };
+    b.addEventListener("keydown",function(e){ var i=TAB_ORDER.indexOf(b.getAttribute("data-tab")), j=-1;
+      if(e.key==="ArrowRight"||e.key==="ArrowDown") j=(i+1)%TAB_ORDER.length;
+      else if(e.key==="ArrowLeft"||e.key==="ArrowUp") j=(i-1+TAB_ORDER.length)%TAB_ORDER.length;
+      else if(e.key==="Home") j=0; else if(e.key==="End") j=TAB_ORDER.length-1;
+      if(j>=0){ e.preventDefault(); switchTab(TAB_ORDER[j]); document.getElementById("tabbtn-"+TAB_ORDER[j]).focus(); } });
+  });
 
   // --- token bar + global keys -------------------------------------------
   document.getElementById("tokensave").onclick=function(){ setTok(document.getElementById("tokenin").value.trim()); showTokenBar(false); tick(); if(cfg===null&&activeTab!=="monitor") loadConfig(); };

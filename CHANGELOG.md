@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Panel accessibility + a form data-loss bug.**
+  - The fusion model form no longer discards in-progress input. Switching the provider group (or the async model-catalog fetch that runs on open) rebuilt the strategy fields from the ORIGINAL config, destroying anything typed in `panel`/`judge`/`synth`/toggles along with the focused field and cursor. The provider catalog now refreshes the fields' suggestion lists IN PLACE (no DOM rebuild), so a provider change preserves typed values, focus/cursor, and a half-typed tag; the fields are rebuilt only on a strategy change.
+  - Toggles (`Web search grounding`, `Planning-turn-only`, `BinEval`) are now real `role="switch"` controls — keyboard-focusable, Space/Enter toggles, `aria-checked` reflected — instead of a mouse-only `<div>`. Verified in-browser (Tab → Space flips the switch and its `_get()`).
+  - Form inputs are associated with their labels (`<label for>` / `id`, plus `aria-describedby` on the hint); the tag-adder and mapping inputs get an `aria-label`. Tabs are a proper `role="tablist"` with `role="tab"`/`aria-selected`, roving `tabindex`, and Arrow/Home/End navigation; panels are `role="tabpanel"`. Modals are `aria-labelledby` their title, trap Tab, focus the first field on open, and restore focus on close. Toasts announce via `role="status" aria-live="polite"`.
+
 ## [0.1.31] - 2026-07-19
 
 ### Security
