@@ -293,6 +293,13 @@ const ServerSchema = z
     bind: z.string().min(1).default("127.0.0.1"),
     port: z.number().int().min(1).max(65535).default(8080),
     auth_token_env: z.string().min(1).optional(),
+    // Optional SEPARATE token for the admin surface (/admin/* + the panel/WebUI),
+    // naming the env var that holds it. When set, the admin API authenticates with
+    // THIS token instead of the client `auth_token_env` — so the widely-copied
+    // client API token (in every LLM client config) does not also grant config
+    // edits + restart. When UNSET the admin surface falls back to `auth_token_env`
+    // (backward compatible), and when neither resolves it is loopback-only.
+    admin_token_env: z.string().min(1).optional(),
   })
   .strict();
 

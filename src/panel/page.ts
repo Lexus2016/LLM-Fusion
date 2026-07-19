@@ -215,10 +215,11 @@ export const PANEL_HTML = `<!doctype html>
     <button class="tab-btn on" data-tab="monitor" id="tabbtn-monitor" role="tab" aria-selected="true" aria-controls="tab-monitor">Monitor</button>
     <button class="tab-btn" data-tab="providers" id="tabbtn-providers" role="tab" aria-selected="false" aria-controls="tab-providers" tabindex="-1">Providers</button>
     <button class="tab-btn" data-tab="models" id="tabbtn-models" role="tab" aria-selected="false" aria-controls="tab-models" tabindex="-1">Models</button>
+    <button class="tab-btn" data-tab="settings" id="tabbtn-settings" role="tab" aria-selected="false" aria-controls="tab-settings" tabindex="-1">Settings</button>
   </div>
 
   <form id="tokenbar" onsubmit="return false;">
-    <span>Auth required — paste the proxy token (<span class="mono">FUSION_PROXY_TOKEN</span>):</span>
+    <span>Auth required — paste the admin/panel token:</span>
     <input id="tokenin" type="password" placeholder="Bearer token" autocomplete="off" />
     <button class="act" id="tokensave" type="submit">Save</button>
   </form>
@@ -239,6 +240,11 @@ export const PANEL_HTML = `<!doctype html>
     <div class="sect-head"><h2>Models</h2><span class="spacer"></span><button class="act primary" id="add-model">+ Create model</button></div>
     <div id="models-editor"></div>
     <div id="empty-models" class="empty" style="display:none">No models configured.</div>
+  </div>
+
+  <div id="tab-settings" class="tab" role="tabpanel" aria-labelledby="tabbtn-settings" tabindex="0">
+    <div class="sect-head"><h2>Global settings</h2><span class="spacer"></span><button class="act danger" id="restart-btn">Restart service</button></div>
+    <div id="settings-editor"></div>
   </div>
 
   <div id="ovl" class="ovl">
@@ -397,7 +403,7 @@ export const PANEL_HTML = `<!doctype html>
   }
 
   // --- config editor (Providers + Models tabs) ---------------------------
-  function loadConfig(){ return jget("admin/config").then(function(j){ cfg=j; renderProviders(); renderModels(); }); }
+  function loadConfig(){ return jget("admin/config").then(function(j){ cfg=j; renderProviders(); renderModels(); renderSettings(); }); }
   function groupIds(){ return cfg && cfg.providers ? Object.keys(cfg.providers) : []; }
   function modelNames(){ return cfg && cfg.models ? Object.keys(cfg.models) : []; }
   function reloadConfigSoon(){ setTimeout(loadConfig, 400); } // let the file watcher hot-reload first
@@ -455,6 +461,11 @@ export const PANEL_HTML = `<!doctype html>
     function fill(list){ dl.textContent=""; (list||[]).forEach(function(s){ var o=el("option"); o.value=s; dl.appendChild(o); }); }
     fill(suggestions); return fill; }
   function fText(label, hint, value, mono, suggestions){ var f=fld(label,hint); var i=el("input"); i.type="text"; i.id="fi"+(++dlSeq); if(f._label)f._label.htmlFor=i.id; if(f._hintId)i.setAttribute("aria-describedby",f._hintId); if(mono) i.className="mono"; i.value=value==null?"":value; f._setSuggest=attachSuggest(i,f,suggestions); f.appendChild(i); f._get=function(){ return i.value.trim(); }; return f; }
+  // Numeric field: text input (so it can be blank = "unset") that parses to a
+  // number on read. Returns undefined when blank, or NaN when non-numeric so the
+  // caller can reject it. inputmode=numeric brings up the number keypad on mobile.
+  function fNum(label, hint, value){ var f=fld(label,hint); var i=el("input"); i.type="text"; i.setAttribute("inputmode","numeric"); i.className="mono num"; i.id="fi"+(++dlSeq); if(f._label)f._label.htmlFor=i.id; if(f._hintId)i.setAttribute("aria-describedby",f._hintId); i.value=(value==null?"":String(value)); f.appendChild(i);
+    f._get=function(){ var v=i.value.trim(); if(v==="") return undefined; var n=Number(v); return isFinite(n)?n:NaN; }; return f; }
   function fSelect(label, hint, value, options){ var f=fld(label,hint); var s=el("select"); s.id="fi"+(++dlSeq); if(f._label)f._label.htmlFor=s.id; if(f._hintId)s.setAttribute("aria-describedby",f._hintId); options.forEach(function(o){ var op=el("option",null,o.label||o); op.value=(o.value!=null?o.value:o); if((o.value!=null?o.value:o)===value) op.selected=true; s.appendChild(op); }); f.appendChild(s); f._get=function(){ return s.value; }; return f; }
   function fToggle(label, hint, value){ var f=el("div","fld toggle"); var d=el("div","tgtxt");
     var lab=el("label",null,label); lab.id="tgl"+(++dlSeq); d.appendChild(lab);
@@ -479,6 +490,18 @@ export const PANEL_HTML = `<!doctype html>
       row.appendChild(k); row.appendChild(v); row.appendChild(x); wrap.appendChild(row); });
       var add=el("button","act",""); add.type="button"; add.textContent="+ Add mapping"; add.onclick=function(){ pairs.push(["",""]); draw(); }; wrap.appendChild(add); }
     draw(); f.appendChild(wrap); f._get=function(){ var o={}; pairs.forEach(function(p){ if(p[0].trim()) o[p[0].trim()]=p[1].trim(); }); return o; }; return f; }
+
+  // Reveal/hide a container of sub-fields as a toggle flips. Layers on top of
+  // fToggle's own handlers (its onclick fires first, then this), so reading the
+  // toggle state here already sees the new value. Also drives initial visibility.
+  function bindReveal(tg, container){
+    function sync(){ container.style.display = tg._get() ? "" : "none"; }
+    tg.addEventListener("click", sync);
+    tg.addEventListener("keydown", function(e){ if(e.key===" "||e.key==="Spacebar"||e.key==="Enter") setTimeout(sync,0); });
+    sync();
+  }
+  // A slightly-inset container for a toggle's dependent sub-fields.
+  function subGroup(){ var d=el("div"); d.style.margin="0 0 4px 2px"; d.style.paddingLeft="12px"; d.style.borderLeft="2px solid var(--line)"; return d; }
 
   // ---- Providers tab ----
   function renderProviders(){
@@ -608,8 +631,10 @@ export const PANEL_HTML = `<!doctype html>
       function buildStrategyFields(h, strat, ex){
         var up=provModels;      // real upstream models fetched from the provider's catalog
         var virt=modelNames();  // configured virtual model names (used by smart routes)
-        if(strat==="single"){ dyn.target=fText("Target model","The one upstream model id this forwards to (e.g. glm-5.2). Pick from the provider's list.", ex&&ex.target, true, up); h.appendChild(dyn.target); }
-        else if(strat==="failover"){ dyn.chain=fTags("Chain","Upstream models tried IN ORDER; advance to the next on failure. Pick from the provider's list.", ex&&ex.chain, up); h.appendChild(dyn.chain); }
+        if(strat==="single"){ dyn.target=fText("Target model","The one upstream model id this forwards to (e.g. glm-5.2). Pick from the provider's list.", ex&&ex.target, true, up); h.appendChild(dyn.target);
+          addPromote(h, ex); addOverrides(h, ex); }
+        else if(strat==="failover"){ dyn.chain=fTags("Chain","Upstream models tried IN ORDER; advance to the next on failure. Pick from the provider's list.", ex&&ex.chain, up); h.appendChild(dyn.chain);
+          addPromote(h, ex); }
         else if(strat==="fusion"){
           dyn.panel=fTags("Panel (experts)","The models that each answer independently. Mix different model families for decorrelated views. Pick from the provider's list.", ex&&ex.panel, up); h.appendChild(dyn.panel);
           dyn.judge=fText("Judge","Ranks the experts' answers and picks the best (reliable structured output helps).", ex&&ex.judge, true, up); h.appendChild(dyn.judge);
@@ -617,8 +642,24 @@ export const PANEL_HTML = `<!doctype html>
           dyn.adv=fText("Adversarial (optional)","One PANEL member that argues against the others to find flaws. Must be listed in the panel.", ex&&ex.adversarial, true, up); h.appendChild(dyn.adv);
           dyn.tool=fSelect("Tool mode","deliberate = experts discuss in prose, only the synth calls tools. bypass = straight to the synth with tools (faster, no deliberation).", ex?ex.tool_mode:"deliberate",[{label:"deliberate",value:"deliberate"},{label:"bypass",value:"bypass"}]); h.appendChild(dyn.tool);
           dyn.planOnly=fToggle("Full fusion only on planning turns","On: full panel on fresh instructions, synth-only on mid-loop tool-result continuations (cheaper). Off: full fusion every step.", ex?!!ex.fusion_planning_turn_only:false); h.appendChild(dyn.planOnly);
-          dyn.web=fToggle("Web search grounding","Run one web search before the panel and inject results as context. Needs TAVILY_API_KEY set on the server.", ex?!!(ex.web_search&&ex.web_search.enabled):false); h.appendChild(dyn.web);
-          dyn.bineval=fToggle("Quality evaluation (BinEval)","After the synth, score the answer on binary quality questions; results go into response headers (non-streaming only).", ex?!!(ex.bineval&&ex.bineval.enabled):false); h.appendChild(dyn.bineval);
+          // Web search grounding + its tuning (revealed only when enabled).
+          var ws=(ex&&ex.web_search)||{};
+          dyn.web=fToggle("Web search grounding","Run one web search before the panel and inject results as context. Needs TAVILY_API_KEY set on the server.", !!ws.enabled); h.appendChild(dyn.web);
+          var wsub=subGroup();
+          dyn.wsMax=fNum("Max results","How many search results to fetch (1–10). Default 3.", ws.max_results); wsub.appendChild(dyn.wsMax);
+          dyn.wsTimeout=fNum("Search timeout (s)","Deadline for the search call (below 60). Default 20.", ws.timeout_s); wsub.appendChild(dyn.wsTimeout);
+          dyn.wsCtx=fNum("Max context chars","Cap on injected context size. Default 4000.", ws.max_context_chars); wsub.appendChild(dyn.wsCtx);
+          dyn.wsPrompt=fNum("Skip if prompt over (chars)","Skip grounding when the request is already this large, so context can't overflow a small-context member. Default 80000.", ws.max_prompt_chars); wsub.appendChild(dyn.wsPrompt);
+          h.appendChild(wsub); bindReveal(dyn.web, wsub);
+          // BinEval quality evaluation + its tuning (revealed only when enabled).
+          var be=(ex&&ex.bineval)||{};
+          dyn.bineval=fToggle("Quality evaluation (BinEval)","After the synth, score the answer on binary quality questions; results go into response headers (non-streaming only).", !!be.enabled); h.appendChild(dyn.bineval);
+          var bsub=subGroup();
+          dyn.beModel=fText("Evaluator model (optional)","Model that runs the evaluation. Blank = use the judge model.", be.model, true, up); bsub.appendChild(dyn.beModel);
+          dyn.beThresh=fNum("Low-quality threshold","Overall score (0–1) below which the answer is flagged in the headers. Default 0.7.", be.threshold); bsub.appendChild(dyn.beThresh);
+          dyn.beTimeout=fNum("Eval timeout (s)","Per-evaluation deadline. Blank = use the judge timeout.", be.timeout_s); bsub.appendChild(dyn.beTimeout);
+          h.appendChild(bsub); bindReveal(dyn.bineval, bsub);
+          addPromote(h, ex); addOverrides(h, ex);
         }
         else if(strat==="smart"){
           dyn.router=fText("Router model","A fast model that classifies each request as simple vs deep (needs reliable JSON). Pick from the provider's list.", ex&&ex.router, true, up); h.appendChild(dyn.router);
@@ -627,16 +668,37 @@ export const PANEL_HTML = `<!doctype html>
           dyn.fusion=fText("Fusion route","Name of a fusion model to use for deep steps (must be in the same provider group).", ex&&typeof ex.fusion==="string"?ex.fusion:"", true, virt); h.appendChild(dyn.fusion);
         }
       }
+      // Per-model override of the global promote_reasoning_to_content. Tri-state:
+      // inherit (omit the key) / on / off — a plain toggle can't express "unset".
+      function addPromote(h, ex){ var v=(ex&&ex.promote_reasoning_to_content); dyn.promote=fSelect("Promote reasoning to content","Normalize a reasoning-only reply so plain clients see the answer. inherit = use the global default.", v==null?"inherit":(v?"on":"off"),[{label:"inherit (global default)",value:"inherit"},{label:"on",value:"on"},{label:"off",value:"off"}]); h.appendChild(dyn.promote); }
+      // Extra request-body fields merged into every upstream call for this model
+      // (e.g. reasoning_effort → none). Core keys are protected server-side.
+      function addOverrides(h, ex){ dyn.overrides=fKV("Request overrides (optional)","Extra request-body fields sent upstream for this model, e.g. reasoning_effort → none. Values are sent as strings.", (ex&&ex.request_overrides)||{}); h.appendChild(dyn.overrides); }
     }, function(){
       var nm=fName._get(); if(!nm){ formError("Model name is required."); return; }
       var strat=fStrat._get(); var obj={ strategy:strat }; var prov=fProv._get(); if(prov) obj.provider=prov;
-      if(strat==="single"){ var t=dyn.target._get(); if(!t){ formError("Target model is required."); return; } obj.target=t; }
-      else if(strat==="failover"){ var ch=dyn.chain._get(); if(!ch.length){ formError("Add at least one model to the chain."); return; } obj.chain=ch; }
+      // Collect the per-model promote override (tri-state) + request_overrides onto obj.
+      function applyCommon(o){ if(dyn.promote){ var pv=dyn.promote._get(); if(pv==="on") o.promote_reasoning_to_content=true; else if(pv==="off") o.promote_reasoning_to_content=false; }
+        if(dyn.overrides){ var ov=dyn.overrides._get(); if(Object.keys(ov).length) o.request_overrides=ov; } }
+      if(strat==="single"){ var t=dyn.target._get(); if(!t){ formError("Target model is required."); return; } obj.target=t; applyCommon(obj); }
+      else if(strat==="failover"){ var ch=dyn.chain._get(); if(!ch.length){ formError("Add at least one model to the chain."); return; } obj.chain=ch; applyCommon(obj); }
       else if(strat==="fusion"){ var panel=dyn.panel._get(); if(panel.length<1){ formError("Add at least one panel member."); return; }
         var judge=dyn.judge._get(), synth=dyn.synth._get(); if(!judge||!synth){ formError("Judge and Synthesizer are required."); return; }
         obj.panel=panel; obj.judge=judge; obj.synth=synth; var adv=dyn.adv._get(); if(adv) obj.adversarial=adv;
         obj.tool_mode=dyn.tool._get(); if(dyn.planOnly._get()) obj.fusion_planning_turn_only=true;
-        if(dyn.web._get()) obj.web_search={ enabled:true }; if(dyn.bineval._get()) obj.bineval={ enabled:true };
+        if(dyn.web._get()){ var ws={ enabled:true };
+          var wm=dyn.wsMax._get(); if(wm!==undefined){ if(isNaN(wm)){ formError("Web search max results must be a number."); return; } ws.max_results=wm; }
+          var wt=dyn.wsTimeout._get(); if(wt!==undefined){ if(isNaN(wt)){ formError("Web search timeout must be a number."); return; } ws.timeout_s=wt; }
+          var wc=dyn.wsCtx._get(); if(wc!==undefined){ if(isNaN(wc)){ formError("Web search max context chars must be a number."); return; } ws.max_context_chars=wc; }
+          var wp=dyn.wsPrompt._get(); if(wp!==undefined){ if(isNaN(wp)){ formError("Web search prompt cap must be a number."); return; } ws.max_prompt_chars=wp; }
+          obj.web_search=ws; }
+        if(dyn.bineval._get()){ var be={ enabled:true };
+          var bm=dyn.beModel._get(); if(bm) be.model=bm;
+          var bth=dyn.beThresh._get(); if(bth!==undefined){ if(isNaN(bth)){ formError("BinEval threshold must be a number."); return; } be.threshold=bth; }
+          var bto=dyn.beTimeout._get(); if(bto!==undefined){ if(isNaN(bto)){ formError("BinEval timeout must be a number."); return; } be.timeout_s=bto; }
+          if(existing&&existing.bineval&&existing.bineval.dimensions) be.dimensions=existing.bineval.dimensions; // preserve custom questions
+          obj.bineval=be; }
+        applyCommon(obj);
       }
       else if(strat==="smart"){ var router=dyn.router._get(); if(!router){ formError("Router model is required."); return; }
         obj.router=router; obj.default=dyn.def._get(); var s=dyn.simple._get(), fu=dyn.fusion._get();
@@ -647,13 +709,95 @@ export const PANEL_HTML = `<!doctype html>
   }
   document.getElementById("add-model").onclick=function(){ modelForm(null,null); };
 
+  // ---- Settings tab (global, non-fusion-specific config) ----
+  function saveSettings(section, obj, done){ jsend("PUT","admin/config/settings/"+encodeURIComponent(section), obj).then(function(){ toast(section+" settings saved","ok"); reloadConfigSoon(); if(done)done(true); })
+    .catch(function(e){ if(done)done(false,String(e.message||e)); }); }
+  // Numbers that only apply at boot (bind/port, concurrency, timeouts) need a
+  // restart; the settings card flags them and pairs saving with the Restart button.
+  function settingsCard(title, desc, onEdit, needsRestart){ var c=el("div","ecard"); var r=el("div","er1");
+    r.appendChild(el("span","ename",title)); if(needsRestart){ var b=el("span","badge","restart to apply"); b.style.color="var(--cooling)"; r.appendChild(b); }
+    var acts=el("div","eacts"); acts.appendChild(mkBtn("Edit","act",false,onEdit)); r.appendChild(acts); c.appendChild(r);
+    c.appendChild(el("div","edesc",desc)); return c; }
+  function renderSettings(){ var box=document.getElementById("settings-editor"); box.textContent=""; if(!cfg) return;
+    var sv=cfg.server||{}, up=cfg.upstream||{}, df=cfg.defaults||{};
+    box.appendChild(settingsCard("Server",
+      "Listen on "+esc(sv.bind||"127.0.0.1")+":"+(sv.port||8080)+(sv.auth_token_env?(" · client auth "+esc(sv.auth_token_env)):" · no client auth")+(sv.admin_token_env?(" · admin token "+esc(sv.admin_token_env)):""),
+      function(){ serverForm(sv); }, true));
+    box.appendChild(settingsCard("Upstream",
+      "api mode "+esc(up.api_mode||"auto")+" · max concurrency "+(up.max_concurrency==null?4:up.max_concurrency)+" · request timeout "+(up.request_timeout_s==null?170:up.request_timeout_s)+"s",
+      function(){ upstreamForm(up); }, true));
+    box.appendChild(settingsCard("Fusion defaults",
+      "panel timeout "+(df.panel_member_timeout_s==null?90:df.panel_member_timeout_s)+"s · judge "+(df.judge_timeout_s==null?60:df.judge_timeout_s)+"s · min panel success "+(df.min_panel_success==null?1:df.min_panel_success),
+      function(){ defaultsForm(df); }, false));
+  }
+  function serverForm(sv){ var fBind,fPort,fAuth,fAdmin;
+    openForm("Edit server settings", function(body){
+      var note=el("div","hint"); note.style.margin="0 2px 14px"; note.textContent="Bind address and port only take effect after a restart (use the Restart button)."; body.appendChild(note);
+      fBind=fText("Bind address","Interface to listen on. 127.0.0.1 = localhost only (recommended). 0.0.0.0 = all interfaces (needs a client auth token or FUSION_ALLOW_OPEN).", sv.bind||"127.0.0.1", true);
+      fPort=fNum("Port","TCP port for the proxy + panel (1–65535). Default 8080.", sv.port==null?8080:sv.port);
+      fAuth=fText("Client auth token env var (optional)","Env var holding the client bearer token for /v1 requests. Set it to require auth (needed for non-loopback bind). Blank = no client auth.", sv.auth_token_env||"", true);
+      fAdmin=fText("Admin token env var (optional)","Env var holding a SEPARATE token for this panel + /admin API, so the widely-copied client token doesn't also grant config edits + restart. Blank = the admin surface reuses the client token (or is loopback-only when neither is set).", sv.admin_token_env||"", true);
+      body.appendChild(fBind); body.appendChild(fPort); body.appendChild(fAuth); body.appendChild(fAdmin);
+    }, function(){
+      var port=fPort._get(); if(port===undefined||isNaN(port)){ formError("Port is required and must be a number."); return; }
+      var bind=fBind._get(); if(!bind){ formError("Bind address is required."); return; }
+      var obj={ bind:bind, port:port }; var a=fAuth._get(); if(a) obj.auth_token_env=a; var ad=fAdmin._get(); if(ad) obj.admin_token_env=ad;
+      saveSettings("server", obj, function(ok,err){ if(ok) closeForm(); else formError(err); });
+    });
+  }
+  function upstreamForm(up){ var fMode,fConc,fTimeout,fCool,fRecheck,fPerDef;
+    openForm("Edit upstream settings", function(body){
+      var note=el("div","hint"); note.style.margin="0 2px 14px"; note.textContent="Concurrency and timeouts are read at boot — restart to apply. base_url / API keys live under Providers."; body.appendChild(note);
+      fMode=fSelect("API mode","auto = detect per provider. openai = force the /v1 OpenAI shape. native = force the Ollama /api shape.", up.api_mode||"auto",[{label:"auto",value:"auto"},{label:"openai",value:"openai"},{label:"native",value:"native"}]);
+      fConc=fNum("Max concurrency","Global cap on simultaneous upstream requests. Default 4.", up.max_concurrency==null?4:up.max_concurrency);
+      fTimeout=fNum("Request timeout (s)","Per-request upstream deadline. Must be below ~182s (the Ollama Cloud ceiling). Default 170.", up.request_timeout_s==null?170:up.request_timeout_s);
+      fCool=fNum("Connector cooldown (s)","How long a connector rests after a soft failure (rate-limit/5xx/timeout) before it is probed again. Default 60.", up.connector_cooldown_s==null?60:up.connector_cooldown_s);
+      fRecheck=fNum("Connector down recheck (s)","How long a connector stays down after a HARD failure (auth/quota) before an automatic probe. 0 = never auto-probe (manual reset only). Default 900.", up.connector_down_recheck_s==null?900:up.connector_down_recheck_s);
+      fPerDef=fNum("Per-model concurrency default (optional)","Default budget applied to each model's own gate. Blank = a model may use the full global budget.", up.per_model_concurrency_default);
+      body.appendChild(fMode); body.appendChild(fConc); body.appendChild(fTimeout); body.appendChild(fCool); body.appendChild(fRecheck); body.appendChild(fPerDef);
+    }, function(){
+      var obj=Object.assign({},up); // preserve base_url/api_key_env/per_model_concurrency the form doesn't edit
+      obj.api_mode=fMode._get();
+      var conc=fConc._get(); if(conc===undefined||isNaN(conc)){ formError("Max concurrency is required and must be a number."); return; } obj.max_concurrency=conc;
+      var to=fTimeout._get(); if(to===undefined||isNaN(to)){ formError("Request timeout is required and must be a number."); return; } obj.request_timeout_s=to;
+      var cool=fCool._get(); if(cool===undefined||isNaN(cool)){ formError("Connector cooldown is required and must be a number."); return; } obj.connector_cooldown_s=cool;
+      var rc=fRecheck._get(); if(rc===undefined||isNaN(rc)){ formError("Connector down recheck is required and must be a number."); return; } obj.connector_down_recheck_s=rc;
+      var pd=fPerDef._get(); if(pd===undefined) delete obj.per_model_concurrency_default; else if(isNaN(pd)){ formError("Per-model concurrency default must be a number."); return; } else obj.per_model_concurrency_default=pd;
+      saveSettings("upstream", obj, function(ok,err){ if(ok) closeForm(); else formError(err); });
+    });
+  }
+  function defaultsForm(df){ var fPanel,fJudge,fRouter,fMin,fPromote;
+    openForm("Edit fusion defaults", function(body){
+      fPanel=fNum("Panel member timeout (s)","Per-model deadline for one panel answer. Default 90.", df.panel_member_timeout_s==null?90:df.panel_member_timeout_s);
+      fJudge=fNum("Judge timeout (s)","Deadline for the judge's one scoring call. Default 60.", df.judge_timeout_s==null?60:df.judge_timeout_s);
+      fRouter=fNum("Router timeout (s)","Deadline for a smart model's routing call; on timeout it uses the default route. Default 30.", df.router_timeout_s==null?30:df.router_timeout_s);
+      fMin=fNum("Min panel success","Fewest usable panel answers required to proceed to judge/synth. Permanently-gated members (403/404/410) relax this automatically. Default 1.", df.min_panel_success==null?1:df.min_panel_success);
+      fPromote=fToggle("Promote reasoning to content","On: a reasoning-only reply (text in the reasoning field, empty content) is normalized so plain clients still see the answer. A fusion model can override this per-model.", df.promote_reasoning_to_content==null?true:!!df.promote_reasoning_to_content);
+      body.appendChild(fPanel); body.appendChild(fJudge); body.appendChild(fRouter); body.appendChild(fMin); body.appendChild(fPromote);
+    }, function(){
+      var obj={};
+      var p=fPanel._get(); if(p===undefined||isNaN(p)){ formError("Panel member timeout is required and must be a number."); return; } obj.panel_member_timeout_s=p;
+      var j=fJudge._get(); if(j===undefined||isNaN(j)){ formError("Judge timeout is required and must be a number."); return; } obj.judge_timeout_s=j;
+      var r=fRouter._get(); if(r===undefined||isNaN(r)){ formError("Router timeout is required and must be a number."); return; } obj.router_timeout_s=r;
+      var m=fMin._get(); if(m===undefined||isNaN(m)){ formError("Min panel success is required and must be a number."); return; } obj.min_panel_success=m;
+      obj.promote_reasoning_to_content=fPromote._get();
+      saveSettings("defaults", obj, function(ok,err){ if(ok) closeForm(); else formError(err); });
+    });
+  }
+  document.getElementById("restart-btn").onclick=function(){
+    confirmAction("Restart", "Restart the proxy now to apply boot-only settings (bind, port, concurrency, timeouts)? In-flight requests are dropped and the service is unavailable for a second or two while the supervisor relaunches it.", true, function(){
+      jsend("POST","admin/restart").then(function(){ toast("restarting — the panel will reconnect shortly","ok"); })
+        .catch(function(e){ toast(String(e.message||e),"err"); });
+    });
+  };
+
   // --- tabs ---------------------------------------------------------------
-  var TAB_ORDER=["monitor","providers","models"];
+  var TAB_ORDER=["monitor","providers","models","settings"];
   function switchTab(t){ activeTab=t;
     TAB_ORDER.forEach(function(x){ var on=x===t;
       document.getElementById("tab-"+x).className="tab"+(on?" on":""); });
     var btns=document.querySelectorAll(".tab-btn"); Array.prototype.forEach.call(btns,function(b){ var on=b.getAttribute("data-tab")===t; b.className="tab-btn"+(on?" on":""); b.setAttribute("aria-selected", on?"true":"false"); b.tabIndex=on?0:-1; });
-    if((t==="providers"||t==="models") && !cfg){ loadConfig().catch(function(e){ if(String(e.message)!=="auth") toast("could not load config: "+e.message,"err"); }); }
+    if((t==="providers"||t==="models"||t==="settings") && !cfg){ loadConfig().catch(function(e){ if(String(e.message)!=="auth") toast("could not load config: "+e.message,"err"); }); }
   }
   Array.prototype.forEach.call(document.querySelectorAll(".tab-btn"),function(b){
     b.onclick=function(){ switchTab(b.getAttribute("data-tab")); };

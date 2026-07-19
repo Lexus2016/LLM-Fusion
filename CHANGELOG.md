@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.32] - 2026-07-19
+
+### Added
+
+- **Fusion resilience: a subscription-gated or retired panel/synth model no longer collapses the whole fusion.** A per-model permanent access error (`403` "this model requires a subscription", `404` not-found, `410` retired) is now routed around instead of failing the request — a DIFFERENT model would answer fine, so the fusion runs with what is available.
+  - **Synth fallback.** When the synthesizer 403/404/410s, the synth retries once on a working model (the judge, or a live panel member when judge == synth) so the assembled panel answers still get synthesized, instead of surfacing the access error to the client. Complementary to the existing mid-plan completion retry (which triggers on a *successful* but incomplete answer) — different trigger, shared `fallbackSynth`.
+  - **Panel proceeds below `min_panel_success` on permanent errors.** A member gated by 403/404/410 will never answer, so the panel gate is relaxed by the number of permanently-unavailable members (`effectiveMin = max(1, min_panel_success − permanently_unavailable)`, always ≥ 1 real answer). TRANSIENT failures (429/5xx/timeout) still count against the full threshold — those are worth waiting/retrying for. The count is idempotent per member. The degradation is surfaced, never silent: a `permanently_unavailable` field on the "fusion: panel complete" log and an `X-Fusion-Degraded-Members` response header.
+- **Panel: a Settings tab for global (non-fusion-specific) config + a Restart button.**
+  - New **Settings** tab edits `server` (bind, port, client-auth env, admin-token env), `upstream` (api mode, max concurrency, request timeout, connector cooldown / down-recheck, per-model concurrency default), and `defaults` (panel/judge/router timeouts, min panel success, promote-reasoning) — through the same comment-preserving, whole-config-validated, atomic-write editor the Providers/Models tabs use. Backend: `PUT /admin/config/settings/:section` (allowlisted to server/upstream/defaults/pricing/overrides; `models`/`providers` keep their own routes), and `GET /admin/config` now surfaces those sections.
+  - **Restart button** (`POST /admin/restart`) applies boot-only settings (bind/port/concurrency/timeouts): it responds first, then the process exits NON-ZERO so the supervisor relaunches it (launchd KeepAlive `SuccessfulExit:false`, systemd/docker `on-failure`; a plain exit(0) would not relaunch). Guarded by the same loopback/auth admin guard as every other mutating route; 501 when no supervisor is wired.
+  - **Forgotten fusion sub-parameters are now editable** and no longer silently reset on save. The model form exposes `web_search` tuning (max results / timeout / max context chars / prompt-size skip) and `bineval` tuning (evaluator model / threshold / timeout), plus per-model `promote_reasoning_to_content` (inherit/on/off) and `request_overrides`. **Bug fixed:** re-saving a fusion model previously discarded `web_search`/`bineval` down to just `{enabled:true}`, wiping any configured `max_results`/`threshold`/etc.; the form now round-trips them (and preserves custom bineval `dimensions` it doesn't render).
+- **Separate admin token for the panel + admin API (`server.admin_token_env`).** When set, `/admin/*` (config edits, connector controls, restart) authenticates with THIS token instead of the client `auth_token_env` — so the widely-copied client API token (present in every LLM-client config) does not also grant reconfiguration + restart. Falls back to the client token when unset (backward compatible); loopback-only when neither resolves. The `/v1/*` surface stays on the client token.
+
 ### Fixed
 
 - **Panel accessibility + a form data-loss bug.**

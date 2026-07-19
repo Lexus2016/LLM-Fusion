@@ -139,6 +139,13 @@ export interface ConfigEditorDeps {
    * Optional: when absent, the picker falls back to free-typed model ids.
    */
   listProviderModels?: (groupId: string, opts: { signal?: AbortSignal }) => Promise<string[]>;
+  /**
+   * Trigger a process restart (for settings that only apply at boot — bind/port,
+   * concurrency, timeouts). Optional: when absent, the panel's Restart button is
+   * reported as unavailable (501) rather than silently doing nothing. The actual
+   * mechanism (graceful exit → supervisor relaunch) lives in the boot wiring.
+   */
+  requestRestart?: () => void;
 }
 
 function friendly(err: ZodError): string {
@@ -252,14 +259,33 @@ export function createConfigEditorApp(deps: ConfigEditorDeps): Hono {
       }
     }
     if (cfg.upstream.api_key_env) envKnown[cfg.upstream.api_key_env] = deps.envHas(cfg.upstream.api_key_env);
+    if (cfg.server.auth_token_env) envKnown[cfg.server.auth_token_env] = deps.envHas(cfg.server.auth_token_env);
+    if (cfg.server.admin_token_env) envKnown[cfg.server.admin_token_env] = deps.envHas(cfg.server.admin_token_env);
     return c.json({
       providers: redactExtraHeaders(cfg.providers) ?? null,
       upstreamLegacy: { base_url: cfg.upstream.base_url ?? null, api_key_env: cfg.upstream.api_key_env ?? null },
       models: cfg.models,
+      // Global, non-fusion-specific settings — editable via the Settings tab.
+      // `server.bind`/`server.port` and the upstream tunables only take effect at
+      // boot, so the panel pairs saving them with the Restart button.
+      server: cfg.server,
+      upstream: cfg.upstream,
       defaults: cfg.defaults,
+      pricing: cfg.pricing ?? {},
+      overrides: cfg.overrides,
       envKnown,
     });
   });
+
+  /**
+   * Top-level config sections editable as a whole object from the Settings tab.
+   * Every write is still validated against the FULL ConfigSchema before it lands
+   * (applyEdit), so an out-of-range value is rejected with the file untouched;
+   * this allowlist just bounds WHICH sections the generic route may replace.
+   * `models`/`providers` are intentionally excluded — they have their own
+   * per-item routes with redaction/restore logic.
+   */
+  const EDITABLE_SECTIONS = new Set(["server", "upstream", "defaults", "pricing", "overrides"]);
 
   async function applyEdit(
     mutate: (doc: Document.Parsed) => void,
@@ -335,6 +361,36 @@ export function createConfigEditorApp(deps: ConfigEditorDeps): Hono {
     if (!res.ok) return c.json({ error: res.error }, 400);
     deps.logger.info({ provider: id }, "config: provider deleted via panel");
     return c.json({ ok: true });
+  });
+
+  // Replace a whole top-level settings section (server | upstream | defaults |
+  // pricing | overrides). The body is the entire section object; whole-config
+  // re-validation (applyEdit) rejects anything the schema won't accept, so a bad
+  // port / negative timeout / malformed base_url returns 400 and never lands.
+  app.put("/admin/config/settings/:section", deps.auth, async (c) => {
+    const section = c.req.param("section");
+    if (!EDITABLE_SECTIONS.has(section)) {
+      return c.json({ error: `section '${section}' is not editable here` }, 404);
+    }
+    const body = await readBody(c);
+    if (body === undefined) return c.json({ error: "request body must be valid JSON" }, 400);
+    const res = await applyEdit((doc) => doc.setIn([section], body));
+    if (!res.ok) return c.json({ error: res.error }, 400);
+    deps.logger.info({ section }, "config: settings section saved via panel");
+    return c.json({ ok: true });
+  });
+
+  // Restart the process so boot-only settings (bind/port/concurrency/timeouts)
+  // take effect. Graceful: respond first, then the boot wiring exits non-zero so
+  // the supervisor (launchd KeepAlive / systemd / docker restart-policy) relaunches.
+  // Guarded by the same loopback/auth admin guard as every other mutating route.
+  app.post("/admin/restart", deps.auth, (c) => {
+    if (!deps.requestRestart) {
+      return c.json({ error: "restart is not available (no supervisor wired)" }, 501);
+    }
+    deps.logger.warn("config: restart requested via panel");
+    deps.requestRestart();
+    return c.json({ ok: true, restarting: true });
   });
 
   // Live model catalog for a provider group — powers the no-typo model picker.

@@ -38,6 +38,12 @@ export interface AppDeps {
   client: UpstreamClient;
   capabilities: CapabilityProvider;
   getAuthToken: () => string | undefined;
+  /**
+   * Token gating the admin surface (/admin/* + panel), when it differs from the
+   * client token. Optional: when absent the admin surface uses `getAuthToken`
+   * (the single-token, backward-compatible behavior).
+   */
+  getAdminToken?: () => string | undefined;
   logger: Logger;
   /**
    * Shared resilience bundle (limiter + circuit breaker + retry policy). Built
@@ -55,6 +61,8 @@ export interface AppDeps {
   configPath?: string;
   /** Whether an api-key env var resolves (for the config editor's UI hints). */
   envHas?: (name: string) => boolean;
+  /** Trigger a process restart for boot-only settings (see ConfigEditorDeps.requestRestart). */
+  requestRestart?: () => void;
 }
 
 interface ModelListItem {
@@ -74,6 +82,11 @@ const READY_TIMEOUT_MS = 5_000;
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
   const auth = createAuthMiddleware(deps.getAuthToken);
+  // Admin surface auth: its own token when wired, else the client token (single-
+  // token, backward compatible). `getAdminTok` also drives the admin guard's
+  // Host-pinning (loopback-only unless an admin-level token is enforced).
+  const getAdminTok = deps.getAdminToken ?? deps.getAuthToken;
+  const adminAuth = createAuthMiddleware(getAdminTok);
   // Process-lifetime resilience: the limiter is sized from the boot config's
   // max_concurrency (an upstream change needs a restart, like base_url/key).
   const resilience = deps.resilience ?? resilienceForUpstream(deps.getConfig().upstream);
@@ -97,12 +110,13 @@ export function createApp(deps: AppDeps): Hono {
       "/",
       createPanelApp({
         router: deps.router,
-        auth,
+        auth: adminAuth,
         logger: deps.logger,
         getConfig: deps.getConfig,
         configPath: deps.configPath,
         envHas: deps.envHas,
-        authEnforced: () => Boolean(deps.getAuthToken()),
+        authEnforced: () => Boolean(getAdminTok()),
+        requestRestart: deps.requestRestart,
       }),
     );
   }

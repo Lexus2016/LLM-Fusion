@@ -238,3 +238,36 @@ describe("panel routes", () => {
     expect((await app.request("/ready")).status).toBe(503); // none up
   });
 });
+
+describe("admin token separation (server.admin_token_env)", () => {
+  const cfg = parseConfig({
+    upstream: { base_url: "https://mock.test", api_key_env: "X" },
+    server: { admin_token_env: "ADMIN_TOK" },
+    models: { "fast-glm": { strategy: "single", target: "glm-5.2" } },
+  });
+  function appWith(getAuthToken: () => string | undefined, getAdminToken?: () => string | undefined) {
+    const client = new NoopClient();
+    const capabilities = new CapabilityService({ client, getOverrides: () => cfg.overrides, logger });
+    return createApp({ getConfig: () => cfg, client, capabilities, getAuthToken, getAdminToken, logger, router: makeRouter(["a"]) });
+  }
+  function getProviders(app: ReturnType<typeof appWith>, token?: string) {
+    const headers: Record<string, string> = {};
+    if (token) headers["authorization"] = "Bearer " + token;
+    return app.request("/admin/providers", { headers });
+  }
+  it("admin surface accepts the dedicated admin token but NOT the client token", async () => {
+    const app = appWith(() => "client-tok", () => "admin-tok");
+    expect((await getProviders(app, "admin-tok")).status).toBe(200);
+    expect((await getProviders(app, "client-tok")).status).toBe(401); // client token must not grant admin
+    expect((await getProviders(app, undefined)).status).toBe(401);
+  });
+  it("the /v1 surface stays on the client token (admin token is not a client token)", async () => {
+    const app = appWith(() => "client-tok", () => "admin-tok");
+    expect((await app.request("/v1/models", { headers: { authorization: "Bearer client-tok" } })).status).toBe(200);
+    expect((await app.request("/v1/models", { headers: { authorization: "Bearer admin-tok" } })).status).toBe(401);
+  });
+  it("falls back to the client token for admin when no admin token is wired", async () => {
+    const app = appWith(() => "client-tok"); // no getAdminToken
+    expect((await getProviders(app, "client-tok")).status).toBe(200);
+  });
+});

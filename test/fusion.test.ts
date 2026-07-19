@@ -434,6 +434,44 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(judgeInput).not.toContain("ans-m2");
   });
 
+  it("falls back to a working model when the synth is subscription-gated (403) instead of failing the fusion", async () => {
+    const up = makeUpstream((body) => {
+      if (body.model === "s") return jsonResponse({ error: "this model requires a subscription, upgrade for access" }, 403);
+      if (body.model === "j") return jsonResponse({ choices: [{ message: { content: JSON.stringify({ consensus: "ok" }) } }] });
+      return jsonResponse({ choices: [{ message: { content: "ans-" + body.model } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    // The gated synth 's' 403s; instead of surfacing that to the client, the synth
+    // falls back to the judge model 'j' (fusion-1's fallbackSynth) which answers 200.
+    expect(res.status).toBe(200);
+    expect(up.recorded.some((b) => b.model === "s")).toBe(true); // gated synth attempted
+    expect(up.recorded.filter((b) => b.model === "j").length).toBeGreaterThanOrEqual(2); // judge + fallback synth
+  });
+
+  it("proceeds below min_panel_success when the shortfall is permanently-gated members (403/410)", async () => {
+    const cfg = parseConfig({
+      upstream: { base_url: "https://mock.test", api_key_env: "X" },
+      defaults: { min_panel_success: 2 },
+      models: { fz: { strategy: "fusion", panel: ["m1", "m2", "m3"], judge: "j", synth: "s" } },
+    });
+    const up = makeUpstream((body) => {
+      if (body.model === "m1") return jsonResponse({ error: "requires a subscription" }, 403);
+      if (body.model === "m3") return jsonResponse({ error: "was retired" }, 410);
+      if (body.model === "j") return jsonResponse({ choices: [{ message: { content: JSON.stringify({ consensus: "ok" }) } }] });
+      if (body.model === "s") return jsonResponse({ choices: [{ message: { content: "final" } }] });
+      return jsonResponse({ choices: [{ message: { content: "ans-" + body.model } }] });
+    });
+    const capabilities = new CapabilityService({ client: up.client, getOverrides: () => cfg.overrides, logger });
+    const entry = cfg.models["fz"]!;
+    const context: StrategyContext = { request: { model: "fz", messages: [{ role: "user", content: "hi" }] }, config: cfg, client: up.client, capabilities, logger, modelConfig: entry };
+    const res = await fusionStrategy.execute(context);
+    // 2 of 3 panel members are permanently gated (403 + 410) => effectiveMin drops
+    // from 2 to max(1, 2-2)=1; the single survivor (m2) suffices. No 502.
+    expect(res.status).toBe(200);
+    // The degradation is surfaced, not silent: both gated members counted once each.
+    expect(res.headers.get("X-Fusion-Degraded-Members")).toBe("2");
+  });
+
   it("runs the adversarial member with a contrarian prompt, others without it", async () => {
     const up = makeUpstream(defaultChat(true));
     const res = await fusionStrategy.execute(ctx(up.client, req(), "fusion-adv"));

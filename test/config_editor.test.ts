@@ -238,3 +238,85 @@ models:
     expect((await dup.json()).error).toMatch(/duplicate account id/);
   });
 });
+
+describe("config editor — global settings & restart (Task 2)", () => {
+  it("GET /admin/config surfaces server / upstream / defaults / pricing / overrides", async () => {
+    const { app } = await setup();
+    const body = await (await app.request("/admin/config")).json();
+    // server + full upstream (not just base_url/api_key_env) are now editable.
+    expect(body.server.port).toBe(8080);
+    expect(body.server.bind).toBe("127.0.0.1");
+    expect(body.upstream.api_mode).toBe("openai");
+    expect(body.upstream.request_timeout_s).toBe(170); // schema default surfaced
+    expect(body.defaults.min_panel_success).toBe(1);
+    expect(body.pricing).toEqual({}); // absent pricing -> {} (never undefined for the form)
+    expect(body.overrides).toEqual({});
+  });
+
+  it("PUT /admin/config/settings/server changes the port and persists", async () => {
+    const { app, path } = await setup();
+    const res = await put(app, "/admin/config/settings/server", { bind: "127.0.0.1", port: 9090 });
+    expect(res.status).toBe(200);
+    const cfg = await loadConfigFile(path);
+    expect(cfg.server.port).toBe(9090);
+  });
+
+  it("PUT /admin/config/settings/defaults changes min_panel_success and persists", async () => {
+    const { app, path } = await setup();
+    const res = await put(app, "/admin/config/settings/defaults", { min_panel_success: 2, judge_timeout_s: 45 });
+    expect(res.status).toBe(200);
+    const cfg = await loadConfigFile(path);
+    expect(cfg.defaults.min_panel_success).toBe(2);
+    expect(cfg.defaults.judge_timeout_s).toBe(45);
+  });
+
+  it("rejects an out-of-range port and leaves the file untouched", async () => {
+    const { app, path } = await setup();
+    const res = await put(app, "/admin/config/settings/server", { bind: "127.0.0.1", port: 70000 });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBeTruthy();
+    expect(await readFile(path, "utf8")).not.toContain("70000"); // never landed
+  });
+
+  it("404s a section that is not in the settings allowlist", async () => {
+    const { app } = await setup();
+    // `models` has its own per-item route; the generic settings route must refuse it.
+    const res = await put(app, "/admin/config/settings/models", { anything: true });
+    expect(res.status).toBe(404);
+  });
+
+  it("preserves operator comments when saving a settings section", async () => {
+    const { app, path } = await setup();
+    await put(app, "/admin/config/settings/server", { bind: "127.0.0.1", port: 9091 });
+    expect(await readFile(path, "utf8")).toContain("keep this comment");
+  });
+
+  it("POST /admin/restart returns 501 when no restart handler is wired", async () => {
+    const { app } = await setup(); // setup() wires no requestRestart
+    const res = await app.request("/admin/restart", { method: "POST" });
+    expect(res.status).toBe(501);
+  });
+
+  it("POST /admin/restart invokes the handler and reports restarting when wired", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fusion-cfg-restart-"));
+    const path = join(dir, "fusion.yaml");
+    await writeFile(path, BASE, "utf8");
+    const cfg = await loadConfigFile(path);
+    let restarted = 0;
+    const app = createConfigEditorApp({
+      getConfig: () => cfg,
+      configPath: path,
+      auth: openAuth,
+      logger,
+      envHas: () => true,
+      authEnforced: () => true,
+      requestRestart: () => {
+        restarted++;
+      },
+    });
+    const res = await app.request("/admin/restart", { method: "POST" });
+    expect(res.status).toBe(200);
+    expect((await res.json()).restarting).toBe(true);
+    expect(restarted).toBe(1);
+  });
+});

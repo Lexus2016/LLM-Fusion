@@ -32,6 +32,8 @@ export interface PanelDeps {
   envHas?: (name: string) => boolean;
   /** Whether client auth is enforced — controls admin Host pinning (see makeAdminApiGuard). */
   authEnforced?: () => boolean;
+  /** Trigger a process restart for boot-only settings (see ConfigEditorDeps.requestRestart). */
+  requestRestart?: () => void;
 }
 
 const ACTIONS = new Set(["disable", "enable", "reset", "pin", "unpin"]);
@@ -56,6 +58,7 @@ export function createPanelApp(deps: PanelDeps): Hono {
         envHas: deps.envHas,
         authEnforced: deps.authEnforced,
         listProviderModels: (id, opts) => deps.router.listGroupModels(id, opts),
+        requestRestart: deps.requestRestart,
       }),
     );
   }

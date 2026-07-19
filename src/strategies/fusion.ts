@@ -64,6 +64,18 @@ const STREAM_HEADERS_BASE: Record<string, string> = {
   connection: "keep-alive",
 };
 
+/**
+ * A model-specific PERMANENT access error, as opposed to a transient availability
+ * failure (429/5xx) or a request-shape error (400/422). 403 = requires a
+ * subscription / no access, 404 = model not found, 410 = model retired. A DIFFERENT
+ * model would not hit these, so the fusion should route around the gated model
+ * (synth falls back; the panel proceeds with the survivors) instead of failing the
+ * whole request.
+ */
+function isModelAccessError(status: number): boolean {
+  return status === 403 || status === 404 || status === 410;
+}
+
 const JudgeAnalysisSchema = z
   .object({
     consensus: z.union([z.string(), z.array(z.string())]).optional(),
@@ -196,15 +208,22 @@ async function runFusion(
   }
 
   // PANEL — parallel, tools stripped.
-  const panelAnswers = await runPanel(ctx, resilience, panelMembers, timer, {
+  const { answers: panelAnswers, permanentlyUnavailable } = await runPanel(ctx, resilience, panelMembers, timer, {
     hasTools,
     native,
     webContext,
     adversarialModel: cfg.adversarial ?? null,
   });
-  if (panelAnswers.length < defaults.min_panel_success) {
+  // A member gated by subscription (403) / not-found (404) / retired (410) will
+  // never answer, so don't fail the whole fusion waiting for min_panel_success from
+  // it: relax the threshold by the number of permanently-unavailable members (but
+  // always require >= 1 real answer). Transient failures (429/5xx/timeout) still
+  // count against the full threshold — those are worth waiting/retrying for.
+  const effectiveMin = Math.max(1, defaults.min_panel_success - permanentlyUnavailable);
+  if (panelAnswers.length < effectiveMin) {
     throw new AllMembersFailedError(
-      `fusion panel produced ${panelAnswers.length} usable answer(s); need >= ${defaults.min_panel_success} for '${request.model}'`,
+      `fusion panel produced ${panelAnswers.length} usable answer(s); need >= ${effectiveMin} for '${request.model}'` +
+        (permanentlyUnavailable > 0 ? ` (${permanentlyUnavailable} member(s) permanently unavailable)` : ""),
     );
   }
   logger.info(
@@ -213,6 +232,7 @@ async function runFusion(
       panel: panelMembers,
       panel_total: panelMembers.length,
       panel_ok: panelAnswers.length,
+      permanently_unavailable: permanentlyUnavailable,
       judge: cfg.judge,
       synth: cfg.synth,
     },
@@ -223,7 +243,7 @@ async function runFusion(
   const analysis = await runJudge(ctx, resilience, cfg.judge, panelAnswers, timer, defaults);
 
   // SYNTH — final answer, streams when requested, the only stage with real tools.
-  const response = await runSynth(ctx, resilience, cfg.synth, analysis, panelAnswers, {
+  let response = await runSynth(ctx, resilience, cfg.synth, analysis, panelAnswers, {
     stream,
     hasTools,
     native,
@@ -232,6 +252,12 @@ async function runFusion(
     fallbackSynth:
         cfg.judge !== cfg.synth ? cfg.judge : (cfg.panel.find((m) => m !== cfg.synth) ?? null),
   });
+  // Some configured panel members were permanently unavailable (403/404/410) and the
+  // panel proceeded on the survivors — mark the response so the degradation is visible
+  // rather than silent. Applied before the bineval wrappers (they preserve headers).
+  if (permanentlyUnavailable > 0) {
+    response = withFusionDegradedHeader(response, permanentlyUnavailable);
+  }
 
   // BINEVAL — optional post-synth quality evaluation. Streaming bodies are consumed by
   // the client, so we can only evaluate non-streaming JSON responses.
@@ -257,6 +283,19 @@ async function runFusion(
 function withBinevalSkippedHeader(response: Response, reason: string): Response {
   const headers = new Headers(response.headers);
   headers.set("X-Fusion-Bineval-Skipped", reason);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+/**
+ * Mark the response as a DEGRADED fusion: `count` configured panel members were
+ * permanently unavailable (403/404/410), so the panel proceeded on fewer answers
+ * than min_panel_success would normally require. Surfaced so the min→1 relaxation
+ * is never silent — a client/operator can tell "high-confidence fusion" apart from
+ * "we ran with what was reachable". Preserves existing headers (incl. bineval).
+ */
+function withFusionDegradedHeader(response: Response, count: number): Response {
+  const headers = new Headers(response.headers);
+  headers.set("X-Fusion-Degraded-Members", String(count));
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
@@ -436,7 +475,7 @@ async function runPanel(
   members: string[],
   timer: TimerFactory,
   opts: { hasTools: boolean; native: boolean; webContext: string | null; adversarialModel: string | null },
-): Promise<PanelAnswer[]> {
+): Promise<{ answers: PanelAnswer[]; permanentlyUnavailable: number }> {
   const timeoutMs = ctx.config.defaults.panel_member_timeout_s * 1000;
   const minSuccess = ctx.config.defaults.min_panel_success;
 
@@ -444,14 +483,21 @@ async function runPanel(
   let completedCount = 0;
 
   if (members.length === 0) {
-    return [];
+    return { answers: [], permanentlyUnavailable: 0 };
   }
 
   const memberControllers = members.map(() => new AbortController());
   const hasStartedDelivering = members.map(() => false);
   const completed = members.map(() => false);
+  // Members that failed with a PERMANENT access error (403/404/410) — used to
+  // relax min_panel_success (a gated model will never answer, so don't fail the
+  // fusion waiting for it as long as at least one real answer came back). A
+  // per-index flag (not a bump counter) so a member can never be double-counted,
+  // even if a future retry path signals more than once.
+  const permanentlyUnavailableByIdx = members.map(() => false);
+  const countPermanentlyUnavailable = () => permanentlyUnavailableByIdx.filter(Boolean).length;
 
-  return new Promise<PanelAnswer[]>((resolve) => {
+  return new Promise<{ answers: PanelAnswer[]; permanentlyUnavailable: number }>((resolve) => {
     const adversarialIdx =
       opts.adversarialModel !== null ? members.indexOf(opts.adversarialModel) : -1;
     const checkFinished = () => {
@@ -473,14 +519,14 @@ async function runPanel(
           }
         }
         if (adversarialDone) {
-          resolve(answers);
+          resolve({ answers, permanentlyUnavailable: countPermanentlyUnavailable() });
           return true;
         }
         // Adversarial still running: keep waiting. Other stragglers already aborted.
         return false;
       }
       if (completedCount === members.length) {
-        resolve(answers);
+        resolve({ answers, permanentlyUnavailable: countPermanentlyUnavailable() });
         return true;
       }
       return false;
@@ -505,6 +551,9 @@ async function runPanel(
         combinedSignal,
         () => {
           hasStartedDelivering[i] = true;
+        },
+        () => {
+          permanentlyUnavailableByIdx[i] = true;
         },
       )
         .then((ans) => {
@@ -544,6 +593,7 @@ async function callPanelMember(
   opts: { hasTools: boolean; native: boolean; webContext: string | null; adversarialModel: string | null },
   signal?: AbortSignal,
   onFirstToken?: () => void,
+  onPermanentUnavailable?: () => void,
 ): Promise<PanelAnswer | null> {
   if (!resilience.breaker.canAttempt(member)) {
     logUpstreamFailure(ctx.logger, { stage: "panel", model: member, kind: "circuit_open", latencyMs: 0 });
@@ -670,6 +720,11 @@ async function callPanelMember(
         },
         "fusion: panel member dropped (client error response)",
       );
+      // 403 (subscription) / 404 (not found) / 410 (retired) is PERMANENT for this
+      // model — signal it so the panel can relax min_panel_success by the number of
+      // permanently-gated members (waiting for "more" answers from a model that will
+      // never answer is pointless). 400/422 are request-shape, NOT signalled.
+      if (isModelAccessError(result.status)) onPermanentUnavailable?.();
     }
     return null;
   }
@@ -1179,6 +1234,24 @@ async function runSynth(
     // 4xx non-availability: the synth answered, so it is reachable/healthy.
     // Release any half-open probe so it is not jammed until restart.
     resilience.breaker.recordSuccess(synth);
+  }
+
+  // The synth model is PERMANENTLY gated for this request (403 subscription / 404
+  // not-found / 410 retired) — passing that error to the client kills the whole
+  // fusion. Fall back to a working model (the judge, or a live panel member; see
+  // `fallbackSynth` at the call sites) so the assembled panel answers still get
+  // synthesized. One hop only: the retry carries `fallbackSynth: null`.
+  if (
+    isModelAccessError(result.status) &&
+    opts.fallbackSynth &&
+    opts.fallbackSynth !== synth &&
+    resilience.breaker.canAttempt(opts.fallbackSynth)
+  ) {
+    ctx.logger.warn(
+      { stage: "synth", model: synth, status: result.status, fallback_model: opts.fallbackSynth },
+      "fusion: synth model unavailable (access error); falling back to a working model",
+    );
+    return runSynth(ctx, resilience, opts.fallbackSynth, analysis, panelAnswers, { ...opts, fallbackSynth: null });
   }
 
   if (result.kind === "stream") {

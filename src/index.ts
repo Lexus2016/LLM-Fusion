@@ -139,6 +139,24 @@ async function main(): Promise<void> {
     );
   }
 
+  // Admin surface (/admin/* + panel) token, SEPARATE from the client token when
+  // `server.admin_token_env` is set — so the widely-copied client API token does
+  // not also grant config edits + restart. Falls back to the client token when no
+  // dedicated admin token is configured (backward compatible); when neither
+  // resolves the admin API stays loopback-only (its Host-pinning guard).
+  const getAdminToken = (): string | undefined => {
+    if (manager.config.server.admin_token_env) {
+      return resolveAuthToken(manager.config.server.admin_token_env, process.env);
+    }
+    return getAuthToken();
+  };
+  if (manager.config.server.admin_token_env) {
+    logger.info(
+      { env: manager.config.server.admin_token_env, admin_auth: getAdminToken() ? "on" : "fails-closed (env unset)" },
+      "admin surface uses a dedicated token (separate from the client API token)",
+    );
+  }
+
   // Rate-limit contention check (non-fatal): a `single`/`failover` model whose
   // upstream target is ALSO a live `fusion` panel member in the same provider
   // group shares one upstream rate-limit bucket AND per_model_concurrency gate
@@ -155,15 +173,39 @@ async function main(): Promise<void> {
     );
   }
 
+  // Restart handler for the panel's Restart button: boot-only settings (bind/port,
+  // upstream concurrency/timeouts) need a fresh process. We respond to the HTTP
+  // request first (in config_editor), then here: close the listener and exit
+  // NON-ZERO so the supervisor relaunches us — launchd's KeepAlive is configured
+  // `SuccessfulExit:false` (restart only on a non-zero exit), and systemd
+  // `on-failure` / docker `on-failure` behave the same. A plain exit(0) would NOT
+  // be relaunched by any of them. The short delay lets the 200 flush to the panel.
+  let server: ReturnType<typeof serve> | undefined;
+  const requestRestart = (): void => {
+    logger.warn("llm-fusion: restart requested — exiting for supervisor relaunch");
+    setTimeout(() => {
+      const bail = () => process.exit(1);
+      // Prefer a graceful listener close, but never hang on it.
+      try {
+        server?.close?.(bail);
+      } catch {
+        bail();
+      }
+      setTimeout(bail, 2000).unref();
+    }, 150);
+  };
+
   const app = createApp({
     getConfig: () => manager.config,
     client: liveClient,
     capabilities,
     getAuthToken,
+    getAdminToken,
     logger,
     router,
     configPath,
     envHas: (name: string) => Boolean(process.env[name]),
+    requestRestart,
   });
 
   // `server.bind` is the default; FUSION_BIND overrides it without editing the
@@ -218,7 +260,7 @@ async function main(): Promise<void> {
     "llm-fusion starting",
   );
 
-  serve({ fetch: app.fetch, hostname: bind, port }, (info) => {
+  server = serve({ fetch: app.fetch, hostname: bind, port }, (info) => {
     logger.info(`llm-fusion listening on http://${bind}:${info.port}`);
   });
 }

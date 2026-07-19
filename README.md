@@ -272,7 +272,7 @@ and a `model_map` (their model ids differ from Ollama's). See
 comparison and which providers signal an exhausted account cleanly (`402`).
 
 **The panel — monitor + no-YAML editor.** Open **http://127.0.0.1:8080/panel**.
-It has three tabs:
+It has four tabs:
 
 - **Monitor** — live health: which account is active, which are cooling or down
   and *why* (reason + last error + countdown), per-account request/failure
@@ -282,18 +282,29 @@ It has three tabs:
   through forms with plain-language hints. No hand-written YAML.
 - **Models** — create and edit `fusion` / `smart` / `failover` / `single`
   models the same way: pick a strategy and the form shows only the fields that
-  strategy needs (panel, judge, synth, router, …), each explained inline.
+  strategy needs (panel, judge, synth, router, …), each explained inline —
+  including the fusion tuning knobs (`web_search`, `bineval`,
+  `promote_reasoning_to_content`, `request_overrides`).
+- **Settings** — global, non-fusion-specific config: `server` (bind, port,
+  client-auth + admin-token env vars), `upstream` (concurrency, timeouts,
+  connector cooldowns), and fusion `defaults` (stage timeouts, min panel
+  success). Boot-only settings (bind/port/concurrency/timeouts) are marked
+  "restart to apply" and the tab has a **Restart** button that relaunches the
+  service so they take effect.
 
 The **Models** form doesn't make you type model ids from memory: it fetches the
 selected provider's **live catalog** (`GET /v1/models`, with a fallback to
 Ollama's `/api/tags`) and offers it as a pick-list, so panel / judge / synth /
 router members are chosen, not mistyped. Every edit is validated with the same
 schema the server boots from, written through a comment-preserving YAML editor,
-backed up (timestamped) and saved atomically; models hot-reload and provider
-changes rebuild the live pool — **no restart**. Destructive actions
-(disable / delete / …) ask for confirmation first. When a client auth token is
-configured, the panel's data and actions require it (the HTML shell carries no
-secrets). Backward compatible: omit `providers:` and the legacy single
+backed up (timestamped) and saved atomically; models and provider changes
+hot-reload with **no restart** (only the boot-only Settings above need the
+Restart button). Destructive actions (disable / delete / restart) ask for
+confirmation first. When a client auth token is configured, the panel's data and
+actions require it (the HTML shell carries no secrets); set
+`server.admin_token_env` to gate the panel + `/admin` API with a **separate**
+token so the client API token doesn't also grant config edits + restart.
+Backward compatible: omit `providers:` and the legacy single
 `upstream.base_url` + `api_key_env` still works unchanged.
 
 ## The honest cost note (read this)
@@ -417,6 +428,7 @@ The proxy reads plain environment variables. It also **auto-loads a local `.env`
 |----------|----------|---------|---------|
 | `OLLAMA_API_KEY` | Yes, for live use | — | The Ollama Cloud Bearer key. The name is whatever `upstream.api_key_env` points to (default `OLLAMA_API_KEY`). Held server-side only; never sent to clients or logged. |
 | `FUSION_PROXY_TOKEN` | No | unset | When `server.auth_token_env: FUSION_PROXY_TOKEN` is set in the config, clients must send `Authorization: Bearer <this value>`. If the config names the var but it is UNSET (e.g. a typo), auth fails closed — every request gets a 500 and startup logs an error — rather than silently disabling auth. |
+| `AUTH_WEB_TOKEN` | No | unset | Optional **separate** admin/panel token. When `server.admin_token_env: AUTH_WEB_TOKEN` is set, the panel + `/admin/*` API authenticate with THIS token instead of the client `FUSION_PROXY_TOKEN` — so the widely-copied client API token doesn't also grant config edits + restart. Unset → the admin surface reuses the client token (or is loopback-only when neither is set). The var name is whatever `server.admin_token_env` points to. |
 | `FUSION_CONFIG` | No | `./fusion.yaml` | Path to the config file to load. |
 | `LOG_PRETTY` | No | unset | `LOG_PRETTY=1` enables human-readable pretty logs (otherwise structured JSON). |
 | `LOG_LEVEL` | No | `info` | pino log level (`debug`, `info`, `warn`, …). |
@@ -470,6 +482,8 @@ On boot it prints a banner: the listen URL, the loaded virtual models and their 
 | `PUT · DELETE /admin/config/models/:name` | Create/edit or delete a virtual model. Validated, comment-preserving, backed-up, atomic; hot-reloaded. |
 | `PUT · DELETE /admin/config/providers/:id` | Create/edit or delete a provider group. Same write guarantees; rebuilds the live pool. |
 | `GET /admin/config/providers/:id/models` | The provider's live model catalog (for the no-typo picker). Cached briefly; degrades to an empty list so the form never blocks. |
+| `PUT /admin/config/settings/:section` | Replace a whole global section (`server` \| `upstream` \| `defaults` \| `pricing` \| `overrides`). Same write guarantees; backs the Settings tab. Boot-only fields need a restart. |
+| `POST /admin/restart` | Relaunch the process so boot-only settings take effect (responds, then exits non-zero for the supervisor to relaunch). Same loopback/auth guard as every mutating route. |
 
 ## Phase 0 — live verification
 
