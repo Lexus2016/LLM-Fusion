@@ -69,6 +69,13 @@ models:
   fast-glm:
     strategy: single
     target: glm-5.2
+    # Suppress glm's chain-of-thought on the (mechanical) simple agent route: no
+    # reasoning to leak into chat, and ~3x faster (A/B: 1692->0 reasoning chars,
+    # 6s->2s, tool-calling intact). Restores the optimization lost in the
+    # `simple: fast-glm` refactor. request_overrides is honored by the single
+    # strategy (and by the smart `simple` route that resolves to this model).
+    request_overrides:
+      reasoning_effort: "none"
 
   # single — 1:1 passthrough to one fast model.
   fast-kimi:
@@ -124,6 +131,12 @@ models:
       # the best solo — the fused model finally EXCEEDS every member.
       # kimi stays on the panel (its material remains valuable input).
     tool_mode: deliberate
+    # Suppress the SYNTH's chain-of-thought: glm-5.2 as synth only ASSEMBLES the
+    # panel+judge deliberation, so its own reasoning is redundant, leaks English CoT
+    # into the agent's chat, and adds latency. reasoning_effort:"none" stops it.
+    # Panel members keep full reasoning — that is where the deliberation value lives.
+    synth_request_overrides:
+      reasoning_effort: "none"
     fusion_planning_turn_only: false
       # full panel on EVERY fresh user instruction (a new task /
       # refinement / module — even days into one chat); synth-only

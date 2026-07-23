@@ -660,6 +660,11 @@ export const PANEL_HTML = `<!doctype html>
           dyn.beTimeout=fNum("Eval timeout (s)","Per-evaluation deadline. Blank = use the judge timeout.", be.timeout_s); bsub.appendChild(dyn.beTimeout);
           h.appendChild(bsub); bindReveal(dyn.bineval, bsub);
           addPromote(h, ex); addOverrides(h, ex);
+          // Synth-only overrides (e.g. reasoning_effort → none): kept DISTINCT from
+          // request_overrides, which the fusion strategy ignores. Without this control
+          // a panel save would silently wipe synth_request_overrides (same round-trip
+          // class as the web_search/bineval fix in v0.1.32) and re-open the synth leak.
+          dyn.synthOverrides=fKV("Synth request overrides (optional)","Extra request-body fields sent upstream to the SYNTH stage only, e.g. reasoning_effort → none (stops the synth from leaking its reasoning). Panel & judge are unaffected.", (ex&&ex.synth_request_overrides)||{}); h.appendChild(dyn.synthOverrides);
         }
         else if(strat==="smart"){
           dyn.router=fText("Router model","A fast model that classifies each request as simple vs deep (needs reliable JSON). Pick from the provider's list.", ex&&ex.router, true, up); h.appendChild(dyn.router);
@@ -698,6 +703,7 @@ export const PANEL_HTML = `<!doctype html>
           var bto=dyn.beTimeout._get(); if(bto!==undefined){ if(isNaN(bto)){ formError("BinEval timeout must be a number."); return; } be.timeout_s=bto; }
           if(existing&&existing.bineval&&existing.bineval.dimensions) be.dimensions=existing.bineval.dimensions; // preserve custom questions
           obj.bineval=be; }
+        if(dyn.synthOverrides){ var so=dyn.synthOverrides._get(); if(Object.keys(so).length) obj.synth_request_overrides=so; }
         applyCommon(obj);
       }
       else if(strat==="smart"){ var router=dyn.router._get(); if(!router){ formError("Router model is required."); return; }

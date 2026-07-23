@@ -70,6 +70,16 @@ const config = parseConfig({
       synth: "s",
       web_search: { enabled: true, max_results: 3, timeout_s: 10, max_context_chars: 4000 },
     },
+    // Per-fusion synth reasoning suppression (the shipped fusion-coder shape):
+    // synth_request_overrides must reach the SYNTH upstream body ONLY. The extra
+    // protected keys here (model/stream/tools) verify they cannot corrupt the call.
+    "fusion-synth-overrides": {
+      strategy: "fusion",
+      panel: ["m1", "m2", "m3"],
+      judge: "j",
+      synth: "s",
+      synth_request_overrides: { reasoning_effort: "none", model: "evil", stream: false, tools: "nope" },
+    },
   },
 });
 
@@ -247,6 +257,27 @@ describe("fusion strategy — panel/judge/synth", () => {
     const synthBody = up.recorded.find((b) => b.model === "s");
     expect(synthBody).toBeDefined();
     expect(synthBody?.tools).toEqual(TOOLS);
+  });
+
+  it("applies synth_request_overrides to the SYNTH body only, protecting core keys (panel/judge untouched)", async () => {
+    const up = makeUpstream(defaultChat());
+    const res = await fusionStrategy.execute(ctx(up.client, req({ tools: TOOLS }), "fusion-synth-overrides"));
+    expect(res.status).toBe(200);
+
+    const synthBody = up.recorded.find((b) => b.model === "s");
+    expect(synthBody).toBeDefined();
+    // The override reached the synth wire...
+    const synthParsed = z.object({ reasoning_effort: z.string().optional() }).passthrough().parse(synthBody);
+    expect(synthParsed.reasoning_effort).toBe("none");
+    // ...but the protected keys were NOT corrupted by the "evil" override values.
+    expect(synthBody?.model).toBe("s");
+    expect(synthBody?.tools).toEqual(TOOLS); // real tools preserved, not "nope"
+
+    // The synth-only override never leaks onto the panel or judge calls.
+    for (const b of up.recorded.filter((b) => b.model !== "s")) {
+      const p = z.object({ reasoning_effort: z.string().optional() }).passthrough().parse(b);
+      expect(p.reasoning_effort).toBeUndefined();
+    }
   });
 
   it("strips unknown judge keys so an injected key never reaches the synth context", async () => {

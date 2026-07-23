@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.33] - 2026-07-23
+
+### Fixed
+
+- **Fusion no longer leaks the synth's chain-of-thought into the visible answer on the agent route.** A "thinking" synth (e.g. `glm-5.2`) streams its reasoning in a `reasoning` field before the content; with `promote_reasoning_to_content` on (the default), the streaming promotion transform re-emits that reasoning as visible `content` until the real answer arrives — so an agent client (e.g. Hermes talking to `fusion-agents`) saw a large block of the model's English chain-of-thought in chat. The reasoning is now suppressed at the SOURCE on the agent route, which is robust to both the OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) surfaces and to however the client renders — with no reasoning generated there is nothing to promote or display (also faster and cheaper; A/B on `glm-5.2`: 1692→0 reasoning chars, ~6s→2s, tool-calling intact).
+  - Restored `request_overrides: { reasoning_effort: "none" }` on `fast-glm` (the smart `simple` route of `fusion-agents`), an optimization dropped in the `simple: fast-glm` config refactor.
+  - NOTE: the general streaming-promotion behavior (reasoning promoted before content for content-only clients on non-suppressed routes such as `fusion-researcher`) is unchanged and tracked as a follow-up — it needs the promotion transform to buffer reasoning and promote only when no content ever arrives, plus a parallel fix in the Anthropic converter.
+
+### Added
+
+- **`synth_request_overrides` on fusion models.** Extra request-body fields merged into the SYNTH upstream call ONLY — the panel and judge keep deliberating. Same protected-key rules as `request_overrides` (`model`/`messages`/`stream`/`tools`/`tool_choice` can never be overridden, and the override wins over a client-supplied value). Primary use: `{ reasoning_effort: "none" }` to stop a thinking synth from streaming its reasoning into the answer and to cut synthesis latency. Applied to `fusion-coder` in the shipped config, editable in the management panel (it round-trips on save — a panel edit no longer wipes it), and also accepted inside an inline `smart` fusion block.
+
 ## [0.1.32] - 2026-07-19
 
 ### Added

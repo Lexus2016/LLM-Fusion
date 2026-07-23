@@ -186,6 +186,7 @@ async function runFusion(
       native,
       promote,
       webContext: null,
+      synthOverrides: cfg.synth_request_overrides,
       fallbackSynth:
         cfg.judge !== cfg.synth ? cfg.judge : (cfg.panel.find((m) => m !== cfg.synth) ?? null),
     });
@@ -249,6 +250,7 @@ async function runFusion(
     native,
     promote,
     webContext,
+    synthOverrides: cfg.synth_request_overrides,
     fallbackSynth:
         cfg.judge !== cfg.synth ? cfg.judge : (cfg.panel.find((m) => m !== cfg.synth) ?? null),
   });
@@ -1185,6 +1187,9 @@ async function runSynth(
     promote: boolean;
     webContext: string | null;
     fallbackSynth?: string | null;
+    // Per-fusion-model overrides applied to the SYNTH upstream body only
+    // (e.g. { reasoning_effort: "none" } to suppress the synth's reasoning).
+    synthOverrides?: Record<string, unknown>;
   },
 ): Promise<Response> {
   if (!resilience.breaker.canAttempt(synth)) {
@@ -1822,7 +1827,13 @@ function buildSynthBody(
   synth: string,
   analysis: JudgeAnalysis | null,
   panelAnswers: PanelAnswer[],
-  opts: { stream: boolean; hasTools: boolean; native: boolean; webContext: string | null },
+  opts: {
+    stream: boolean;
+    hasTools: boolean;
+    native: boolean;
+    webContext: string | null;
+    synthOverrides?: Record<string, unknown>;
+  },
 ): Record<string, unknown> {
   // Synth keeps the real tools (if any) and the original messages; we append a
   // synthesis-context system message only on the full fusion path.
@@ -1841,6 +1852,15 @@ function buildSynthBody(
     msgs.push({ role: "system", content: context });
   }
   const body: Record<string, unknown> = { ...rest, model: synth, messages: msgs, stream: opts.stream };
+  // Per-fusion-model synth overrides (e.g. { reasoning_effort: "none" } to stop a
+  // "thinking" synth from streaming its chain-of-thought and to cut latency). Applied
+  // to the SYNTH call only; core keys are protected so an override can never corrupt
+  // the call shape, and the override WINS over any client-supplied value.
+  if (opts.synthOverrides) {
+    const overrides: Record<string, unknown> = { ...opts.synthOverrides };
+    for (const key of ["model", "messages", "stream", "tools", "tool_choice"]) delete overrides[key];
+    Object.assign(body, overrides);
+  }
   // `rest` already carries `tools`/`tool_choice` verbatim when present — synth is
   // the only stage that receives them, so no stripping here.
   return opts.native ? openAiBodyToNativeChat(body) : body;

@@ -95,6 +95,12 @@ const FusionModelSchema = z
     // Per-model override of `defaults.promote_reasoning_to_content`. When unset
     // the global default applies.
     promote_reasoning_to_content: z.boolean().optional(),
+    // Extra request-body fields merged into the SYNTH upstream call ONLY (panel &
+    // judge keep deliberating). Same protected-key rules as request_overrides.
+    // Primary use: { reasoning_effort: "none" } to stop a "thinking" synth from
+    // streaming its chain-of-thought into the visible answer (and to cut latency) —
+    // the panel + judge already did the deliberation.
+    synth_request_overrides: z.record(z.string(), z.unknown()).optional(),
     web_search: WebSearchSchema,
     // Optional adversarial panel member: the name of a model ALREADY listed in
     // `panel` that should run with a red-team/contrarian prompt (find flaws, hidden
@@ -124,6 +130,9 @@ const FusionBlockSchema = z
     panel: z.array(z.string().min(1)).min(1),
     judge: z.string().min(1),
     synth: z.string().min(1),
+    // Synth-only overrides (mirrors FusionModelSchema.synth_request_overrides) so an
+    // inline `smart` fusion block can also suppress the synth's reasoning.
+    synth_request_overrides: z.record(z.string(), z.unknown()).optional(),
     promote_reasoning_to_content: z.boolean().optional(),
     web_search: WebSearchSchema,
     bineval: BinevalSchema.optional(),
