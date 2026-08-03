@@ -286,6 +286,8 @@ export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, U
      * tool_calls guard in promoteReasoningNonStream.
      */
     toolCallsSeen: boolean;
+    /** Cut off by the token limit before producing any answer text. */
+    truncated: boolean;
     /**
      * This choice already flushed at its finish_reason. Anything arriving after
      * that is trailing chain-of-thought: it must never re-buffer under a fresh
@@ -310,6 +312,7 @@ export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, U
       s = {
         realContentSeen: false,
         toolCallsSeen: false,
+        truncated: false,
         flushed: false,
         reasoningBuffer: "",
         contentFilter: createThinkTagStreamFilter(),
@@ -351,7 +354,7 @@ export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, U
       if (s.flushed) continue;
       // The buffered reasoning is the answer only when this choice produced no
       // real content AND no tool call; otherwise it was chain-of-thought.
-      const suppress = s.realContentSeen || s.toolCallsSeen || unparsedToolCalls;
+      const suppress = s.realContentSeen || s.toolCallsSeen || s.truncated || unparsedToolCalls;
       const reasoningTail = suppress ? "" : s.reasoningBuffer + s.reasoningFilter.flush();
       s.reasoningBuffer = "";
       if (suppress) s.reasoningFilter.flush();
@@ -396,7 +399,13 @@ export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, U
     for (const choice of parsed.data.choices) {
       const index = choice.index ?? 0;
       const s = stateFor(index);
-      if (choice.finish_reason != null) finished.push(index);
+      if (choice.finish_reason != null) {
+        finished.push(index);
+        // A stream cut by the token limit before it ever produced content has
+        // no answer to show: what sits in the buffer is a truncated train of
+        // thought. Fail closed, as with an unreadable tool_calls chunk.
+        if (choice.finish_reason === "length") s.truncated = true;
+      }
       const delta = choice.delta;
       if (!delta) continue;
       if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) s.toolCallsSeen = true;
@@ -419,6 +428,17 @@ export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, U
         }
         if (cleaned !== content) {
           delta.content = cleaned;
+          modified = true;
+        }
+      }
+      if (choice.finish_reason != null) {
+        // Consume the content filter's carry HERE, appended to this chunk's own
+        // text. Leaving it to the synthetic tail would emit it BEFORE this
+        // chunk (the tail precedes the terminating chunk), so "answer <thi"
+        // would reach the client as "<thi" + "answer ".
+        const carry = s.contentFilter.flush();
+        if (carry.length > 0) {
+          delta.content = (typeof delta.content === "string" ? delta.content : "") + carry;
           modified = true;
         }
       }
@@ -470,7 +490,10 @@ export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, U
     },
     flush(controller) {
       buffer += decoder.decode();
-      if (buffer.length > 0) controller.enqueue(encoder.encode(handleLine(buffer)));
+      // A stream that ends mid-line leaves that line unterminated; the
+      // synthetic tail below would concatenate onto it and produce one
+      // unparseable `data:` line instead of two events.
+      if (buffer.length > 0) controller.enqueue(encoder.encode(`${handleLine(buffer)}\n\n`));
       // Stream ended without [DONE]: still surface a false-partial tail as its
       // own blank-line-closed SSE event.
       const tail = tailChunkLine();

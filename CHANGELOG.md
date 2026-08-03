@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.35] - 2026-08-03
+
+### Fixed
+
+Three defects in the v0.1.34 streaming converters, found by an independent state-machine audit after that release.
+
+- **A chain-of-thought cut short by the token limit is no longer promoted as the answer.** `finish_reason: "length"` before any content means the model never reached a reply; the buffer holds a truncated train of thought. It is now suppressed, matching the fail-closed rule already used for unreadable `tool_calls` chunks.
+- **The think-tag filter's carry no longer jumps ahead of the text it trails.** When one chunk carried both content and `finish_reason`, the carry went out in the synthetic tail — which precedes the terminating chunk — so `"answer <thi"` reached the client as `"<thi" + "answer "`. The carry is now appended to that chunk's own text.
+- **A stream ending mid-line no longer corrupts the tail event.** The unterminated final line was enqueued without a newline and the synthetic tail concatenated onto it, producing one unparseable `data:` line instead of two events — losing a reasoning-only answer on an abnormally terminated stream.
+
 ## [0.1.34] - 2026-08-03
 
 ### Fixed

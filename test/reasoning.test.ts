@@ -207,4 +207,32 @@ describe("makeReasoningPromotionTransform — think tags across delta boundaries
     const out = await pump([reasoningChunk("private plan"), deviant, "data: [DONE]\n"]);
     expect(out).not.toContain("private plan");
   });
+
+  it("does not promote a chain-of-thought cut short by the token limit", async () => {
+    // finish_reason "length" before any content means the model never got to
+    // an answer — the buffer holds a truncated train of thought, not a reply.
+    const finish = `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "length" }] })}\n`;
+    const out = await pump([reasoningChunk("still musing about"), finish, "data: [DONE]\n"]);
+    expect(out).not.toContain("still musing");
+  });
+
+  it("keeps a content-filter carry in order when content and finish_reason share a chunk", async () => {
+    // The carry belongs AFTER the text it trails; the synthetic tail is emitted
+    // before the terminating chunk, so it must not be used for this.
+    const both = `data: ${JSON.stringify({ choices: [{ delta: { content: "answer <thi" }, finish_reason: "stop" }] })}\n`;
+    const out = await pump([both, "data: [DONE]\n"]);
+    expect(contentsOf(out)).toBe("answer <thi");
+  });
+
+  it("frames a stream that ends mid-line so the tail stays a separate SSE event", async () => {
+    // No trailing newline on the last line: the synthetic tail used to be
+    // concatenated onto it, producing one unparseable `data:` line.
+    const out = await pump([reasoningChunk("the answer"), `data: {"choices":[{"delta":{"reasoning":" is 42."}}]}`]);
+    for (const line of out.split("\n")) {
+      const t = line.trim();
+      if (!t.startsWith("data:") || t === "data: [DONE]") continue;
+      expect(() => JSON.parse(t.slice(5).trim())).not.toThrow();
+    }
+    expect(contentsOf(out)).toBe("the answer is 42.");
+  });
 });
