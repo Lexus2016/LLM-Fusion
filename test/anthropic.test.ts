@@ -699,6 +699,183 @@ describe("anthropic route", () => {
     expect(text).toContain("event: message_stop");
   });
 
+  it("never surfaces reasoning as text on a tool turn (reasoning + tool_calls, no content)", async () => {
+    // The agent-loop step Claude Code and Hermes run constantly: the model
+    // reasons, then calls a tool, with no prose in between.
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          sseResponse([
+            { choices: [{ delta: { reasoning: "I should list the directory first." } }] },
+            {
+              choices: [
+                { delta: { tool_calls: [{ index: 0, id: "tu-1", function: { name: "bash", arguments: '{"command":"ls"}' } }] } },
+              ],
+            },
+            { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+          ]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-raw",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain("I should list the directory");
+    expect(text).not.toContain('"type":"text_delta"'); // no visible prose at all
+    expect(text).toContain('"name":"bash"');
+    expect(text).toContain('"stop_reason":"tool_use"');
+  });
+
+  it("treats reasoning_content like reasoning on the Anthropic surface", async () => {
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          sseResponse([
+            { choices: [{ delta: { reasoning_content: "answer via reasoning_content" } }] },
+            { choices: [{ delta: {}, finish_reason: "stop" }] },
+          ]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-raw",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"text":"answer via reasoning_content"');
+  });
+
+  it("a same-chunk whitespace content does not swallow a reasoning-only answer", async () => {
+    // Regression: the reasoning branch used to be chained to the content branch
+    // with `else if`, so one chunk carrying BOTH a cosmetic space and the real
+    // answer in `reasoning` dropped the answer entirely.
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          sseResponse([
+            { choices: [{ delta: { content: " ", reasoning: "the whole answer" } }] },
+            { choices: [{ delta: {}, finish_reason: "stop" }] },
+          ]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-raw",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain("the whole answer");
+  });
+
+  it("suppresses reasoning on a tool turn whose tool_calls never open a block", async () => {
+    // A deviant upstream that streams only argument fragments (no id/name)
+    // opens no tool block — the turn is still a tool turn, so its reasoning
+    // must not be flushed as visible text.
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          sseResponse([
+            { choices: [{ delta: { reasoning: "private plan" } }] },
+            { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"a":1}' } }] } }] },
+            { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+          ]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-raw",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain("private plan");
+  });
+
+  it("streamed: content that is entirely an inline <think> block keeps the reasoning answer", async () => {
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          sseResponse([
+            { choices: [{ delta: { reasoning: "ANSWER" } }] },
+            { choices: [{ delta: { content: "<think>inline cot</think>" } }] },
+            { choices: [{ delta: {}, finish_reason: "stop" }] },
+          ]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-raw",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const text = await res.text();
+    expect(text).toContain('"text":"ANSWER"');
+    expect(text).not.toContain("inline cot");
+  });
+
+  it("non-streamed: a reasoning-only reply is not an empty assistant turn (promote off)", async () => {
+    // The Anthropic wire format has no reasoning channel, so this converter must
+    // promote on its own — with the flag off nothing upstream does it.
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          jsonResponse({
+            id: "r-x",
+            choices: [{ message: { role: "assistant", content: "", reasoning: "ANSWER" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-raw",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.content).toEqual([{ type: "text", text: "ANSWER" }]);
+  });
+
+  it("non-streamed: a tool turn's reasoning is never promoted into a text block", async () => {
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          jsonResponse({
+            id: "r-y",
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: "",
+                  reasoning: "private plan",
+                  tool_calls: [{ id: "tu-9", function: { name: "bash", arguments: '{"command":"ls"}' } }],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-raw",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const body = await res.json();
+    expect(JSON.stringify(body)).not.toContain("private plan");
+    expect(body.stop_reason).toBe("tool_use");
+  });
+
   it("streamed tool_calls with finish_reason:stop still yield stop_reason:tool_use", async () => {
     // Regression: a deviant upstream that emits tool_calls but finish_reason "stop"
     // (or null) must not produce stop_reason:"end_turn" — Claude Code keys its agent

@@ -195,12 +195,20 @@ export function promoteReasoningNonStream(data: unknown): unknown {
       }
     }
     const promotedContent = typeof message.content === "string" ? message.content : "";
-    if (promotedContent.trim().length > 0) continue; // real content already present
-    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) continue; // tool path
+    const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
     const reasoning = stripThinkingTags(reasoningText(message));
-    if (reasoning.length === 0) continue;
-    message.content = reasoning;
-    mutated = true;
+    if (promotedContent.trim().length === 0 && !hasToolCalls && reasoning.length > 0) {
+      message.content = reasoning;
+      mutated = true;
+    }
+    // Strip the raw fields whatever happened above, matching the streaming
+    // transform: on the promotion path a reasoning field left on the wire is a
+    // leak into any client that renders that channel.
+    if (message.reasoning !== undefined || message.reasoning_content !== undefined) {
+      delete message.reasoning;
+      delete message.reasoning_content;
+      mutated = true;
+    }
   }
   return mutated ? parsed.data : data;
 }
@@ -218,14 +226,25 @@ const StreamDeltaSchema = z
 
 const StreamChunkSchema = z
   .object({
-    choices: z.array(z.object({ delta: StreamDeltaSchema.optional() }).passthrough()).optional(),
+    choices: z
+      .array(
+        z
+          .object({
+            index: z.number().int().optional(),
+            delta: StreamDeltaSchema.optional(),
+            finish_reason: z.union([z.string(), z.null()]).optional(),
+          })
+          .passthrough(),
+      )
+      .optional(),
   })
   .passthrough();
 
 /**
  * Cap on buffered reasoning text. A reasoning-only reply is the answer, so the
- * buffer is kept whole up to this size; past it the head is preserved (the tail
- * of a runaway chain-of-thought is worth less than an unbounded gateway buffer).
+ * buffer is kept whole up to this size; past it the TAIL is preserved — a
+ * runaway chain-of-thought puts its conclusion last, so dropping the opening
+ * costs less than dropping the answer.
  */
 export const REASONING_BUFFER_MAX = 1_048_576;
 
@@ -243,43 +262,106 @@ export const REASONING_BUFFER_MAX = 1_048_576;
  * with no separator. So the buffer is dropped the moment real content appears,
  * and flushed as content only at end of stream.
  *
- * `tool_calls` deltas and `finish_reason` are never touched. Only a partial
- * trailing line is buffered for parsing — never the whole response.
+ * `tool_calls` deltas are passed through untouched, but their PRESENCE is
+ * latched: a tool turn's reasoning is never the answer. `finish_reason` values
+ * are likewise never rewritten — they only mark where a choice's buffered
+ * answer must be flushed. Only a partial trailing line is buffered for
+ * parsing — never the whole response.
  */
 export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
-  let realContentSeen = false;
-  // Separate stream-filters per source: a tag split across fragments is only
-  // meaningful WITHIN one field, and an unterminated block in `reasoning` must
-  // not suppress later real `content`.
-  const contentFilter = createThinkTagStreamFilter();
-  const reasoningFilter = createThinkTagStreamFilter();
   // Chunk metadata captured from the stream, so synthetic tail chunks carry
   // the same id/model shape as the real ones (strict parsers reject bare deltas).
   const meta: { id?: string; created?: number; model?: string } = {};
-  // Reasoning held back until end of stream — see the transform's doc comment.
-  let reasoningBuffer = "";
 
-  const syntheticChunkLine = (content: string): string =>
+  interface ChoiceState {
+    /** A non-whitespace answer fragment has been seen on the content channel. */
+    realContentSeen: boolean;
+    /**
+     * A tool turn carries no prose: the model reasons, then calls a tool. Its
+     * reasoning must NEVER be flushed as the answer — that would inject private
+     * chain-of-thought into an agent loop's visible transcript. Mirrors the
+     * tool_calls guard in promoteReasoningNonStream.
+     */
+    toolCallsSeen: boolean;
+    /**
+     * This choice already flushed at its finish_reason. Anything arriving after
+     * that is trailing chain-of-thought: it must never re-buffer under a fresh
+     * latch and reach the client at [DONE].
+     */
+    flushed: boolean;
+    /** Reasoning held back until end of stream — see the transform's doc comment. */
+    reasoningBuffer: string;
+    // Separate stream-filters per source: a tag split across fragments is only
+    // meaningful WITHIN one field, and an unterminated block in `reasoning` must
+    // not suppress later real `content`.
+    contentFilter: ThinkTagStreamFilter;
+    reasoningFilter: ThinkTagStreamFilter;
+  }
+
+  // Per choice index, never shared: with `n>1` the choices are independent
+  // streams, and one choice's content must not suppress another's reasoning.
+  const states = new Map<number, ChoiceState>();
+  const stateFor = (index: number): ChoiceState => {
+    let s = states.get(index);
+    if (s === undefined) {
+      s = {
+        realContentSeen: false,
+        toolCallsSeen: false,
+        flushed: false,
+        reasoningBuffer: "",
+        contentFilter: createThinkTagStreamFilter(),
+        reasoningFilter: createThinkTagStreamFilter(),
+      };
+      states.set(index, s);
+    }
+    return s;
+  };
+  // A chunk this transform could not parse but that mentions tool_calls still
+  // marks the turn as a tool turn: failing open would flush chain-of-thought
+  // into an agent transcript, which is the exact leak this transform prevents.
+  let unparsedToolCalls = false;
+
+  const syntheticChunkLine = (index: number, content: string): string =>
     `data: ${JSON.stringify({
       ...(meta.id !== undefined ? { id: meta.id } : {}),
       object: "chat.completion.chunk",
       ...(meta.created !== undefined ? { created: meta.created } : {}),
       ...(meta.model !== undefined ? { model: meta.model } : {}),
-      choices: [{ index: 0, delta: { content } }],
+      choices: [{ index, delta: { content } }],
     })}`;
 
-  /** Leftover carry flushed as one synthetic content chunk (own SSE event). */
-  const tailChunkLine = (): string | null => {
-    // The buffered reasoning is the answer only when no real content ever
-    // arrived; otherwise it was private chain-of-thought and is discarded.
-    const reasoningTail = realContentSeen ? "" : reasoningBuffer + reasoningFilter.flush();
-    reasoningBuffer = "";
-    const tail = contentFilter.flush() + reasoningTail;
-    if (tail.length === 0) return null;
-    return syntheticChunkLine(tail);
+  /**
+   * Leftover carry flushed as one synthetic content chunk per choice. Pass the
+   * indices that just finished; omit to flush every choice (end of stream). A
+   * flushed choice is MARKED, not removed — deleting it would let a trailing
+   * chunk recreate it with a fresh latch and leak late chain-of-thought.
+   *
+   * Accepted tradeoff: `unparsedToolCalls` is a substring test on a chunk this
+   * transform could not read, so an unreadable chunk that merely mentions
+   * tool_calls suppresses a reasoning-only answer for the whole stream. Failing
+   * closed loses an answer; failing open leaks chain-of-thought.
+   */
+  const tailChunkLine = (only?: number[]): string | null => {
+    const lines: string[] = [];
+    for (const [index, s] of states) {
+      if (only !== undefined && !only.includes(index)) continue;
+      if (s.flushed) continue;
+      // The buffered reasoning is the answer only when this choice produced no
+      // real content AND no tool call; otherwise it was chain-of-thought.
+      const suppress = s.realContentSeen || s.toolCallsSeen || unparsedToolCalls;
+      const reasoningTail = suppress ? "" : s.reasoningBuffer + s.reasoningFilter.flush();
+      s.reasoningBuffer = "";
+      if (suppress) s.reasoningFilter.flush();
+      const tail = s.contentFilter.flush() + reasoningTail;
+      // Kept, not deleted: a deleted entry would be recreated with a fresh
+      // latch by any trailing chunk, letting late chain-of-thought through.
+      s.flushed = true;
+      if (tail.length > 0) lines.push(syntheticChunkLine(index, tail));
+    }
+    return lines.length > 0 ? lines.join("\n\n") : null;
   };
 
   const handleLine = (line: string): string => {
@@ -297,47 +379,81 @@ export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, U
     try {
       chunk = JSON.parse(payload);
     } catch {
+      if (payload.includes('"tool_calls"')) unparsedToolCalls = true;
       return line;
     }
     const parsed = StreamChunkSchema.safeParse(chunk);
-    if (!parsed.success || !parsed.data.choices) return line;
+    if (!parsed.success || !parsed.data.choices) {
+      if (payload.includes('"tool_calls"')) unparsedToolCalls = true;
+      return line;
+    }
     const raw = chunk as { id?: unknown; created?: unknown; model?: unknown };
     if (typeof raw.id === "string") meta.id = raw.id;
     if (typeof raw.created === "number") meta.created = raw.created;
     if (typeof raw.model === "string") meta.model = raw.model;
     let modified = false;
+    const finished: number[] = [];
     for (const choice of parsed.data.choices) {
+      const index = choice.index ?? 0;
+      const s = stateFor(index);
+      if (choice.finish_reason != null) finished.push(index);
       const delta = choice.delta;
       if (!delta) continue;
+      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) s.toolCallsSeen = true;
+      else if (delta.tool_calls != null && !Array.isArray(delta.tool_calls)) s.toolCallsSeen = true;
       const content = typeof delta.content === "string" ? delta.content : "";
       if (content.length > 0) {
-        realContentSeen = true; // real content — leave this and every later event alone
-        // The answer arrived, so everything buffered from `reasoning` was
-        // private chain-of-thought. Drop it (buffer AND the filter's carry)
-        // instead of prepending it to the text the client renders.
-        reasoningBuffer = "";
-        reasoningFilter.flush();
-        const cleaned = contentFilter.push(content);
+        const cleaned = s.contentFilter.push(content);
+        // Latch on the FILTERED text, and on non-whitespace only. Content that
+        // is entirely an inline <think> block is chain-of-thought, not the
+        // answer — latching on the raw delta would drop a reasoning-only
+        // reply's buffer and then strip that same content, leaving nothing.
+        // The non-whitespace rule matches promoteReasoningNonStream.
+        if (cleaned.trim().length > 0) {
+          s.realContentSeen = true;
+          // The answer arrived, so everything buffered from `reasoning` was
+          // private chain-of-thought. Drop it (buffer AND the filter's carry)
+          // instead of prepending it to the text the client renders.
+          s.reasoningBuffer = "";
+          s.reasoningFilter.flush();
+        }
         if (cleaned !== content) {
           delta.content = cleaned;
           modified = true;
         }
-      } else if (!realContentSeen) {
-        const rawReasoning = firstNonEmpty(delta.reasoning, delta.reasoning_content);
-        if (rawReasoning.length > 0) {
-          // Buffer instead of emitting, and strip the raw fields so nothing
-          // reaches the client mid-stream — including a partial <think> tag.
-          reasoningBuffer += reasoningFilter.push(rawReasoning);
-          if (reasoningBuffer.length > REASONING_BUFFER_MAX) {
-            reasoningBuffer = reasoningBuffer.slice(0, REASONING_BUFFER_MAX);
-          }
-          delete delta.reasoning;
-          delete delta.reasoning_content;
-          modified = true;
+      }
+      // Strip the raw reasoning fields from EVERY chunk on this path, buffering
+      // only while the answer channel is still silent. Promotion means the
+      // client asked for content-only normalization, so a reasoning field left
+      // on the wire is a leak into any client that renders that channel —
+      // including the late fragments that arrive after the answer starts.
+      const rawReasoning = firstNonEmpty(delta.reasoning, delta.reasoning_content);
+      if (delta.reasoning !== undefined || delta.reasoning_content !== undefined) {
+        delete delta.reasoning;
+        delete delta.reasoning_content;
+        modified = true;
+      }
+      // Buffer only while this choice is still live and its answer channel is
+      // silent. After the choice flushed at its finish_reason, trailing
+      // reasoning is stripped but never re-buffered — it is late
+      // chain-of-thought, not a second answer.
+      if (rawReasoning.length > 0 && !s.realContentSeen && !s.flushed) {
+        s.reasoningBuffer += s.reasoningFilter.push(rawReasoning);
+        if (s.reasoningBuffer.length > REASONING_BUFFER_MAX) {
+          s.reasoningBuffer = s.reasoningBuffer.slice(-REASONING_BUFFER_MAX);
         }
       }
     }
-    return modified ? `data: ${JSON.stringify(parsed.data)}` : line;
+    const out = modified ? `data: ${JSON.stringify(parsed.data)}` : line;
+    if (finished.length > 0) {
+      // Deliver a reasoning-only answer BEFORE the terminating chunk: clients
+      // that stop accumulating at finish_reason would otherwise never see it.
+      // Only the choices that actually finished are flushed — with `n>1` the
+      // others may still be streaming.
+      const tail = tailChunkLine(finished);
+      if (tail !== null) return `${tail}\n\n${out}`;
+    }
+    return out;
   };
 
   return new TransformStream<Uint8Array, Uint8Array>({
