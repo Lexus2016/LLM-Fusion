@@ -1089,8 +1089,10 @@ describe("fusion strategy — reasoning→content normalization", () => {
     // Pre-content reasoning never reaches the client in any field.
     expect(text).not.toContain("thinking-1");
     expect(text).not.toContain("thinking-2");
-    // The late reasoning passes through verbatim (proves the latch turned off).
-    expect(text).toContain("late-thought");
+    // Reasoning arriving AFTER the answer is stripped too: on the promotion
+    // path a raw reasoning field on the wire is a leak into any client that
+    // renders that channel.
+    expect(text).not.toContain("late-thought");
     expect(text).toContain("[DONE]");
   });
 

@@ -18,7 +18,7 @@ import { dispatch } from "./router";
 import { UsageAccumulator, usageHeaderValue, toOpenAiUsage } from "./usage";
 import { createAuthMiddleware } from "./auth";
 import { BadRequestError, FusionError, toAnthropicErrorResponse } from "./errors";
-import { stripThinkingTags, createThinkTagStreamFilter, REASONING_BUFFER_MAX } from "./reasoning";
+import { stripThinkingTags, createThinkTagStreamFilter, firstNonEmpty, REASONING_BUFFER_MAX } from "./reasoning";
 import { stripHopByHopHeaders } from "./headers";
 
 /**
@@ -427,6 +427,8 @@ export function openAiToAnthropicResponse(
                 .object({
                   role: z.string().optional(),
                   content: z.union([z.string(), z.null()]).optional(),
+                  reasoning: z.union([z.string(), z.null()]).optional(),
+                  reasoning_content: z.union([z.string(), z.null()]).optional(),
                   tool_calls: z
                     .array(
                       z.object({
@@ -455,7 +457,15 @@ export function openAiToAnthropicResponse(
   const finishReason = choice?.finish_reason ?? null;
 
   const contentBlocks: Array<Record<string, unknown>> = [];
-  const textContent = typeof message?.content === "string" ? stripThinkingTags(message.content) : "";
+  let textContent = typeof message?.content === "string" ? stripThinkingTags(message.content) : "";
+  if (textContent.trim().length === 0 && !(message?.tool_calls && message.tool_calls.length > 0)) {
+    // The Anthropic wire format has no reasoning channel, so a reasoning-only
+    // reply would render as an empty assistant turn. Promote it here rather
+    // than relying on the OpenAI-side transform, which is skipped entirely when
+    // `promote_reasoning_to_content` is off. The tool_calls guard mirrors
+    // promoteReasoningNonStream: a tool turn's reasoning is never the answer.
+    textContent = stripThinkingTags(firstNonEmpty(message?.reasoning, message?.reasoning_content));
+  }
   if (textContent.length > 0) {
     contentBlocks.push({ type: "text", text: textContent });
   }
@@ -570,6 +580,7 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
   // answer IS that field). See makeReasoningPromotionTransform for the /v1 twin.
   let reasoningBuffer = "";
   let realContentSeen = false;
+  let toolCallsSeen = false;
   let finishReason: string | null = null;
   let started = false;
 
@@ -645,6 +656,7 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
                     role: z.string().optional(),
                     content: z.union([z.string(), z.null()]).optional(),
                     reasoning: z.union([z.string(), z.null()]).optional(),
+                    reasoning_content: z.union([z.string(), z.null()]).optional(),
                     tool_calls: z
                       .array(
                         z
@@ -669,7 +681,13 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
       .passthrough()
       .safeParse(obj);
 
-    if (!parsed.success) return;
+    if (!parsed.success) {
+      // Fail closed, matching makeReasoningPromotionTransform: a chunk this
+      // converter cannot read but that mentions tool_calls still marks the turn
+      // as a tool turn, so buffered reasoning is never flushed as visible text.
+      if (JSON.stringify(obj).includes('"tool_calls"')) toolCallsSeen = true;
+      return;
+    }
 
     const chunk = parsed.data;
     const choice = chunk.choices?.[0];
@@ -683,25 +701,49 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
     if (!delta) return;
 
     const rawContent = typeof delta.content === "string" ? delta.content : undefined;
-    const rawReasoning = typeof delta.reasoning === "string" ? delta.reasoning : undefined;
+    // Both field spellings, matching makeReasoningPromotionTransform — an
+    // upstream that only sends `reasoning_content` must not fall through as an
+    // empty reply.
+    const rawReasoning =
+      typeof delta.reasoning === "string" && delta.reasoning.length > 0
+        ? delta.reasoning
+        : typeof delta.reasoning_content === "string"
+          ? delta.reasoning_content
+          : undefined;
     if (typeof rawContent === "string" && rawContent.length > 0) {
-      realContentSeen = true;
-      // The answer arrived: whatever `reasoning` carried was private
-      // chain-of-thought, so drop the buffer AND the filter's partial-tag carry
-      // rather than gluing either to the front of the visible text.
-      reasoningBuffer = "";
-      reasoningThinkFilter.flush();
       const text = contentThinkFilter.push(rawContent);
+      // Latch on the FILTERED text, and on non-whitespace only: content that is
+      // entirely an inline <think> block is chain-of-thought, not the answer,
+      // and latching on the raw delta would drop a reasoning-only reply's
+      // buffer and then strip that same content, leaving an empty reply.
+      if (text.trim().length > 0) {
+        realContentSeen = true;
+        // The answer arrived: whatever `reasoning` carried was private
+        // chain-of-thought, so drop the buffer AND the filter's partial-tag
+        // carry rather than gluing either to the front of the visible text.
+        reasoningBuffer = "";
+        reasoningThinkFilter.flush();
+      }
       if (text.length > 0) {
         emitText(controller, text);
       }
-    } else if (!realContentSeen && typeof rawReasoning === "string" && rawReasoning.length > 0) {
+    }
+    // Independent of the content branch, not chained to it: a single chunk can
+    // carry BOTH fields, and a whitespace-only `content` must not block the
+    // reasoning that holds the actual answer. Mirrors the OpenAI twin.
+    if (!realContentSeen && typeof rawReasoning === "string" && rawReasoning.length > 0) {
       reasoningBuffer += reasoningThinkFilter.push(rawReasoning);
       if (reasoningBuffer.length > REASONING_BUFFER_MAX) {
-        reasoningBuffer = reasoningBuffer.slice(0, REASONING_BUFFER_MAX);
+        reasoningBuffer = reasoningBuffer.slice(-REASONING_BUFFER_MAX);
       }
     }
 
+    if (delta.tool_calls != null && delta.tool_calls.length > 0) {
+      // Latch on the raw delta, not on toolBlockIndex: an upstream that sends
+      // only argument fragments (no id/name) never opens a block, yet the turn
+      // is still a tool turn whose reasoning must stay private.
+      toolCallsSeen = true;
+    }
     for (const tc of delta.tool_calls ?? []) {
       const idx = tc.index ?? 0;
       const hasStart = tc.id != null || tc.function?.name != null;
@@ -755,7 +797,10 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
           }
           handleChunk(obj, controller);
         } catch {
-          /* ignore malformed SSE lines */
+          // Malformed SSE line. Fail closed on tool turns for the same reason
+          // the OpenAI twin does: flushing chain-of-thought into an agent
+          // transcript is worse than dropping an unreadable chunk.
+          if (payload.includes('"tool_calls"')) toolCallsSeen = true;
         }
       }
     },
@@ -794,9 +839,12 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
 
       // A false-partial think tag carried to the very end of the stream is
       // literal text (e.g. "<tho…") — surface it instead of swallowing it. The
-      // buffered reasoning joins it only when no real content ever arrived,
-      // i.e. when that reasoning IS the model's answer.
-      const reasoningTail = realContentSeen ? "" : reasoningBuffer + reasoningThinkFilter.flush();
+      // buffered reasoning joins it only when the stream produced no real
+      // content AND no tool call, i.e. when that reasoning IS the answer. A
+      // tool turn carries no prose, so flushing there would inject private
+      // chain-of-thought into the agent loop's visible transcript.
+      const suppressReasoning = realContentSeen || toolCallsSeen;
+      const reasoningTail = suppressReasoning ? "" : reasoningBuffer + reasoningThinkFilter.flush();
       reasoningBuffer = "";
       const thinkTail = contentThinkFilter.flush() + reasoningTail;
       if (thinkTail.length > 0) {

@@ -109,4 +109,102 @@ describe("makeReasoningPromotionTransform — think tags across delta boundaries
     expect(texts.join("")).toBe("REAL");
     expect(out).not.toContain("planning");
   });
+
+  const reasoningChunk = (r: string) => `data: ${JSON.stringify({ choices: [{ delta: { reasoning: r } }] })}\n`;
+  const contentsOf = (out: string): string =>
+    out
+      .split("\n")
+      .filter((l) => l.startsWith("data:") && l.trim() !== "data: [DONE]")
+      .map((l) => (JSON.parse(l.slice(5).trim()) as { choices: Array<{ delta?: { content?: string } }> }).choices[0]?.delta?.content ?? "")
+      .join("");
+
+  it("never flushes reasoning as the answer on a tool turn (no content, tool_calls present)", async () => {
+    // An agent-loop step is reasoning + a tool call and NO prose. Flushing the
+    // buffer there would inject private chain-of-thought straight into the
+    // visible transcript — the non-stream path has always guarded this.
+    const toolChunk = `data: ${JSON.stringify({
+      choices: [{ delta: { tool_calls: [{ index: 0, id: "t1", function: { name: "bash", arguments: "{}" } }] } }] })}\n`;
+    const finish = `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "tool_calls" }] })}\n`;
+    const out = await pump([reasoningChunk("I should run ls to check."), toolChunk, finish, "data: [DONE]\n"]);
+    expect(out).not.toContain("I should run ls");
+    expect(contentsOf(out)).toBe("");
+    expect(out).toContain('"name":"bash"'); // the tool call itself survives untouched
+    expect(out).toContain("[DONE]");
+  });
+
+  it("delivers a reasoning-only answer BEFORE the finish_reason chunk", async () => {
+    // Clients that stop accumulating at finish_reason would never see content
+    // emitted after it.
+    const finish = `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n`;
+    const out = await pump([reasoningChunk("the whole "), reasoningChunk("answer"), finish, "data: [DONE]\n"]);
+    expect(contentsOf(out)).toBe("the whole answer");
+    const idxAnswer = out.indexOf("the whole answer");
+    const idxFinish = out.indexOf('"finish_reason":"stop"');
+    expect(idxAnswer).toBeGreaterThanOrEqual(0);
+    expect(idxFinish).toBeGreaterThan(idxAnswer);
+  });
+
+  it("strips reasoning fields from chunks arriving after the answer started", async () => {
+    const out = await pump([chunk("ANSWER"), reasoningChunk("late private thought"), "data: [DONE]\n"]);
+    expect(out).not.toContain("late private thought");
+    expect(out).not.toContain('"reasoning"');
+    expect(contentsOf(out)).toBe("ANSWER");
+  });
+
+  it("promotes reasoning_content as well as reasoning", async () => {
+    const rc = `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "via reasoning_content" } }] })}\n`;
+    const out = await pump([rc, "data: [DONE]\n"]);
+    expect(contentsOf(out)).toBe("via reasoning_content");
+  });
+
+  it("a whitespace-only content delta does not discard a reasoning-only answer", async () => {
+    const out = await pump([chunk(" "), reasoningChunk("the real answer"), "data: [DONE]\n"]);
+    expect(contentsOf(out)).toContain("the real answer");
+  });
+
+  it("content that is entirely an inline <think> block does not discard a reasoning-only answer", async () => {
+    // The latch must fire on the FILTERED text: raw content of "<think>…</think>"
+    // is chain-of-thought, and latching on it would drop the buffer and then
+    // strip that same content, leaving the client with nothing.
+    const out = await pump([reasoningChunk("ANSWER"), chunk("<think>inline cot</think>"), "data: [DONE]\n"]);
+    expect(contentsOf(out)).toBe("ANSWER");
+    expect(out).not.toContain("inline cot");
+  });
+
+  it("keeps per-choice state so one choice's content cannot swallow another's answer (n>1)", async () => {
+    const two = `data: ${JSON.stringify({
+      choices: [
+        { index: 0, delta: { content: "A0" } },
+        { index: 1, delta: { reasoning: "A1" } },
+      ],
+    })}\n`;
+    const out = await pump([two, "data: [DONE]\n"]);
+    const perChoice = out
+      .split("\n")
+      .filter((l) => l.startsWith("data:") && l.trim() !== "data: [DONE]")
+      .flatMap((l) => (JSON.parse(l.slice(5).trim()) as { choices: Array<{ index?: number; delta?: { content?: string } }> }).choices)
+      .reduce<Record<number, string>>((acc, c) => {
+        acc[c.index ?? 0] = (acc[c.index ?? 0] ?? "") + (c.delta?.content ?? "");
+        return acc;
+      }, {});
+    expect(perChoice[0]).toBe("A0");
+    expect(perChoice[1]).toBe("A1"); // was lost when the state was transform-wide
+  });
+
+  it("does not re-buffer reasoning that trails a choice's finish_reason", async () => {
+    // Regression from the per-choice refactor: deleting the state on flush let
+    // a trailing reasoning fragment recreate it with a fresh latch and reach
+    // the client as content at [DONE].
+    const finish = `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n`;
+    const out = await pump([chunk("ANSWER"), finish, reasoningChunk("trailing cot"), "data: [DONE]\n"]);
+    expect(out).not.toContain("trailing cot");
+    expect(contentsOf(out)).toBe("ANSWER");
+  });
+
+  it("treats a chunk it cannot parse but that mentions tool_calls as a tool turn", async () => {
+    // Failing open here would flush chain-of-thought into an agent transcript.
+    const deviant = `data: {"choices":[{"delta":{"tool_calls":"not-an-array"}}],"weird":\n`;
+    const out = await pump([reasoningChunk("private plan"), deviant, "data: [DONE]\n"]);
+    expect(out).not.toContain("private plan");
+  });
 });
