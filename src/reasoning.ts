@@ -223,11 +223,28 @@ const StreamChunkSchema = z
   .passthrough();
 
 /**
- * SSE transform that re-emits `delta.reasoning` / `delta.reasoning_content`
- * fragments as `delta.content`, but ONLY until a real `delta.content` fragment
- * appears; once real content arrives, every later event passes through verbatim
- * (no duplication). `tool_calls` deltas and `finish_reason` are never touched.
- * Only a partial trailing line is buffered — never the whole response.
+ * Cap on buffered reasoning text. A reasoning-only reply is the answer, so the
+ * buffer is kept whole up to this size; past it the head is preserved (the tail
+ * of a runaway chain-of-thought is worth less than an unbounded gateway buffer).
+ */
+export const REASONING_BUFFER_MAX = 1_048_576;
+
+/**
+ * SSE transform that surfaces `delta.reasoning` / `delta.reasoning_content` as
+ * `delta.content` ONLY when the stream never produces a real `delta.content` —
+ * the reasoning-only case this normalization exists for.
+ *
+ * Reasoning fragments are BUFFERED, never streamed inline. Which kind of model
+ * is on the other end is not knowable while the reasoning arrives: a
+ * reasoning-only model puts its ANSWER in that field, while a thinking model
+ * puts private chain-of-thought there and the answer in later `content` deltas.
+ * Emitting eagerly got the second case wrong — the chain-of-thought was streamed
+ * into the same text the client renders, glued to the front of the real answer
+ * with no separator. So the buffer is dropped the moment real content appears,
+ * and flushed as content only at end of stream.
+ *
+ * `tool_calls` deltas and `finish_reason` are never touched. Only a partial
+ * trailing line is buffered for parsing — never the whole response.
  */
 export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
@@ -242,7 +259,8 @@ export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, U
   // Chunk metadata captured from the stream, so synthetic tail chunks carry
   // the same id/model shape as the real ones (strict parsers reject bare deltas).
   const meta: { id?: string; created?: number; model?: string } = {};
-  let reasoningTailMerged = false;
+  // Reasoning held back until end of stream — see the transform's doc comment.
+  let reasoningBuffer = "";
 
   const syntheticChunkLine = (content: string): string =>
     `data: ${JSON.stringify({
@@ -255,7 +273,11 @@ export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, U
 
   /** Leftover carry flushed as one synthetic content chunk (own SSE event). */
   const tailChunkLine = (): string | null => {
-    const tail = contentFilter.flush() + reasoningFilter.flush();
+    // The buffered reasoning is the answer only when no real content ever
+    // arrived; otherwise it was private chain-of-thought and is discarded.
+    const reasoningTail = realContentSeen ? "" : reasoningBuffer + reasoningFilter.flush();
+    reasoningBuffer = "";
+    const tail = contentFilter.flush() + reasoningTail;
     if (tail.length === 0) return null;
     return syntheticChunkLine(tail);
   };
@@ -290,14 +312,12 @@ export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, U
       const content = typeof delta.content === "string" ? delta.content : "";
       if (content.length > 0) {
         realContentSeen = true; // real content — leave this and every later event alone
-        let cleaned = contentFilter.push(content);
-        // The reasoning phase is over: a false-partial tag carried at its end
-        // is literal narration text and belongs BEFORE the first content, not
-        // reordered to the end of the stream.
-        if (!reasoningTailMerged) {
-          reasoningTailMerged = true;
-          cleaned = reasoningFilter.flush() + cleaned;
-        }
+        // The answer arrived, so everything buffered from `reasoning` was
+        // private chain-of-thought. Drop it (buffer AND the filter's carry)
+        // instead of prepending it to the text the client renders.
+        reasoningBuffer = "";
+        reasoningFilter.flush();
+        const cleaned = contentFilter.push(content);
         if (cleaned !== content) {
           delta.content = cleaned;
           modified = true;
@@ -305,9 +325,12 @@ export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, U
       } else if (!realContentSeen) {
         const rawReasoning = firstNonEmpty(delta.reasoning, delta.reasoning_content);
         if (rawReasoning.length > 0) {
-          // Promote even when the filtered text is empty (tag-only fragment):
-          // leaving the raw reasoning field in place would leak the partial tag.
-          delta.content = reasoningFilter.push(rawReasoning);
+          // Buffer instead of emitting, and strip the raw fields so nothing
+          // reaches the client mid-stream — including a partial <think> tag.
+          reasoningBuffer += reasoningFilter.push(rawReasoning);
+          if (reasoningBuffer.length > REASONING_BUFFER_MAX) {
+            reasoningBuffer = reasoningBuffer.slice(0, REASONING_BUFFER_MAX);
+          }
           delete delta.reasoning;
           delete delta.reasoning_content;
           modified = true;

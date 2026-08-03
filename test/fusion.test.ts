@@ -1065,7 +1065,7 @@ describe("fusion strategy — reasoning→content normalization", () => {
     expect(payload.choices[0].message.tool_calls).toHaveLength(1);
   });
 
-  it("synth stream: re-emits reasoning deltas as content until real content appears (flag on)", async () => {
+  it("synth stream: buffers reasoning and drops it once real content appears (flag on)", async () => {
     const up = makeUpstream((body) => {
       if (body.model === "j") return validJudge;
       if (body.model === "s") {
@@ -1083,9 +1083,12 @@ describe("fusion strategy — reasoning→content normalization", () => {
     const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true })));
     expect(res.headers.get("content-type")).toContain("text/event-stream");
     const text = await res.text();
-    // Reasoning before real content surfaces as content; once real content lands,
-    // promotion stops — "late-thought" is NOT promoted into content.
-    expect(streamedContents(text)).toEqual(["thinking-1 ", "thinking-2 ", "REAL-ANSWER"]);
+    // The synth's chain-of-thought is private: buffered while it streams, then
+    // discarded the moment the real answer lands. Only the answer is visible.
+    expect(streamedContents(text)).toEqual(["REAL-ANSWER"]);
+    // Pre-content reasoning never reaches the client in any field.
+    expect(text).not.toContain("thinking-1");
+    expect(text).not.toContain("thinking-2");
     // The late reasoning passes through verbatim (proves the latch turned off).
     expect(text).toContain("late-thought");
     expect(text).toContain("[DONE]");

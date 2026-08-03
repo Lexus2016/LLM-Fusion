@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.34] - 2026-08-03
+
+### Fixed
+
+- **Chain-of-thought no longer leaks into the visible answer on ANY route.** This is the general fix tracked as a follow-up in 0.1.33 (which only suppressed reasoning at the source, on the agent route). Both streaming converters emitted a model's `reasoning` eagerly, before it was knowable whether a real answer would follow, and into the SAME text block as that answer — so a thinking model's English chain-of-thought was rendered glued to the front of the reply with no separator (`…before trusting it.Шефе, перевірила…`) in clients like Hermes and Claude Code.
+  - `makeReasoningPromotionTransform` (`/v1/chat/completions`) now BUFFERS reasoning instead of re-emitting it as `content`, and drops the buffer — and the think-tag filter's carry — the moment a real `content` delta arrives. The buffer is flushed as content only at end of stream, i.e. only for the reasoning-only replies this normalization exists for. Raw `reasoning`/`reasoning_content` fields are stripped from passed-through chunks so nothing reaches the client mid-stream.
+  - The Anthropic converter (`/v1/messages`) had the same bug and **no gate at all**: `content ?? reasoning` was emitted as `text_delta` regardless of `promote_reasoning_to_content`, so disabling the flag did not stop the leak. It now applies the same buffer-and-drop rule. This is the surface Hermes and Claude Code use.
+  - Buffered reasoning is capped at 1 MiB (`REASONING_BUFFER_MAX`, head preserved) so a runaway chain-of-thought cannot grow an unbounded per-stream buffer on the gateway.
+  - Behavior change for reasoning-only models: their answer now arrives as one chunk at end of stream rather than incrementally, since the two cases are only distinguishable once the stream ends. Non-streamed responses were already correct and are untouched.
+
 ## [0.1.33] - 2026-07-23
 
 ### Fixed

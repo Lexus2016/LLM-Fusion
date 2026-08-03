@@ -275,11 +275,12 @@ describe("server", () => {
     });
     expect(res.headers.get("content-type")).toContain("text/event-stream");
     const text = await res.text();
-    // reasoning was promoted to content (both transforms ran)
-    expect(text).toContain('"content":"alpha "');
-    expect(text).toContain('"content":"beta"');
+    // Reasoning-only stream (no content delta ever): the buffered reasoning IS
+    // the answer, so it is flushed as content — as a single chunk, since the
+    // transform can only tell it apart from private chain-of-thought at the end.
+    expect(text).toContain('"content":"alpha beta"');
     // ordering invariant: all content -> the single usage chunk -> [DONE]
-    const idxContent = text.lastIndexOf('"content":"beta"');
+    const idxContent = text.lastIndexOf('"content":"alpha beta"');
     const idxUsage = text.indexOf("fusion-usage");
     const idxDone = text.indexOf("[DONE]");
     expect(idxUsage).toBeGreaterThan(idxContent);

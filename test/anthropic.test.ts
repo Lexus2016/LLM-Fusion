@@ -19,6 +19,9 @@ const config = parseConfig({
   server: { bind: "127.0.0.1", port: 8080 },
   models: {
     "anthropic-fast": { strategy: "single", target: "glm-5.2" },
+    // promote off => `reasoning` reaches the Anthropic converter natively, which
+    // is the path the converter's own leak guard has to cover.
+    "anthropic-raw": { strategy: "single", target: "glm-5.2", promote_reasoning_to_content: false },
     "anthropic-fusion": { strategy: "fusion", panel: ["a", "b"], judge: "a", synth: "b" },
   },
 });
@@ -615,6 +618,85 @@ describe("anthropic route", () => {
     expect(text).toContain('event: message_delta');
     expect(text).toContain('event: message_stop');
     expect(res.headers.get("x-fusion-usage")).toContain('"calls":1');
+  });
+
+  it("never streams upstream `reasoning` as text when a real answer follows (promote on)", async () => {
+    // Regression: the converter used `content ?? reasoning` and emitted both as
+    // text_delta into the SAME block, so a thinking model's English
+    // chain-of-thought was rendered glued to the front of the answer
+    // ("…before trusting it.Шефе, перевірила…") in clients like Hermes.
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          sseResponse([
+            { choices: [{ delta: { reasoning: "Let me think. The user wants X." } }] },
+            { choices: [{ delta: { reasoning: " Actually wait — reconsider." } }] },
+            { choices: [{ delta: { content: "Final answer." } }] },
+            { choices: [{ delta: {}, finish_reason: "stop" }] },
+          ]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-fast",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"text":"Final answer."');
+    expect(text).not.toContain("Let me think");
+    expect(text).not.toContain("Actually wait");
+  });
+
+  it("never streams upstream `reasoning` as text when a real answer follows (promote off)", async () => {
+    // With promotion disabled the reasoning field is untouched upstream, so the
+    // Anthropic converter is the only thing standing between it and the client.
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          sseResponse([
+            { choices: [{ delta: { reasoning: "private chain-of-thought" } }] },
+            { choices: [{ delta: { content: "Final answer." } }] },
+            { choices: [{ delta: {}, finish_reason: "stop" }] },
+          ]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-raw",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"text":"Final answer."');
+    expect(text).not.toContain("private chain-of-thought");
+  });
+
+  it("surfaces reasoning as the answer when the stream produces no content at all", async () => {
+    // A reasoning-only model puts its ANSWER in that field — suppressing it
+    // outright would render an empty reply.
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          sseResponse([
+            { choices: [{ delta: { reasoning: "the whole " } }] },
+            { choices: [{ delta: { reasoning: "answer" } }] },
+            { choices: [{ delta: {}, finish_reason: "stop" }] },
+          ]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-raw",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"text":"the whole answer"');
+    expect(text).toContain("event: message_stop");
   });
 
   it("streamed tool_calls with finish_reason:stop still yield stop_reason:tool_use", async () => {

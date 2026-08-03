@@ -96,13 +96,17 @@ describe("makeReasoningPromotionTransform — think tags across delta boundaries
     expect(tail?.model).toBe("m-1"); // …and the synthetic chunk carries the stream's metadata
   });
 
-  it("merges a reasoning-phase false partial before the first content, not after it", async () => {
+  it("drops a reasoning-phase false partial once real content arrives", async () => {
     const reasoningChunk = (r: string) => `data: ${JSON.stringify({ choices: [{ delta: { reasoning: r } }] })}\n`;
     const out = await pump([reasoningChunk("planning <thi"), chunk("REAL"), "data: [DONE]\n"]);
     const texts = out
       .split("\n")
       .filter((l) => l.startsWith("data:") && l.trim() !== "data: [DONE]")
       .map((l) => (JSON.parse(l.slice(5).trim()) as { choices: Array<{ delta: { content?: string } }> }).choices[0]?.delta.content ?? "");
-    expect(texts.join("")).toBe("planning <thiREAL"); // literal narration stays in order
+    // Real content proves the reasoning was private chain-of-thought — its text
+    // AND its carried false-partial tag go with it, rather than being prepended
+    // to the answer the client renders.
+    expect(texts.join("")).toBe("REAL");
+    expect(out).not.toContain("planning");
   });
 });

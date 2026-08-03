@@ -18,7 +18,7 @@ import { dispatch } from "./router";
 import { UsageAccumulator, usageHeaderValue, toOpenAiUsage } from "./usage";
 import { createAuthMiddleware } from "./auth";
 import { BadRequestError, FusionError, toAnthropicErrorResponse } from "./errors";
-import { stripThinkingTags, createThinkTagStreamFilter } from "./reasoning";
+import { stripThinkingTags, createThinkTagStreamFilter, REASONING_BUFFER_MAX } from "./reasoning";
 import { stripHopByHopHeaders } from "./headers";
 
 /**
@@ -562,7 +562,14 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
   // per source so an unterminated block in `reasoning` cannot suppress `content`.
   const contentThinkFilter = createThinkTagStreamFilter();
   const reasoningThinkFilter = createThinkTagStreamFilter();
-  let reasoningTailMerged = false;
+  // `reasoning` is buffered, never streamed as text: the Anthropic surface has
+  // no separate channel for it here, so emitting it as `text_delta` put private
+  // chain-of-thought into the same block as the answer — with no separator, the
+  // client rendered "…before trusting it.Шефе, перевірила…". It is surfaced only
+  // when the stream never produced real content (a reasoning-only model, whose
+  // answer IS that field). See makeReasoningPromotionTransform for the /v1 twin.
+  let reasoningBuffer = "";
+  let realContentSeen = false;
   let finishReason: string | null = null;
   let started = false;
 
@@ -590,6 +597,18 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
     });
     activeBlock = { index, kind: "text" };
     return index;
+  };
+
+  /** Append text to the active text block, opening one if needed. */
+  const emitText = (controller: TransformStreamDefaultController<Uint8Array>, text: string): void => {
+    if (!activeBlock || activeBlock.kind !== "text") {
+      startTextBlock(controller);
+    }
+    emit(controller, "content_block_delta", {
+      type: "content_block_delta",
+      index: activeBlock!.index,
+      delta: { type: "text_delta", text },
+    });
   };
 
   const startToolBlock = (
@@ -665,30 +684,21 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
 
     const rawContent = typeof delta.content === "string" ? delta.content : undefined;
     const rawReasoning = typeof delta.reasoning === "string" ? delta.reasoning : undefined;
-    const rawText = rawContent ?? rawReasoning;
-    if (typeof rawText === "string" && rawText.length > 0) {
-      let text: string;
-      if (rawContent !== undefined) {
-        text = contentThinkFilter.push(rawText);
-        // The reasoning phase is over: a false-partial tag carried at its end
-        // is literal narration and belongs before the first content fragment,
-        // not reordered to the end of the stream.
-        if (!reasoningTailMerged) {
-          reasoningTailMerged = true;
-          text = reasoningThinkFilter.flush() + text;
-        }
-      } else {
-        text = reasoningThinkFilter.push(rawText);
-      }
+    if (typeof rawContent === "string" && rawContent.length > 0) {
+      realContentSeen = true;
+      // The answer arrived: whatever `reasoning` carried was private
+      // chain-of-thought, so drop the buffer AND the filter's partial-tag carry
+      // rather than gluing either to the front of the visible text.
+      reasoningBuffer = "";
+      reasoningThinkFilter.flush();
+      const text = contentThinkFilter.push(rawContent);
       if (text.length > 0) {
-        if (!activeBlock || activeBlock.kind !== "text") {
-          startTextBlock(controller);
-        }
-        emit(controller, "content_block_delta", {
-          type: "content_block_delta",
-          index: activeBlock!.index,
-          delta: { type: "text_delta", text },
-        });
+        emitText(controller, text);
+      }
+    } else if (!realContentSeen && typeof rawReasoning === "string" && rawReasoning.length > 0) {
+      reasoningBuffer += reasoningThinkFilter.push(rawReasoning);
+      if (reasoningBuffer.length > REASONING_BUFFER_MAX) {
+        reasoningBuffer = reasoningBuffer.slice(0, REASONING_BUFFER_MAX);
       }
     }
 
@@ -783,17 +793,14 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
       }
 
       // A false-partial think tag carried to the very end of the stream is
-      // literal text (e.g. "<tho…") — surface it instead of swallowing it.
-      const thinkTail = contentThinkFilter.flush() + reasoningThinkFilter.flush();
+      // literal text (e.g. "<tho…") — surface it instead of swallowing it. The
+      // buffered reasoning joins it only when no real content ever arrived,
+      // i.e. when that reasoning IS the model's answer.
+      const reasoningTail = realContentSeen ? "" : reasoningBuffer + reasoningThinkFilter.flush();
+      reasoningBuffer = "";
+      const thinkTail = contentThinkFilter.flush() + reasoningTail;
       if (thinkTail.length > 0) {
-        if (!activeBlock || activeBlock.kind !== "text") {
-          startTextBlock(controller);
-        }
-        emit(controller, "content_block_delta", {
-          type: "content_block_delta",
-          index: activeBlock!.index,
-          delta: { type: "text_delta", text: thinkTail },
-        });
+        emitText(controller, thinkTail);
       }
       stopActiveBlock(controller);
       const finalUsage = await opts.usage.finalize(opts.pricing);

@@ -241,14 +241,15 @@ describe("usage accounting", () => {
     expect(log?.strategy).toBe("fusion");
   });
 
-  it("fusion stream: emits a final aggregate usage chunk; reasoning->content transform still works", async () => {
+  it("fusion stream: emits a final aggregate usage chunk; reasoning never leaks into content", async () => {
     const { app, recorded } = makeApp(buildConfig());
     const res = await post(app, { model: "fusion-m", stream: true, messages: [{ role: "user", content: "hard" }] });
     expect(res.headers.get("content-type")).toContain("text/event-stream");
     const text = await res.text();
     const chunks = parseSse(text);
 
-    // Reasoning promoted into content, then real content (no regression).
+    // Real content arrives, so the preceding reasoning was private
+    // chain-of-thought and is dropped — only the answer reaches the client.
     const ContentChunk = z.object({ choices: z.array(z.object({ delta: z.object({ content: z.string().optional() }).passthrough() }).passthrough()) });
     const contents: string[] = [];
     for (const c of chunks) {
@@ -257,7 +258,7 @@ describe("usage accounting", () => {
       const d = parsed.data.choices[0]?.delta.content;
       if (typeof d === "string") contents.push(d);
     }
-    expect(contents).toContain("think "); // reasoning was promoted
+    expect(contents).not.toContain("think "); // reasoning was NOT promoted
     expect(contents).toContain("answer");
 
     // Exactly one usage chunk, carrying the full aggregate.
