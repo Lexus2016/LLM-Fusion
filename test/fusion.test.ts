@@ -212,6 +212,58 @@ function streamedContents(text: string): string[] {
   return out;
 }
 
+/** Assembled `function.arguments` per tool-call index, from a client SSE transcript. */
+function assembledToolArgs(text: string): string[] {
+  const ChunkSchema = z
+    .object({
+      choices: z
+        .array(
+          z
+            .object({
+              delta: z
+                .object({
+                  tool_calls: z
+                    .array(
+                      z
+                        .object({
+                          index: z.number().optional(),
+                          function: z.object({ arguments: z.string().optional() }).passthrough().optional(),
+                        })
+                        .passthrough(),
+                    )
+                    .optional(),
+                })
+                .passthrough()
+                .optional(),
+            })
+            .passthrough(),
+        )
+        .optional(),
+    })
+    .passthrough();
+  const acc = new Map<number, string>();
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice("data:".length).trim();
+    if (payload.length === 0 || payload === "[DONE]") continue;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    const parsed = ChunkSchema.safeParse(raw);
+    if (!parsed.success) continue;
+    for (const choice of parsed.data.choices ?? []) {
+      for (const tc of choice.delta?.tool_calls ?? []) {
+        const idx = tc.index ?? 0;
+        acc.set(idx, (acc.get(idx) ?? "") + (tc.function?.arguments ?? ""));
+      }
+    }
+  }
+  return [...acc.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+}
+
 const req = (over: Partial<ChatCompletionRequest> = {}): ChatCompletionRequest => ({
   model: "fusion-1",
   messages: [{ role: "user", content: "hello" }],
@@ -1236,6 +1288,98 @@ describe("fusion strategy — synth completeness guard", () => {
       return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
     });
     const res = await fusionStrategy.execute(ctx(up.client, req({ tools: TOOLS })));
+    await res.text();
+    expect(synthCalls).toBe(1);
+  });
+
+  // The streaming guard used to rebuild the terminal chunk with a placeholder
+  // `tool_calls: [{}]`, so the assembled arguments were never inspected and a
+  // truncated call reached the client unchecked — on the path clients actually
+  // use. These three pin the assembled-argument behaviour.
+  it("synth stream: recovers a tool call whose ASSEMBLED arguments are truncated (length-cut)", async () => {
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        const nudged = systemContents(body).some((c) => c.includes("stopped while still planning"));
+        if (nudged) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  content: "",
+                  tool_calls: [
+                    { id: "c9", type: "function", function: { name: "write_file", arguments: '{"path":"a.py"}' } },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+        // Arguments split across chunks and cut mid-JSON, then finish_reason:"length".
+        return sseResponse([
+          {
+            choices: [
+              { delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "write_file", arguments: '{"pa' } }] } },
+            ],
+          },
+          { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: 'th":"a.py","content":"x' } }] } }] },
+          { choices: [{ delta: {}, finish_reason: "length" }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    expect(synthCalls).toBe(2); // the truncated call triggered recovery
+    expect(assembledToolArgs(text)).toEqual(['{"path":"a.py"}']); // client gets parsable arguments
+  });
+
+  it("synth stream: leaves a tool call alone when the assembled arguments parse", async () => {
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        return sseResponse([
+          {
+            choices: [
+              { delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "write_file", arguments: '{"pa' } }] } },
+            ],
+          },
+          { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: 'th":"a.py"}' } }] } }] },
+          { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    expect(synthCalls).toBe(1); // no recovery for a complete call
+    expect(text).toContain("write_file");
+    expect(text).toContain("finish_reason");
+  });
+
+  it("synth stream: does NOT treat an empty-argument (no-arg) tool call as truncated", async () => {
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        return sseResponse([
+          {
+            choices: [
+              { delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "list_files", arguments: "" } }] } },
+            ],
+          },
+          { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
     await res.text();
     expect(synthCalls).toBe(1);
   });

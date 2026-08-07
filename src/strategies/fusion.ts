@@ -1388,6 +1388,16 @@ function detectIncompleteSynth(data: unknown): "empty" | "planning_tail" | null 
   return null;
 }
 
+/** True when `text` parses as JSON — used to judge assembled tool-call arguments. */
+function isParsableJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * A completion whose finish_reason is "length" AND whose tool_calls carry
  * unparseable (truncated) arguments. Prose cut by the cap is still worth
@@ -1448,7 +1458,7 @@ async function retrySynthForCompletion(
   synth: string,
   originalBody: Record<string, unknown>,
   opts: { native: boolean; fallbackSynth?: string | null },
-  reason: "empty" | "planning_tail",
+  reason: SynthRetryReason,
 ): Promise<unknown | null> {
   const nudgedBody = appendSynthCompletionNudge(originalBody);
 
@@ -1535,6 +1545,25 @@ const RecoveredToolCallSchema = z
   })
   .passthrough();
 
+/**
+ * One `delta.tool_calls[]` fragment of a streamed tool call. Arguments arrive
+ * split across chunks (standard OpenAI streaming), keyed by `index`, so the
+ * terminal check can only judge the ASSEMBLED string.
+ */
+const StreamToolCallDeltaSchema = z
+  .object({
+    index: z.number().optional(),
+    id: z.string().optional(),
+    function: z
+      .object({ name: z.string().optional(), arguments: z.string().optional() })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough();
+
+/** Why a synth answer needs the stricter non-streamed retry. */
+type SynthRetryReason = "empty" | "planning_tail" | "length_cut_tool_call";
+
 /** Build the single replacement SSE chunk line carrying a recovered synth answer. */
 /**
  * Normalize one recovered tool call into the OpenAI streaming delta shape
@@ -1600,6 +1629,11 @@ function makeSynthStreamCompletenessGuard(
   let content = "";
   let reasoning = "";
   let toolCallsSeen = false;
+  // Streamed tool-call arguments arrive as fragments across chunks, keyed by
+  // `index`. Accumulate them so the terminal check judges the ASSEMBLED
+  // arguments — a stub placeholder here made `lengthCutMidToolCall` unreachable
+  // on the streaming path, which is the path clients actually use.
+  const toolCallAcc = new Map<number, { id?: string; name?: string; args: string }>();
   let terminalFinishReason: string | null = null;
   let terminalLine: string | null = null;
   const meta = { id: `fusion-synth-${synth}`, created: Math.floor(Date.now() / 1000), model: synth };
@@ -1633,15 +1667,52 @@ function makeSynthStreamCompletenessGuard(
     if (parsed.data.model) meta.model = parsed.data.model;
     const choice = parsed.data.choices?.[0];
     const delta = choice?.delta;
+    let withheldToolFragment = false;
     if (delta) {
       if (typeof delta.content === "string") content += delta.content;
       if (typeof delta.reasoning === "string") reasoning += delta.reasoning;
       if (typeof delta.reasoning_content === "string") reasoning += delta.reasoning_content;
-      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) toolCallsSeen = true;
+      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+        toolCallsSeen = true;
+        // WITHHELD from the live stream: a truncated call can only be replaced
+        // if its fragments never reached the client. Forwarding them live and
+        // then appending a recovered call leaves the client with both, glued
+        // into one unparsable argument string. Text/reasoning still stream
+        // live, so first-token latency for prose is untouched.
+        withheldToolFragment = true;
+        for (const raw of delta.tool_calls) {
+          const frag = StreamToolCallDeltaSchema.safeParse(raw);
+          if (!frag.success) continue;
+          const idx = frag.data.index ?? 0;
+          const acc = toolCallAcc.get(idx) ?? { args: "" };
+          if (frag.data.id != null) acc.id = frag.data.id;
+          if (frag.data.function?.name != null) acc.name = frag.data.function.name;
+          if (typeof frag.data.function?.arguments === "string") acc.args += frag.data.function.arguments;
+          toolCallAcc.set(idx, acc);
+        }
+      }
     }
     if (choice?.finish_reason != null) {
       terminalFinishReason = choice.finish_reason;
       terminalLine = line;
+      return;
+    }
+    if (withheldToolFragment) {
+      // Keep any text riding along in the same chunk; drop only the tool_calls.
+      const textOnly = typeof delta?.content === "string" && delta.content.length > 0 ? delta.content : null;
+      if (textOnly !== null) {
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              id: meta.id,
+              object: "chat.completion.chunk",
+              created: meta.created,
+              model: meta.model,
+              choices: [{ index: 0, delta: { content: textOnly }, finish_reason: null }],
+            })}\n\n`,
+          ),
+        );
+      }
       return;
     }
     controller.enqueue(encoder.encode(line + "\n"));
@@ -1660,16 +1731,80 @@ function makeSynthStreamCompletenessGuard(
       buffer += decoder.decode();
       if (buffer.length > 0) handleLine(buffer, controller);
       if (terminalLine === null) return; // stream ended without a terminal chunk — nothing to reconcile
+      // Assemble the streamed fragments into real tool calls. Falls back to the
+      // old placeholder only when tool_calls were seen but nothing parsed, so a
+      // shape this guard cannot read behaves exactly as it did before.
+      const assembled = [...toolCallAcc.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, c]) => ({ type: "function", id: c.id, function: { name: c.name, arguments: c.args } }));
       const reconstructed = {
         choices: [
           {
             finish_reason: terminalFinishReason,
-            message: { content, reasoning, tool_calls: toolCallsSeen ? [{}] : undefined },
+            message: {
+              content,
+              reasoning,
+              tool_calls: toolCallsSeen ? (assembled.length > 0 ? assembled : [{}]) : undefined,
+            },
           },
         ],
       };
-      const incomplete = detectIncompleteSynth(reconstructed);
+      // The fusion path logged no terminal state at all, so a truncated synth
+      // tool call was invisible in production. Mirrors `single: tool-turn
+      // terminal state`.
+      const brokenArgs = assembled.filter((c) => c.function.arguments.length > 0 && !isParsableJson(c.function.arguments));
+      if (toolCallsSeen) {
+        ctx.logger.info(
+          {
+            stage: "synth",
+            model: synth,
+            finish_reason: terminalFinishReason,
+            tool_calls: assembled.length,
+            broken_tool_args: brokenArgs.length,
+            args_len: assembled.reduce((n, c) => n + c.function.arguments.length, 0),
+            content_len: content.length,
+          },
+          "fusion: synth tool-turn terminal state",
+        );
+      }
+      // A tool call whose assembled arguments do not parse is not runnable —
+      // recover it rather than handing the client a broken call. `lengthCut…`
+      // covers finish_reason:"length"; the second check catches a truncated
+      // call under any other finish reason (empty args = a genuine no-arg tool).
+      const toolArgsUnusable = lengthCutMidToolCall(reconstructed) || brokenArgs.length > 0;
+      const incomplete: SynthRetryReason | null =
+        detectIncompleteSynth(reconstructed) ?? (toolArgsUnusable ? "length_cut_tool_call" : null);
+      // Release the withheld tool-call fragments as ONE delta chunk. Done for
+      // every path that keeps the original call, so withholding never loses it.
+      const emitAssembled = (): void => {
+        if (assembled.length === 0) return;
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              id: meta.id,
+              object: "chat.completion.chunk",
+              created: meta.created,
+              model: meta.model,
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    tool_calls: assembled.map((c, index) => ({
+                      index,
+                      id: c.id,
+                      type: "function",
+                      function: { name: c.function.name, arguments: c.function.arguments },
+                    })),
+                  },
+                  finish_reason: null,
+                },
+              ],
+            })}\n\n`,
+          ),
+        );
+      };
       if (incomplete === null) {
+        emitAssembled();
         // SSE events are blank-line delimited: terminalLine is a single split line
         // with its trailing "\n" already stripped, so it needs "\n\n" (not "\n")
         // to close its own event before [DONE] opens the next one.
@@ -1678,6 +1813,8 @@ function makeSynthStreamCompletenessGuard(
         return;
       }
       const recovered = await runRecoveryWithKeepalive(ctx, resilience, synth, originalBody, opts, incomplete, controller, encoder);
+      // Recovery failed: fall back to the original call rather than dropping it.
+      if (recovered === null) emitAssembled();
       const replacementLine = recovered !== null ? synthRecoveredChunkLine(recovered, meta) : terminalLine;
       controller.enqueue(encoder.encode(replacementLine + "\n\n"));
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
@@ -1699,7 +1836,7 @@ async function runRecoveryWithKeepalive(
   synth: string,
   originalBody: Record<string, unknown>,
   opts: { native: boolean; fallbackSynth?: string | null },
-  incomplete: "empty" | "planning_tail",
+  incomplete: SynthRetryReason,
   controller: TransformStreamDefaultController<Uint8Array>,
   encoder: TextEncoder,
 ): Promise<unknown | null> {
