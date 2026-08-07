@@ -1625,6 +1625,46 @@ describe("fusion strategy — synth completeness guard", () => {
     expect(text).toContain("list_files");
   });
 
+  it("synth stream: does not replay prose that already streamed when recovering a tool call", async () => {
+    // The tool-call recovery reason fires with NON-empty content (unlike the
+    // pre-existing empty/planning_tail reasons), so replaying the retry's full
+    // answer would show the same prose to the user twice.
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        if (systemContents(body).some((c) => c.includes("stopped while still planning"))) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  content: "PROSE-ONE",
+                  tool_calls: [
+                    { id: "ok", type: "function", function: { name: "write_file", arguments: '{"path":"a.py"}' } },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+        return sseResponse([
+          { choices: [{ delta: { content: "PROSE-ONE" } }] },
+          {
+            choices: [
+              { delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "write_file", arguments: '{"pa' } }] } },
+            ],
+          },
+          { choices: [{ delta: {}, finish_reason: "length" }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    expect(assembledToolArgs(text)).toEqual(['{"path":"a.py"}']);
+    expect(streamedContents(text)).toEqual(["PROSE-ONE"]); // exactly once
+  });
+
   it("synth stream: keeps sibling choices when stripping tool_calls from a withheld chunk", async () => {
     const up = makeUpstream((body) => {
       if (body.model === "j") return jsonResponse(judgeOk);

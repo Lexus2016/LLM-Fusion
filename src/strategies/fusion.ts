@@ -1408,11 +1408,15 @@ function completionHasBrokenToolArgs(data: unknown): boolean {
   });
 }
 
-/** True when `text` parses as JSON — used to judge assembled tool-call arguments. */
+/**
+ * True when `text` parses as a JSON OBJECT — the only shape the OpenAI protocol
+ * allows for `function.arguments`. Plain `JSON.parse` would also accept `123`
+ * or `true`, letting a nonsense argument string pass as a runnable call.
+ */
 function isParsableJson(text: string): boolean {
   try {
-    JSON.parse(text);
-    return true;
+    const parsed: unknown = JSON.parse(text);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
   } catch {
     return false;
   }
@@ -1607,13 +1611,21 @@ function normalizeRecoveredToolCall(tc: unknown, index: number): Record<string, 
   return { ...parsed.data, index };
 }
 
-function synthRecoveredChunkLine(recovered: unknown, meta: { id: string; created: number; model: string }): string {
+function synthRecoveredChunkLine(
+  recovered: unknown,
+  meta: { id: string; created: number; model: string },
+  opts: { omitContent?: boolean } = {},
+): string {
   const parsed = SynthCompletionSchema.safeParse(recovered);
   const finishReason = parsed.success ? (parsed.data.choices?.[0]?.finish_reason ?? "stop") : "stop";
   const toolCalls = extractToolCalls(recovered);
   const answer = extractAnswer(recovered) ?? "";
   const delta: Record<string, unknown> = {};
-  if (answer.length > 0) delta.content = answer;
+  // `omitContent` guards the tool-call recovery path: prose already streamed
+  // live, so replaying the retry's full answer would show it to the user twice.
+  // The pre-existing "empty"/"planning_tail" reasons only fire on an EMPTY
+  // content, which is why this never mattered before tool-call recovery existed.
+  if (answer.length > 0 && opts.omitContent !== true) delta.content = answer;
   if (toolCalls.length > 0) {
     delta.tool_calls = toolCalls.map((tc, index) => normalizeRecoveredToolCall(tc, index));
   }
@@ -1743,8 +1755,11 @@ function makeSynthStreamCompletenessGuard(
           // of a sparse-index turn. Fragments without one belong to index 0.
           const idx = frag.data.index ?? 0;
           const acc = toolCallAcc.get(idx) ?? { args: "" };
-          if (frag.data.id != null) acc.id = frag.data.id;
-          if (frag.data.function?.name != null) acc.name = frag.data.function.name;
+          // Only NON-EMPTY id/name overwrite: a later fragment carrying `name: ""`
+          // (some gateways pad every fragment) would otherwise erase the real
+          // name and turn a good call into an unrunnable one.
+          if (frag.data.id) acc.id = frag.data.id;
+          if (frag.data.function?.name) acc.name = frag.data.function.name;
           if (typeof frag.data.function?.arguments === "string") acc.args += frag.data.function.arguments;
           toolCallAcc.set(idx, acc);
         }
@@ -1886,7 +1901,9 @@ function makeSynthStreamCompletenessGuard(
             encoder,
           );
           if (salvaged !== null) {
-            controller.enqueue(encoder.encode(synthRecoveredChunkLine(salvaged, meta) + "\n\n"));
+            controller.enqueue(
+              encoder.encode(synthRecoveredChunkLine(salvaged, meta, { omitContent: content.length > 0 }) + "\n\n"),
+            );
           } else {
             // Recovery failed: deliver whatever was buffered rather than nothing.
             emitAssembled();
@@ -1975,7 +1992,10 @@ function makeSynthStreamCompletenessGuard(
         }
         emitAssembled();
       }
-      const replacementLine = recovered !== null ? synthRecoveredChunkLine(recovered, meta) : terminalLine;
+      const replacementLine =
+        recovered !== null
+          ? synthRecoveredChunkLine(recovered, meta, { omitContent: content.length > 0 })
+          : terminalLine;
       controller.enqueue(encoder.encode(replacementLine + "\n\n"));
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
     },
