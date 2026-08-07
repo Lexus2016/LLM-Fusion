@@ -1644,6 +1644,23 @@ function makeSynthStreamCompletenessGuard(
   let terminalLine: string | null = null;
   const meta = { id: `fusion-synth-${synth}`, created: Math.floor(Date.now() / 1000), model: synth };
 
+  // Rebuild a chunk with `tool_calls` removed from choices[0], preserving every
+  // other field and EVERY other choice. Rebuilding from scratch would drop
+  // sibling choices on an `n > 1` request and any provider extras on the chunk.
+  const stripToolCallsFromChunk = (raw: unknown): string => {
+    const o = { ...(raw as Record<string, unknown>) };
+    const choices = Array.isArray(o.choices) ? o.choices : [];
+    o.choices = choices.map((ch, i) => {
+      if (i !== 0 || typeof ch !== "object" || ch === null) return ch;
+      const c = { ...(ch as Record<string, unknown>) };
+      const d = { ...(c.delta as Record<string, unknown>) };
+      delete d.tool_calls;
+      c.delta = d;
+      return c;
+    });
+    return `data: ${JSON.stringify(o)}`;
+  };
+
   const handleLine = (line: string, controller: TransformStreamDefaultController<Uint8Array>): void => {
     if (terminalLine !== null) return; // holding everything after the terminal chunk (incl. [DONE])
     const trimmed = line.trimStart();
@@ -1720,15 +1737,7 @@ function makeSynthStreamCompletenessGuard(
       // line after emitAssembled() would append them a second time, producing
       // duplicated/unparsable arguments at the client.
       if (withheldToolFragment) {
-        const strippedDelta: Record<string, unknown> = { ...(delta as Record<string, unknown>) };
-        delete strippedDelta.tool_calls;
-        terminalLine = `data: ${JSON.stringify({
-          id: meta.id,
-          object: "chat.completion.chunk",
-          created: meta.created,
-          model: meta.model,
-          choices: [{ index: 0, delta: strippedDelta, finish_reason: choice.finish_reason }],
-        })}`;
+        terminalLine = stripToolCallsFromChunk(obj);
       } else {
         terminalLine = line;
       }
@@ -1736,21 +1745,13 @@ function makeSynthStreamCompletenessGuard(
     }
     if (withheldToolFragment) {
       // Drop ONLY tool_calls; every other delta field (role, content, refusal,
-      // reasoning, provider extras) still belongs to the client and rides on.
+      // reasoning, provider extras) and every sibling choice still belongs to
+      // the client and rides on.
       const strippedDelta: Record<string, unknown> = { ...(delta as Record<string, unknown>) };
       delete strippedDelta.tool_calls;
-      if (Object.keys(strippedDelta).length > 0) {
-        controller.enqueue(
-          encoder.encode(
-            `data: ${JSON.stringify({
-              id: meta.id,
-              object: "chat.completion.chunk",
-              created: meta.created,
-              model: meta.model,
-              choices: [{ index: 0, delta: strippedDelta, finish_reason: null }],
-            })}\n\n`,
-          ),
-        );
+      const siblingChoices = (parsed.data.choices?.length ?? 0) > 1;
+      if (Object.keys(strippedDelta).length > 0 || siblingChoices) {
+        controller.enqueue(encoder.encode(stripToolCallsFromChunk(obj) + "\n\n"));
       }
       return;
     }
@@ -1833,7 +1834,10 @@ function makeSynthStreamCompletenessGuard(
             { stage: "synth", model: synth, tool_calls: assembled.length },
             "fusion: synth stream ended without a terminal chunk; released the buffered tool call",
           );
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         } else if (toolCallsSeen) {
+          // A truncated call with no terminal chunk deserves the SAME recovery
+          // as one with it — dropping it leaves the client with no call at all.
           ctx.logger.warn(
             {
               stage: "synth",
@@ -1841,11 +1845,39 @@ function makeSynthStreamCompletenessGuard(
               tool_calls: assembled.length,
               unreadable_fragment: unreadableToolFragment,
             },
-            "fusion: synth stream ended without a terminal chunk and the buffered tool call was not runnable; dropped",
+            "fusion: synth stream ended without a terminal chunk and the buffered tool call was not runnable; recovering",
           );
+          const salvaged = await runRecoveryWithKeepalive(
+            ctx,
+            resilience,
+            synth,
+            originalBody,
+            opts,
+            "length_cut_tool_call",
+            controller,
+            encoder,
+          );
+          if (salvaged !== null) {
+            controller.enqueue(encoder.encode(synthRecoveredChunkLine(salvaged, meta) + "\n\n"));
+          } else {
+            // Recovery failed: deliver whatever was buffered rather than nothing.
+            emitAssembled();
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({
+                  id: meta.id,
+                  object: "chat.completion.chunk",
+                  created: meta.created,
+                  model: meta.model,
+                  choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+                })}\n\n`,
+              ),
+            );
+          }
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        } else if (sawDone) {
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         }
-        // [DONE] was withheld with the fragments — always close the stream.
-        if (sawDone) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         return;
       }
       const reconstructed = {

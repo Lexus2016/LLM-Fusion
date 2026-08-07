@@ -1510,6 +1510,75 @@ describe("fusion strategy — synth completeness guard", () => {
     expect(text).toContain("write_file"); // the recovered, named call
   });
 
+  it("synth stream: recovers a TRUNCATED call even when no terminal chunk arrives", async () => {
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        const nudged = systemContents(body).some((c) => c.includes("stopped while still planning"));
+        if (nudged) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  content: "",
+                  tool_calls: [
+                    { id: "c9", type: "function", function: { name: "write_file", arguments: '{"path":"ok.py"}' } },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+        // Truncated arguments AND no finish_reason chunk: dropping this leaves
+        // the client with no call at all, so it must still reach recovery.
+        return sseResponse([
+          {
+            choices: [
+              { delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "write_file", arguments: '{"pa' } }] } },
+            ],
+          },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    expect(synthCalls).toBe(2);
+    expect(assembledToolArgs(text)).toEqual(['{"path":"ok.py"}']);
+    expect(text.split("[DONE]").length - 1).toBe(1);
+  });
+
+  it("synth stream: keeps sibling choices when stripping tool_calls from a withheld chunk", async () => {
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        return sseResponse([
+          {
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [{ index: 0, id: "c1", function: { name: "write_file", arguments: '{"path":"a.py"}' } }],
+                },
+              },
+              // An `n > 1` sibling riding in the same SSE event must survive.
+              { index: 1, delta: { content: "sibling" } },
+            ],
+          },
+          { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    expect(text).toContain("sibling");
+    expect(assembledToolArgs(text)).toEqual(['{"path":"a.py"}']);
+  });
+
   it("does NOT retry a complete answer that happens to carry finish_reason:stop", async () => {
     let synthCalls = 0;
     const up = makeUpstream((body) => {
