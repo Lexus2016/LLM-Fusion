@@ -1551,6 +1551,80 @@ describe("fusion strategy — synth completeness guard", () => {
     expect(text.split("[DONE]").length - 1).toBe(1);
   });
 
+  it("synth stream: rejects a RECOVERY whose tool arguments are themselves truncated", async () => {
+    // The retry's own answer must be validated: a truncated call routinely
+    // arrives labelled finish_reason:"tool_calls", which the length-only check
+    // would wave through — defeating the point of recovering at all.
+    const up = makeUpstream((body) => {
+      if (body.model === "j") {
+        // Fallback synth (judge model) — returns the good call.
+        if (systemContents(body).some((c) => c.includes("stopped while still planning"))) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  content: "",
+                  tool_calls: [
+                    { id: "ok", type: "function", function: { name: "write_file", arguments: '{"path":"good.py"}' } },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+        return jsonResponse(judgeOk);
+      }
+      if (body.model === "s") {
+        if (systemContents(body).some((c) => c.includes("stopped while still planning"))) {
+          // Retry is ALSO broken, but labelled "tool_calls", not "length".
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  content: "",
+                  tool_calls: [{ id: "bad", type: "function", function: { name: "write_file", arguments: '{"path":"' } }],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+        return sseResponse([
+          {
+            choices: [
+              { delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "write_file", arguments: '{"pa' } }] } },
+            ],
+          },
+          { choices: [{ delta: {}, finish_reason: "length" }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    expect(assembledToolArgs(text)).toEqual(['{"path":"good.py"}']);
+  });
+
+  it("synth stream: a no-arg call with no terminal chunk is released, not retried", async () => {
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        // Empty arguments are a genuine no-arg tool, not a truncation.
+        return sseResponse([
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "list_files", arguments: "" } }] } }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    expect(synthCalls).toBe(1); // no needless retry
+    expect(text).toContain("list_files");
+  });
+
   it("synth stream: keeps sibling choices when stripping tool_calls from a withheld chunk", async () => {
     const up = makeUpstream((body) => {
       if (body.model === "j") return jsonResponse(judgeOk);

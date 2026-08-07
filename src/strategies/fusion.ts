@@ -1388,6 +1388,26 @@ function detectIncompleteSynth(data: unknown): "empty" | "planning_tail" | null 
   return null;
 }
 
+/**
+ * A completion carrying tool calls whose arguments do not parse, under ANY
+ * finish reason. `lengthCutMidToolCall` only judges `finish_reason:"length"`,
+ * but a truncated call routinely arrives labelled `"tool_calls"` — accepting
+ * one as a recovered answer would defeat the whole point of the retry.
+ * Absent/empty arguments are a genuine no-arg tool and stay valid.
+ */
+function completionHasBrokenToolArgs(data: unknown): boolean {
+  const parsed = SynthCompletionSchema.safeParse(data);
+  if (!parsed.success) return false;
+  const toolCalls = parsed.data.choices?.[0]?.message?.tool_calls;
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return false;
+  return !toolCalls.every((tc) => {
+    const args = (tc as { function?: { arguments?: unknown } })?.function?.arguments;
+    if (args === undefined || args === null) return true;
+    if (typeof args !== "string") return false;
+    return args.length === 0 || isParsableJson(args);
+  });
+}
+
 /** True when `text` parses as JSON — used to judge assembled tool-call arguments. */
 function isParsableJson(text: string): boolean {
   try {
@@ -1484,10 +1504,10 @@ async function retrySynthForCompletion(
       ctx.logger.warn({ stage: "synth", model }, "fusion: synth completion retry still incomplete");
       return null;
     }
-    if (lengthCutMidToolCall(result.data)) {
+    if (lengthCutMidToolCall(result.data) || completionHasBrokenToolArgs(result.data)) {
       ctx.logger.warn(
         { stage: "synth", model },
-        "fusion: synth completion retry was length-cut mid tool call; not usable",
+        "fusion: synth completion retry carried unparsable tool arguments; not usable",
       );
       return null;
     }
@@ -1779,9 +1799,14 @@ function makeSynthStreamCompletenessGuard(
         .map(([index, c]) => ({ index, type: "function", id: c.id, function: { name: c.name, arguments: c.args } }));
       // Release the withheld tool-call fragments as ONE delta chunk, preserving
       // upstream indices. Used on every path that keeps the original call, so
-      // withholding can never lose it.
+      // withholding can never lose it. A NAMELESS call is never released: no
+      // client can run it, and shipping one is worse than shipping none.
+      // NOTE: only choices[0] is accumulated (as everywhere in this guard), so
+      // an `n > 1` turn has its sibling choices passed through untouched rather
+      // than inspected.
       const emitAssembled = (): void => {
-        if (assembled.length === 0) return;
+        const runnableCalls = assembled.filter((c) => c.function.name);
+        if (runnableCalls.length === 0) return;
         controller.enqueue(
           encoder.encode(
             `data: ${JSON.stringify({
@@ -1793,7 +1818,7 @@ function makeSynthStreamCompletenessGuard(
                 {
                   index: 0,
                   delta: {
-                    tool_calls: assembled.map((c) => ({
+                    tool_calls: runnableCalls.map((c) => ({
                       index: c.index,
                       id: c.id,
                       type: "function",
@@ -1812,11 +1837,14 @@ function makeSynthStreamCompletenessGuard(
         // wise vanish (before withholding they had already reached the client),
         // so release a runnable call and close the stream ourselves. A call is
         // runnable only with a name AND parsable arguments — the same bar
-        // tool_turn_guard uses for its salvage path.
+        // tool_turn_guard uses for its salvage path. Empty arguments are a
+        // genuine no-arg tool, not a truncation.
         const runnable =
           assembled.length > 0 &&
           !unreadableToolFragment &&
-          assembled.every((c) => c.function.name && isParsableJson(c.function.arguments));
+          assembled.every(
+            (c) => c.function.name && (c.function.arguments.length === 0 || isParsableJson(c.function.arguments)),
+          );
         if (runnable) {
           emitAssembled();
           controller.enqueue(
