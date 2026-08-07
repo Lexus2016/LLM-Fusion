@@ -1438,7 +1438,76 @@ describe("fusion strategy — synth completeness guard", () => {
     // Withholding must not swallow the call when no terminal chunk ever arrives.
     expect(assembledToolArgs(text)).toEqual(['{"path":"a.py"}']);
     expect(text).toContain("write_file");
-    expect(text).toContain("[DONE]");
+    // ORDER matters: an SDK stops reading at [DONE], so the call must precede
+    // it and [DONE] must appear exactly once.
+    expect(text.indexOf("write_file")).toBeLessThan(text.indexOf("[DONE]"));
+    expect(text.split("[DONE]").length - 1).toBe(1);
+  });
+
+  it("synth stream: preserves non-tool delta fields (role) on a withheld tool-call chunk", async () => {
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        return sseResponse([
+          {
+            choices: [
+              {
+                // OpenAI puts `role` on the first chunk of the turn, alongside
+                // the opening tool_call fragment. Withholding must not eat it.
+                delta: {
+                  role: "assistant",
+                  tool_calls: [
+                    { index: 0, id: "c1", function: { name: "write_file", arguments: '{"path":"a.py"}' } },
+                  ],
+                },
+              },
+            ],
+          },
+          { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    expect(text).toContain('"role":"assistant"');
+    expect(assembledToolArgs(text)).toEqual(['{"path":"a.py"}']);
+  });
+
+  it("synth stream: routes a NAMELESS tool call into recovery instead of shipping it", async () => {
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        const nudged = systemContents(body).some((c) => c.includes("stopped while still planning"));
+        if (nudged) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  content: "",
+                  tool_calls: [
+                    { id: "c9", type: "function", function: { name: "write_file", arguments: '{"path":"a.py"}' } },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+        // Fragment with arguments but no name anywhere — not runnable.
+        return sseResponse([
+          { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"path":"a.py"}' } }] } }] },
+          { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    expect(synthCalls).toBe(2);
+    expect(text).toContain("write_file"); // the recovered, named call
   });
 
   it("does NOT retry a complete answer that happens to carry finish_reason:stop", async () => {

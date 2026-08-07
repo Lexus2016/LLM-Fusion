@@ -1632,6 +1632,9 @@ function makeSynthStreamCompletenessGuard(
   // A withheld fragment this guard could not parse — the turn cannot be replayed
   // faithfully, so it must go to recovery rather than be silently lost.
   let unreadableToolFragment = false;
+  // [DONE] arrived while tool-call fragments were being withheld; flush() owns
+  // closing the stream in that case.
+  let sawDone = false;
   // Streamed tool-call arguments arrive as fragments across chunks, keyed by
   // `index`. Accumulate them so the terminal check judges the ASSEMBLED
   // arguments — a stub placeholder here made `lengthCutMidToolCall` unreachable
@@ -1650,6 +1653,13 @@ function makeSynthStreamCompletenessGuard(
     }
     const payload = trimmed.slice("data:".length).trim();
     if (payload.length === 0 || payload === "[DONE]") {
+      // Once a tool call is being withheld, [DONE] must be withheld too: an SDK
+      // stops reading at [DONE], so releasing it before flush() emits the call
+      // would hide that call from the client entirely. flush() re-emits it.
+      if (payload === "[DONE]" && toolCallsSeen) {
+        sawDone = true;
+        return;
+      }
       controller.enqueue(encoder.encode(line + "\n"));
       return;
     }
@@ -1725,9 +1735,11 @@ function makeSynthStreamCompletenessGuard(
       return;
     }
     if (withheldToolFragment) {
-      // Keep any text riding along in the same chunk; drop only the tool_calls.
-      const textOnly = typeof delta?.content === "string" && delta.content.length > 0 ? delta.content : null;
-      if (textOnly !== null) {
+      // Drop ONLY tool_calls; every other delta field (role, content, refusal,
+      // reasoning, provider extras) still belongs to the client and rides on.
+      const strippedDelta: Record<string, unknown> = { ...(delta as Record<string, unknown>) };
+      delete strippedDelta.tool_calls;
+      if (Object.keys(strippedDelta).length > 0) {
         controller.enqueue(
           encoder.encode(
             `data: ${JSON.stringify({
@@ -1735,7 +1747,7 @@ function makeSynthStreamCompletenessGuard(
               object: "chat.completion.chunk",
               created: meta.created,
               model: meta.model,
-              choices: [{ index: 0, delta: { content: textOnly }, finish_reason: null }],
+              choices: [{ index: 0, delta: strippedDelta, finish_reason: null }],
             })}\n\n`,
           ),
         );
@@ -1797,8 +1809,14 @@ function makeSynthStreamCompletenessGuard(
       if (terminalLine === null) {
         // Stream ended with no terminal chunk. Withheld fragments would other-
         // wise vanish (before withholding they had already reached the client),
-        // so release a complete call and close the stream ourselves.
-        if (assembled.length > 0 && !unreadableToolFragment) {
+        // so release a runnable call and close the stream ourselves. A call is
+        // runnable only with a name AND parsable arguments — the same bar
+        // tool_turn_guard uses for its salvage path.
+        const runnable =
+          assembled.length > 0 &&
+          !unreadableToolFragment &&
+          assembled.every((c) => c.function.name && isParsableJson(c.function.arguments));
+        if (runnable) {
           emitAssembled();
           controller.enqueue(
             encoder.encode(
@@ -1811,12 +1829,23 @@ function makeSynthStreamCompletenessGuard(
               })}\n\n`,
             ),
           );
-          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
           ctx.logger.warn(
             { stage: "synth", model: synth, tool_calls: assembled.length },
             "fusion: synth stream ended without a terminal chunk; released the buffered tool call",
           );
+        } else if (toolCallsSeen) {
+          ctx.logger.warn(
+            {
+              stage: "synth",
+              model: synth,
+              tool_calls: assembled.length,
+              unreadable_fragment: unreadableToolFragment,
+            },
+            "fusion: synth stream ended without a terminal chunk and the buffered tool call was not runnable; dropped",
+          );
         }
+        // [DONE] was withheld with the fragments — always close the stream.
+        if (sawDone) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         return;
       }
       const reconstructed = {
@@ -1854,8 +1883,14 @@ function makeSynthStreamCompletenessGuard(
       // covers finish_reason:"length"; the second check catches a truncated
       // call under any other finish reason (empty args = a genuine no-arg tool).
       // An unreadable withheld fragment counts too: it cannot be replayed.
+      // So does a nameless call — the permissive fragment schema lets `{}`
+      // through, and a call with no name is not runnable by any client.
+      const namelessCall = assembled.some((c) => !c.function.name);
       const toolArgsUnusable =
-        lengthCutMidToolCall(reconstructed) || brokenArgs.length > 0 || unreadableToolFragment;
+        lengthCutMidToolCall(reconstructed) ||
+        brokenArgs.length > 0 ||
+        unreadableToolFragment ||
+        namelessCall;
       const incomplete: SynthRetryReason | null =
         detectIncompleteSynth(reconstructed) ?? (toolArgsUnusable ? "length_cut_tool_call" : null);
       if (incomplete === null) {
@@ -1869,7 +1904,17 @@ function makeSynthStreamCompletenessGuard(
       }
       const recovered = await runRecoveryWithKeepalive(ctx, resilience, synth, originalBody, opts, incomplete, controller, encoder);
       // Recovery failed: fall back to the original call rather than dropping it.
-      if (recovered === null) emitAssembled();
+      // With an unreadable fragment that fallback is necessarily partial — say
+      // so rather than letting a silently incomplete call look normal.
+      if (recovered === null) {
+        if (unreadableToolFragment) {
+          ctx.logger.warn(
+            { stage: "synth", model: synth, tool_calls: assembled.length },
+            "fusion: recovery failed and a withheld tool-call fragment was unreadable; delivering a PARTIAL call",
+          );
+        }
+        emitAssembled();
+      }
       const replacementLine = recovered !== null ? synthRecoveredChunkLine(recovered, meta) : terminalLine;
       controller.enqueue(encoder.encode(replacementLine + "\n\n"));
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
