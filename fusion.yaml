@@ -29,34 +29,24 @@ upstream:
 # http://127.0.0.1:8080/panel
 providers:
   ollama-cloud:
-    # provider group id (referenced by models' `provider:`)
-    type: ollama # ollama | openai-compat
-    base_url: https://ollama.com # Ollama Cloud root (group default)
     accounts:
-      # failover across these — same models, different keys
       - id: ollama-1
-        api_key_env: OLLAMA_API_KEY # env var holding the Bearer key (never inline)
-      # Add a SECOND Ollama account to rotate on limits / billing (same models):
-      # - id: ollama-2
-      #   api_key_env: OLLAMA_API_KEY_2
-      # A DIFFERENT provider = its own group with DIFFERENT models, e.g. OpenRouter.
-      # Models bound to it need `provider: openrouter` and this group's model ids:
-      # openrouter:
-      #   type: openai-compat
-      #   base_url: https://openrouter.ai/api/v1
-      #   accounts:
-      #     - id: openrouter-1
-      #       api_key_env: OPENROUTER_API_KEY
-      #       model_map: { "glm-5.2": "z-ai/glm-4.6", "kimi-k2.7-code": "moonshotai/kimi-k2" }
-
+        api_key_env: OLLAMA_API_KEY
+        treat_403_as: passthrough
+        quota_markers: []
+      - id: ollama-lexus
+        api_key_env: OLLAMA_API_KEY_2
+    type: ollama
+    base_url: https://ollama.com
 server:
   bind: 127.0.0.1
     # localhost only. For Docker set 0.0.0.0 here
     # (or run with FUSION_BIND=0.0.0.0) so the host can reach it.
-  port: 8080
+  port: 8081
   # auth_token_env: FUSION_PROXY_TOKEN  # optional: when set, clients must send
   # Authorization: Bearer <value-of-that-env-var>.
   # Unset = unauthenticated (localhost single-user) + startup warning.
+  admin_token_env: AUTH_WEB_TOKEN
 
 defaults:
   # applied to every model unless overridden per-model
@@ -85,7 +75,7 @@ models:
   # single — 1:1 passthrough to one fast model.
   fast-deepseek:
     strategy: single
-    target: deepseek-v4-pro
+    target: deepseek-v4-flash:0731-cloud
 
   # =========================================================================
   # Task-specialized virtual models — assembled from an empirical model shoot-out
@@ -100,8 +90,14 @@ models:
   #   (coding/architecture decisions genuinely benefit from diverse takes).
   #   Panel history: P1 (2026-06-27) was glm+kimi+gpt-oss; gpt-oss's 131K ctx became
   #   the fusion-agents context bottleneck, so it was swapped for mistral-large-3:675b
-  #   (2026-07-08, 262K ctx). Panel changed again same day to the 4-model lineup below
-  #   (glm-5.2 dropped from the panel, stays judge+synth).
+  #   (2026-07-08, 262K ctx). Panel changed again same day to a 4-model lineup adding
+  #   qwen3-coder:480b-cloud. That model was RETIRED upstream on 2026-07-15 and every
+  #   panel fan-out kept paying for it: /api/show 410s ("capability discovery missed",
+  #   660/day) plus "panel member dropped (client error response)" (371/day), leaving
+  #   the panel running 2-of-4 live voices. Removed 2026-08-07; the degraded panel
+  #   correlated with a 6-18% rate of truncated tool-call CONTENT (the model stopping
+  #   mid-sentence while still closing valid JSON), which fell to 0-3% within the hour
+  #   after removal. Verify a replacement against ollama.com/api/tags before adding it.
   #   gemini-3-flash previously 400'd with "missing thought_signature in functionCall
   #   parts" on panel requests carrying foreign tool-call history (every agent-loop
   #   step) — a 2026-07-08 spot-check (2 synthetic multi-turn probes, with and without
@@ -109,7 +105,7 @@ models:
   #   watch the `tool-turn terminal state` log line in real agent-loop sessions.
   fusion-coder:
     strategy: fusion
-    panel: [ kimi-k2.7-code, deepseek-v4-pro, gemini-3-flash-preview, qwen3-coder-next ]
+    panel: [ kimi-k2.7-code, deepseek-v4-flash:0731-cloud, glm-5.2 ]
     # panel: [kimi-k2.7-code, minimax-m3, gpt-oss:120b]   # earlier 3-model alternative, unused
     # Benchmark (bench/fusion-bench.mjs, 15/15 tasks, this panel): the fused answer beat
     # every panel member AND solo glm-5.2 on the 9/15 tasks that completed cleanly
@@ -122,7 +118,7 @@ models:
     # long, rambling generations that eat its own token budget; no per-panel-member
     # request_overrides mechanism exists yet to throttle it (only single/smart.simple
     # support request_overrides — see src/config.ts).
-    judge: glm-5.2 # most reliable structured-JSON (router shoot-out) -> fewer judge-parse failures
+    judge: deepseek-v4-flash:0731-cloud # most reliable structured-JSON (router shoot-out) -> fewer judge-parse failures
     synth: glm-5.2
       # CHANGED 2026-07-07 (fusion-lift bench, docs/llm-fusion-audit.md):
       # as synth, kimi emitted 17-19k-char draft-style output on factual/
@@ -148,7 +144,7 @@ models:
     # Useful for factual consistency checks on research / report outputs.
     bineval:
       enabled: true
-      model: deepseek-v4-pro
+      model: deepseek-v4-flash:0731-cloud
         # CHANGED 2026-07-07: glm-5.2 became the coder SYNTH (v0.1.23),
         # so a glm evaluator would self-grade its own answers.
         # deepseek-v4-pro sits outside this pipeline entirely
@@ -159,8 +155,7 @@ models:
       # Custom binary questions (optional; omit to use the built-in defaults):
       dimensions:
         - dimension: factual_consistency
-          question: "Does the answer contain only claims well-supported by the request and
-            accepted facts?"
+          question: "Does the answer contain only claims well-supported by the request and accepted facts?"
 
     # Optional web grounding for the panel (research freshness). The proxy runs
     # ONE Tavily search before the panel fans out and injects the cleaned results
@@ -187,7 +182,7 @@ models:
   #   gpt-oss:120b 13 (most exhaustive coverage + Western lineage).
   fusion-researcher:
     strategy: fusion
-    panel: [ kimi-k2.7-code, glm-5.2, gpt-oss:120b ]
+    panel: [ kimi-k2.7-code, glm-5.2, deepseek-v4-flash:0731-cloud ]
     judge: glm-5.2
     synth: kimi-k2.7-code # scored 15/15; cleanest report-ready prose
     tool_mode: deliberate
@@ -199,7 +194,7 @@ models:
     # Useful for factual consistency checks on research / report outputs.
     bineval:
       enabled: true
-      model: deepseek-v4-pro
+      model: deepseek-v4-flash:0731-cloud
         # CHANGED 2026-07-08: glm-5.2 is BOTH a researcher panel member
         # and the judge, so it was grading an answer it helped write and
         # adjudicate — not literal self-grading (kimi is the synth) but a
@@ -214,8 +209,7 @@ models:
       # Custom binary questions (optional; omit to use the built-in defaults):
       dimensions:
         - dimension: factual_consistency
-          question: "Does the answer contain only claims well-supported by the request and
-            accepted facts?"
+          question: "Does the answer contain only claims well-supported by the request and accepted facts?"
 
     # Optional web grounding for the panel (research freshness). The proxy runs
     # ONE Tavily search before the panel fans out and injects the cleaned results
@@ -238,7 +232,7 @@ models:
   fusion-agents:
     strategy: smart
     provider: ollama-cloud
-    router: glm-5.2
+    router: deepseek-v4-flash:0731-cloud
     default: simple
-    simple: fast-glm
+    simple: fast-deepseek
     fusion: fusion-coder
