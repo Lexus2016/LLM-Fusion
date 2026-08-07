@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.36] - 2026-08-07
+
+### Fixed
+
+- **The streaming synth guard now inspects the tool-call arguments it was written to check.** `makeSynthStreamCompletenessGuard` rebuilt its terminal chunk with a placeholder `tool_calls: [{}]` and never accumulated the streamed argument fragments. Two consequences, both on the path clients actually use (the code's own comment: *"the client always streams in practice, so this is the path that actually matters"*): `detectIncompleteSynth` early-returns on any tool turn, so it always reported "complete"; and `lengthCutMidToolCall` — written precisely for a call cut at the token cap — was unreachable, so a truncated tool call reached the client unchecked and unlogged. Fragments are now accumulated per upstream `index`, the terminal chunk is rebuilt from the real assembled calls, and a call whose arguments do not parse is routed into the existing recovery retry under a new reason, `length_cut_tool_call`. Empty arguments still mean a genuine no-arg tool.
+  - **Tool-call fragments are WITHHELD from the live stream until the terminal chunk.** A truncated call can only be replaced if its fragments never reached the client — forwarding them live and then appending a recovered call leaves the client with both, glued into one unparsable argument string. Text and reasoning still stream live, so prose first-token latency is unchanged. `[DONE]` is withheld with them: an SDK stops reading there, so releasing it before the call would hide that call entirely.
+  - **A chunk carrying BOTH `tool_calls` and `finish_reason`** is no longer replayed verbatim as the terminal line — its fragments are already accumulated, so replaying it appended them a second time. The terminal line is rebuilt with `tool_calls` stripped from `choices[0]`, every other field and every sibling choice copied through untouched.
+  - **A stream that ends with no terminal chunk** no longer swallows the buffered call. Before withholding, those fragments had already reached the client and the early `return` was harmless; now the branch releases a runnable call with a synthetic `finish_reason` chunk and `[DONE]`, or — when the buffered call is truncated — runs the same recovery retry as the terminal path.
+  - **The recovery's own answer is validated.** It was only rejected on `finish_reason: "length"`, but a truncated call routinely arrives labelled `"tool_calls"`, so a retry returning `'{"path":"'` was adopted as the recovered answer. `completionHasBrokenToolArgs` now judges tool arguments under any finish reason.
+  - **Already-streamed prose is not replayed.** The pre-existing recovery reasons (`empty`, `planning_tail`) only fire when content is empty, so replaying the retry's full answer was always safe; `length_cut_tool_call` fires with non-empty content, which would have shown the same prose twice. `synthRecoveredChunkLine` takes an `omitContent` option for that case.
+  - **Nameless calls are never released.** The permissive fragment schema lets `{}` through, producing a call no client can run; it now routes into recovery, and is filtered out of the release if recovery fails. A fragment that fails schema validation is likewise no longer skipped silently — it marks the turn unusable instead of vanishing while withheld.
+  - Smaller correctness fixes found in review: `isParsableJson` required only valid JSON, so primitives like `123` passed as runnable arguments — it now requires a JSON object, the only shape the protocol allows; fragment merging used `!= null`, so a gateway padding later fragments with `name: ""` erased the real name.
+  - **New log line `fusion: synth tool-turn terminal state`** (finish reason, call count, assembled argument length, broken-argument count). The fusion path logged no terminal state at all, which made truncation invisible in production while the `single` path logged ~400 turns/day.
+  - Known limitation, documented in the code: only `choices[0]` is accumulated and inspected, as throughout this guard. On an `n > 1` turn sibling choices pass through untouched but their tool calls are not checked.
+
+### Changed
+
+- **`fusion-coder` panel drops `qwen3-coder:480b-cloud`**, retired upstream on 2026-07-15. Every fan-out still paid for it — `/api/show` 410s (660/day, logged as "capability discovery missed") plus "panel member dropped (client error response)" (371/day) — leaving the panel running 2 of its 4 voices. The degraded panel coincided with a 6–18%/hour rate of truncated tool-call *content* (the model stopping mid-sentence while still closing valid JSON), which fell to 0–3% within the hour after removal, measured over 7681 real tool calls. Verify any replacement against `ollama.com/api/tags` before adding it.
+- **`fusion.yaml` in the repo is synced with the deployed config.** The tracked copy had drifted far enough (port, admin token, account list, `fast-deepseek` target, panel roster) that diagnosing production from it produced a wrong picture. Only env-var *names* are tracked, never values.
+
 ## [0.1.35] - 2026-08-03
 
 ### Fixed

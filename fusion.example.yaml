@@ -66,6 +66,7 @@ server:
   auth_token_env: FUSION_PROXY_TOKEN  # optional; env var holding the shared client token.
                                       # If unset, proxy runs unauthenticated and warns.
                                       # Also gates the panel's /admin data + actions.
+  admin_token_env: AUTH_WEB_TOKEN
 
 defaults:                             # applied to every model unless overridden per-model
   panel_member_timeout_s: 90          # per panel member (default: 90)
