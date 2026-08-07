@@ -1384,6 +1384,63 @@ describe("fusion strategy — synth completeness guard", () => {
     expect(synthCalls).toBe(1);
   });
 
+  it("synth stream: does NOT duplicate arguments when one chunk carries BOTH tool_calls and finish_reason", async () => {
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        return sseResponse([
+          {
+            choices: [
+              { delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "write_file", arguments: '{"pa' } }] } },
+            ],
+          },
+          // Terminal chunk carries the LAST fragment and finish_reason together.
+          {
+            choices: [
+              {
+                delta: { tool_calls: [{ index: 0, function: { arguments: 'th":"a.py"}' } }] },
+                finish_reason: "tool_calls",
+              },
+            ],
+          },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    // Exactly one copy of the arguments — replaying the raw terminal line would
+    // append the last fragment a second time and corrupt the JSON.
+    expect(assembledToolArgs(text)).toEqual(['{"path":"a.py"}']);
+  });
+
+  it("synth stream: releases a buffered tool call when the stream ends with no terminal chunk", async () => {
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        // Complete call, but the upstream never sends a finish_reason chunk.
+        return sseResponse([
+          {
+            choices: [
+              {
+                delta: {
+                  tool_calls: [{ index: 0, id: "c1", function: { name: "write_file", arguments: '{"path":"a.py"}' } }],
+                },
+              },
+            ],
+          },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    // Withholding must not swallow the call when no terminal chunk ever arrives.
+    expect(assembledToolArgs(text)).toEqual(['{"path":"a.py"}']);
+    expect(text).toContain("write_file");
+    expect(text).toContain("[DONE]");
+  });
+
   it("does NOT retry a complete answer that happens to carry finish_reason:stop", async () => {
     let synthCalls = 0;
     const up = makeUpstream((body) => {

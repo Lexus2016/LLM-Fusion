@@ -1629,6 +1629,9 @@ function makeSynthStreamCompletenessGuard(
   let content = "";
   let reasoning = "";
   let toolCallsSeen = false;
+  // A withheld fragment this guard could not parse — the turn cannot be replayed
+  // faithfully, so it must go to recovery rather than be silently lost.
+  let unreadableToolFragment = false;
   // Streamed tool-call arguments arrive as fragments across chunks, keyed by
   // `index`. Accumulate them so the terminal check judges the ASSEMBLED
   // arguments — a stub placeholder here made `lengthCutMidToolCall` unreachable
@@ -1682,7 +1685,15 @@ function makeSynthStreamCompletenessGuard(
         withheldToolFragment = true;
         for (const raw of delta.tool_calls) {
           const frag = StreamToolCallDeltaSchema.safeParse(raw);
-          if (!frag.success) continue;
+          if (!frag.success) {
+            // A fragment this guard cannot read is withheld like every other,
+            // so it must not be dropped silently — mark the turn unusable and
+            // let the terminal check route it into recovery.
+            unreadableToolFragment = true;
+            continue;
+          }
+          // Keep the UPSTREAM index: re-numbering would rewrite the semantics
+          // of a sparse-index turn. Fragments without one belong to index 0.
           const idx = frag.data.index ?? 0;
           const acc = toolCallAcc.get(idx) ?? { args: "" };
           if (frag.data.id != null) acc.id = frag.data.id;
@@ -1694,7 +1705,23 @@ function makeSynthStreamCompletenessGuard(
     }
     if (choice?.finish_reason != null) {
       terminalFinishReason = choice.finish_reason;
-      terminalLine = line;
+      // A chunk carrying BOTH tool_calls and finish_reason must not be replayed
+      // verbatim: its fragments are already accumulated, and emitting the raw
+      // line after emitAssembled() would append them a second time, producing
+      // duplicated/unparsable arguments at the client.
+      if (withheldToolFragment) {
+        const strippedDelta: Record<string, unknown> = { ...(delta as Record<string, unknown>) };
+        delete strippedDelta.tool_calls;
+        terminalLine = `data: ${JSON.stringify({
+          id: meta.id,
+          object: "chat.completion.chunk",
+          created: meta.created,
+          model: meta.model,
+          choices: [{ index: 0, delta: strippedDelta, finish_reason: choice.finish_reason }],
+        })}`;
+      } else {
+        terminalLine = line;
+      }
       return;
     }
     if (withheldToolFragment) {
@@ -1730,13 +1757,68 @@ function makeSynthStreamCompletenessGuard(
     async flush(controller) {
       buffer += decoder.decode();
       if (buffer.length > 0) handleLine(buffer, controller);
-      if (terminalLine === null) return; // stream ended without a terminal chunk — nothing to reconcile
-      // Assemble the streamed fragments into real tool calls. Falls back to the
-      // old placeholder only when tool_calls were seen but nothing parsed, so a
-      // shape this guard cannot read behaves exactly as it did before.
+      // Assemble the streamed fragments into real tool calls, keeping each
+      // call's UPSTREAM index. Falls back to the old placeholder only when
+      // tool_calls were seen but nothing parsed, so a shape this guard cannot
+      // read behaves exactly as it did before.
       const assembled = [...toolCallAcc.entries()]
         .sort((a, b) => a[0] - b[0])
-        .map(([, c]) => ({ type: "function", id: c.id, function: { name: c.name, arguments: c.args } }));
+        .map(([index, c]) => ({ index, type: "function", id: c.id, function: { name: c.name, arguments: c.args } }));
+      // Release the withheld tool-call fragments as ONE delta chunk, preserving
+      // upstream indices. Used on every path that keeps the original call, so
+      // withholding can never lose it.
+      const emitAssembled = (): void => {
+        if (assembled.length === 0) return;
+        controller.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              id: meta.id,
+              object: "chat.completion.chunk",
+              created: meta.created,
+              model: meta.model,
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    tool_calls: assembled.map((c) => ({
+                      index: c.index,
+                      id: c.id,
+                      type: "function",
+                      function: { name: c.function.name, arguments: c.function.arguments },
+                    })),
+                  },
+                  finish_reason: null,
+                },
+              ],
+            })}\n\n`,
+          ),
+        );
+      };
+      if (terminalLine === null) {
+        // Stream ended with no terminal chunk. Withheld fragments would other-
+        // wise vanish (before withholding they had already reached the client),
+        // so release a complete call and close the stream ourselves.
+        if (assembled.length > 0 && !unreadableToolFragment) {
+          emitAssembled();
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                id: meta.id,
+                object: "chat.completion.chunk",
+                created: meta.created,
+                model: meta.model,
+                choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          ctx.logger.warn(
+            { stage: "synth", model: synth, tool_calls: assembled.length },
+            "fusion: synth stream ended without a terminal chunk; released the buffered tool call",
+          );
+        }
+        return;
+      }
       const reconstructed = {
         choices: [
           {
@@ -1771,38 +1853,11 @@ function makeSynthStreamCompletenessGuard(
       // recover it rather than handing the client a broken call. `lengthCut…`
       // covers finish_reason:"length"; the second check catches a truncated
       // call under any other finish reason (empty args = a genuine no-arg tool).
-      const toolArgsUnusable = lengthCutMidToolCall(reconstructed) || brokenArgs.length > 0;
+      // An unreadable withheld fragment counts too: it cannot be replayed.
+      const toolArgsUnusable =
+        lengthCutMidToolCall(reconstructed) || brokenArgs.length > 0 || unreadableToolFragment;
       const incomplete: SynthRetryReason | null =
         detectIncompleteSynth(reconstructed) ?? (toolArgsUnusable ? "length_cut_tool_call" : null);
-      // Release the withheld tool-call fragments as ONE delta chunk. Done for
-      // every path that keeps the original call, so withholding never loses it.
-      const emitAssembled = (): void => {
-        if (assembled.length === 0) return;
-        controller.enqueue(
-          encoder.encode(
-            `data: ${JSON.stringify({
-              id: meta.id,
-              object: "chat.completion.chunk",
-              created: meta.created,
-              model: meta.model,
-              choices: [
-                {
-                  index: 0,
-                  delta: {
-                    tool_calls: assembled.map((c, index) => ({
-                      index,
-                      id: c.id,
-                      type: "function",
-                      function: { name: c.function.name, arguments: c.function.arguments },
-                    })),
-                  },
-                  finish_reason: null,
-                },
-              ],
-            })}\n\n`,
-          ),
-        );
-      };
       if (incomplete === null) {
         emitAssembled();
         // SSE events are blank-line delimited: terminalLine is a single split line
