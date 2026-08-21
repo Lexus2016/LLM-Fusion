@@ -120,8 +120,16 @@ export function detectIncompleteToolTurn(
   const fin = choice.finish_reason;
   const toolCalls = choice.message?.tool_calls;
   const hasCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
+  // Runnability is judged under EVERY finish_reason, not just "length". A call whose
+  // arguments are truncated/scalar, or that has no name to dispatch, is unrunnable
+  // whatever the upstream claims the outcome was — and `finish_reason:"tool_calls"`
+  // on a call the client cannot execute is precisely the stall this guard exists to
+  // break. The STREAM path already enforced exactly this via `assembledCallsEmittable`;
+  // leaving the shared predicate gated on "length" is what let the NON-STREAM twin
+  // (single.ts) ship an unrunnable call with no retry at all.
+  if (hasCalls && (toolCallArgsBroken(toolCalls) || toolCallNameMissing(toolCalls))) return "broken_tool_call";
   if (fin === "length") {
-    if (hasCalls) return toolCallArgsBroken(toolCalls) ? "broken_tool_call" : null;
+    if (hasCalls) return null; // calls present and runnable: an honest tool turn
     const rawContent = typeof choice.message?.content === "string" ? choice.message.content : "";
     if (stripThinkingTags(rawContent).trim().length === 0) return "empty";
     return null; // honest length-cut prose is still worth delivering
@@ -138,6 +146,24 @@ export function detectIncompleteToolTurn(
 }
 
 /**
+ * finish_reasons for which re-prompting is never appropriate, however unrunnable the
+ * turn is. `content_filter` means the upstream REFUSED: nudging it with "Emit the tool
+ * call NOW" re-runs the refusal — it burns a call and at best returns the same block,
+ * at worst launders a safety stop into a second attempt. The turn is still made HONEST
+ * (the unrunnable call is dropped, the `content_filter` terminal is preserved); it is
+ * only the retry that is suppressed.
+ */
+const NO_RETRY_FINISH_REASONS = new Set(["content_filter"]);
+
+/** True when this response's finish_reason forbids a recovery retry. See above. */
+export function toolTurnRetryBlocked(data: unknown): boolean {
+  const parsed = TurnCompletionSchema.safeParse(data);
+  if (!parsed.success) return false;
+  const fin = parsed.data.choices?.[0]?.finish_reason;
+  return typeof fin === "string" && NO_RETRY_FINISH_REASONS.has(fin);
+}
+
+/**
  * True when at least one tool call carries a NON-EMPTY arguments string that is
  * not a JSON OBJECT — either truncated mid-arguments (the output-cap signature)
  * or a scalar/array, which parses but is not runnable tool input.
@@ -151,6 +177,28 @@ function toolCallArgsBroken(toolCalls: unknown[]): boolean {
     if (typeof args !== "string" || args.length === 0) continue;
     // Not merely "does it parse": a scalar or array is not runnable tool input.
     if (!isJsonObjectString(args)) return true;
+  }
+  return false;
+}
+
+/**
+ * True when at least one tool call has no dispatchable `function.name`. A nameless
+ * call is unrunnable however well-formed its arguments are — there is nothing to look
+ * up. `toolCallArgsBroken` inspects `arguments` only and misses it entirely; the
+ * stream path's `assembledCallsEmittable` has always required a name.
+ * NOTE: this also rejects a tool call that is not `{function:{name,arguments}}`-shaped
+ * at all (e.g. OpenAI's newer `type:"custom"` calls). That is deliberate parity with
+ * the stream path, whose accumulator is built from `function.name` and cannot
+ * represent such a call either; supporting them is a feature, not part of this fix.
+ */
+function toolCallNameMissing(toolCalls: unknown[]): boolean {
+  for (const tc of toolCalls) {
+    const parsed = RecoveredToolCallSchema.safeParse(tc);
+    if (!parsed.success) return true;
+    const name = parsed.data.function?.name;
+    // `.trim()`: a whitespace-only name is as undispatchable as an absent one —
+    // there is no such tool to look up — and JSON round-trips it happily.
+    if (typeof name !== "string" || name.trim().length === 0) return true;
   }
   return false;
 }
@@ -268,14 +316,76 @@ async function streamRetryToolTurn(
   const decoder = new TextDecoder();
   let buf = "";
   let forwarded = 0;
+  let sawFinishReason = false;
+  const retryCalls: ToolCallAcc = new Map();
+  /**
+   * Forward ONLY `data:` lines, each re-framed with its own blank separator. Every
+   * other line of the retry stream is DROPPED rather than spliced into the original
+   * turn. The cosmetic half is the blank separator that used to trail the swallowed
+   * `[DONE]`, leaving a stray empty line ahead of the fail-open terminal. The
+   * non-cosmetic half is the SSE `event:` field: it is STICKY — it names the type of
+   * the NEXT dispatched event, and on the fail-open path that next event is the
+   * guard's OWN terminal chunk. A retry that died after writing `event: error` would
+   * therefore re-label the original terminal as an error event, and `id:` fields would
+   * likewise rewrite the client's Last-Event-ID from a stream it is not reading.
+   * Neither is ours to relay: the retry is spliced INTO another turn, not proxied.
+   * Re-framing also guarantees a clean frame boundary for the synthesised terminal
+   * below (the payload string itself is never re-serialised, so no JSON round-trip).
+   * Known limitation: a multi-line `data:` event would be split into one event per
+   * line. No LLM upstream emits those, and `handleLine` cannot parse them either.
+   */
   const forwardLine = (line: string): void => {
     const trimmed = line.trimStart();
-    if (trimmed.startsWith("data:")) {
-      const payload = trimmed.slice("data:".length).trim();
-      if (payload === "[DONE]") return; // the caller closes the stream itself
-      if (payload.length > 0) forwarded += 1;
-    }
-    controller.enqueue(encoder.encode(line + "\n"));
+    if (!trimmed.startsWith("data:")) return;
+    const payload = trimmed.slice("data:".length).trim();
+    if (payload === "[DONE]") return; // the caller closes the stream itself
+    if (payload.length === 0) return;
+    // Classify BEFORE enqueueing — the order is the point. While the line went out
+    // first, a chunk carrying ONLY a terminal had to be counted as a replacement turn
+    // (otherwise failing open would put a SECOND finish_reason on the wire), which
+    // meant a retry answering with nothing but `finish_reason:"tool_calls"` suppressed
+    // the held original terminal and delivered an EMPTY tool turn: no call to run, no
+    // prose — precisely the actionless terminal this guard exists to eliminate.
+    // Deciding first lets a bare terminal be DROPPED instead: not forwarded, not
+    // counted, so no double-terminal is possible and the fail-open path takes over.
+    // A terminal that FOLLOWS real content is still forwarded and still latches
+    // `sawFinishReason` — that one is the retry's honest end, not an empty turn.
+    const signal = classifyRecoveryChunk(payload, retryCalls);
+    if (!signal.substantive && !(signal.terminal && forwarded > 0)) return;
+    if (signal.substantive) forwarded += 1;
+    if (signal.terminal) sawFinishReason = true;
+    controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
+  };
+  /**
+   * The retry delivered a usable turn but never a terminal chunk — it was cut, or the
+   * upstream simply closed without one. Closing on a bare `[DONE]` here would hand the
+   * client a turn with no finish_reason at all, which is exactly the hole this whole
+   * function's return value is supposed to cover, so synthesise one. The VALUE is
+   * evidence-driven, not a blanket `"length"`:
+   *   - the retry forwarded tool-call fragments that assemble into a runnable call →
+   *     `"tool_calls"`. The client holds a complete, executable call; that IS why the
+   *     turn ended, and `"length"` would be the lie.
+   *   - fragments that do NOT assemble (truncated args, or no name) → `"length"`. The
+   *     client holds broken JSON; `"tool_calls"` would order it to execute garbage,
+   *     while `"length"` → Anthropic `max_tokens` prompts a clean re-ask.
+   *   - no fragments, stream ERRORED mid-flight → `"length"`. Demonstrably a cut.
+   *   - no fragments, stream ended CLEANLY without a terminal → `"stop"`. This is the
+   *     one case with no strictly honest answer: a clean EOF is ambiguous between a
+   *     sloppy upstream that never emits finish_reason and an intermediary that closed
+   *     tidily on a truncated turn. `"stop"` is chosen because the content was fully
+   *     forwarded and nothing reported an error; `"length"` would make every turn from
+   *     such an upstream look truncated and drive endless auto-continuation.
+   */
+  const synthesiseTerminal = (cut: boolean): void => {
+    const calls = buildAssembledCalls(retryCalls);
+    const finish =
+      calls !== undefined ? (assembledCallsRunnable(calls) ? "tool_calls" : "length") : cut ? "length" : "stop";
+    const chunk = { choices: [{ index: 0, delta: {}, finish_reason: finish }] };
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+    ctx.logger.warn(
+      { stage: "single", model: target, finish_reason: finish, cut },
+      "single: streaming recovery retry ended without a terminal; synthesised one",
+    );
   };
   try {
     for (;;) {
@@ -298,7 +408,9 @@ async function streamRetryToolTurn(
       { stage: "single", model: target, forwarded, err: err instanceof Error ? err.message : String(err) },
       "single: streaming recovery retry broke mid-stream",
     );
-    return forwarded > 0;
+    if (forwarded === 0) return false;
+    if (!sawFinishReason) synthesiseTerminal(true);
+    return true;
   }
   ctx.logger.info(
     { stage: "single", model: target, reason, forwarded },
@@ -306,7 +418,9 @@ async function streamRetryToolTurn(
       ? "single: streaming recovery retry forwarded a replacement turn"
       : "single: streaming recovery retry produced no chunks; delivering the original",
   );
-  return forwarded > 0;
+  if (forwarded === 0) return false;
+  if (!sawFinishReason) synthesiseTerminal(false);
+  return true;
 }
 
 
@@ -344,6 +458,107 @@ const StreamChunkSchema = z
   })
   .passthrough();
 
+/** Index-keyed accumulator for streamed tool-call fragments. */
+type ToolCallAcc = Map<number, { id?: string; name?: string; args: string }>;
+
+const ToolCallDeltaSchema = z
+  .object({
+    index: z.number().optional(),
+    id: z.string().optional(),
+    function: z.object({ name: z.string().optional(), arguments: z.string().optional() }).passthrough().optional(),
+  })
+  .passthrough();
+
+/** Fold one `delta.tool_calls[]` entry into the accumulator, keyed by its index. */
+function accumulateToolCallDelta(acc: ToolCallAcc, tc: unknown): void {
+  const parsed = ToolCallDeltaSchema.safeParse(tc);
+  if (!parsed.success) return;
+  const idx = typeof parsed.data.index === "number" ? parsed.data.index : 0;
+  const cur = acc.get(idx) ?? { args: "" };
+  if (parsed.data.id) cur.id = parsed.data.id;
+  if (parsed.data.function?.name) cur.name = parsed.data.function.name;
+  if (typeof parsed.data.function?.arguments === "string") cur.args += parsed.data.function.arguments;
+  acc.set(idx, cur);
+}
+
+/**
+ * Message-shaped view of an accumulator's tool call(s) (`{id,type,function}`), or
+ * undefined when none were accumulated. Used to judge completeness via
+ * `toolCallArgsBroken` / `assembledCallsRunnable` before deciding whether to emit
+ * the assembled call, recover, or (on the retry path) what terminal is honest.
+ */
+function buildAssembledCalls(
+  acc: ToolCallAcc,
+): { id?: string; type: string; function: { name?: string; arguments: string } }[] | undefined {
+  if (acc.size === 0) return undefined;
+  return [...acc.values()].map((c) => ({
+    id: c.id,
+    type: "function",
+    function: { name: c.name, arguments: c.args },
+  }));
+}
+
+/**
+ * STRICT runnability check for the mid-flight-cut SALVAGE path only. On a cut
+ * (no finish_reason) we cannot tell an empty-arguments no-arg tool call from a
+ * call truncated BEFORE its arguments began — so, unlike `toolCallArgsBroken`
+ * (which ignores empty args, correct for a CLEAN finish where empty means a
+ * no-arg tool), salvage requires every call to have a name AND non-empty
+ * arguments that parse as JSON. Anything short of that recovers instead — the
+ * safe choice, since re-asking yields a clean call rather than executing a tool
+ * with empty/partial input.
+ */
+function assembledCallsRunnable(calls: { function: { name?: string; arguments: string } }[]): boolean {
+  return (
+    calls.length > 0 &&
+    calls.every((c) => {
+      if (!c.function.name?.trim() || c.function.arguments.length === 0) return false;
+      return isJsonObjectString(c.function.arguments);
+    })
+  );
+}
+
+/**
+ * Judge ONE recovery chunk: does it carry a replacement TURN, and does it carry a
+ * TERMINAL? `forwarded > 0` is what tells the caller to SUPPRESS the held original
+ * terminal, so the bar has to be "the client received something it can use", not
+ * merely "some bytes arrived". Two shapes cleared the old `payload.length > 0` bar
+ * while delivering nothing usable:
+ *   - `{"choices":[{"delta":{"role":"assistant"}}]}` — the opener nearly every
+ *     upstream sends first. A retry that dies immediately after it reached the catch
+ *     branch's `return forwarded > 0` and reported success.
+ *   - `{"error":{...}}` on a 200 response — Ollama, vLLM and OpenRouter all signal
+ *     mid-stream failure this way, so the `status >= 400` check never sees it.
+ * Either one suppressed the original terminal and left the turn with NO
+ * finish_reason at all (`stop_reason: null` once src/anthropic.ts translates it).
+ * A terminal-only chunk is NOT substantive: an empty `finish_reason` chunk is an empty
+ * turn, and `forwardLine` drops it before it reaches the wire (see the ordering note
+ * there) rather than letting it suppress the held original terminal.
+ * Tool-call fragments are accumulated here as a side effect, because the terminal
+ * synthesised below depends on whether they assemble into a runnable call.
+ */
+function classifyRecoveryChunk(payload: string, acc: ToolCallAcc): { substantive: boolean; terminal: boolean } {
+  let obj: unknown;
+  try {
+    obj = JSON.parse(payload);
+  } catch {
+    return { substantive: false, terminal: false };
+  }
+  const parsed = StreamChunkSchema.safeParse(obj);
+  if (!parsed.success) return { substantive: false, terminal: false };
+  const choice = parsed.data.choices?.[0];
+  if (choice === undefined) return { substantive: false, terminal: false };
+  const delta = choice.delta;
+  const nonEmpty = (v: string | null | undefined): boolean => typeof v === "string" && v.length > 0;
+  let substantive = nonEmpty(delta?.content) || nonEmpty(delta?.reasoning) || nonEmpty(delta?.reasoning_content);
+  if (Array.isArray(delta?.tool_calls) && delta.tool_calls.length > 0) {
+    substantive = true;
+    for (const tc of delta.tool_calls) accumulateToolCallDelta(acc, tc);
+  }
+  const terminal = choice.finish_reason !== null && choice.finish_reason !== undefined;
+  return { substantive, terminal };
+}
+
 /**
  * Deep-clone an SSE chunk with any `delta.tool_calls` removed. Option B withholds
  * tool-call fragments from the live stream and re-emits ONE assembled call at the
@@ -374,13 +589,20 @@ function stripToolCallsFromChunk(chunk: unknown): unknown {
  * that is not a parseable `data: ` chunk is returned unchanged.
  */
 function markTerminalLengthCut(line: string): string {
-  // `data:` with the space OPTIONAL, matching handleLine's own parse: the terminal
-  // handed to us is the RAW upstream line whenever that chunk carried no tool_call
-  // fragments of its own, so a stricter prefix would silently skip the rewrite on
-  // any upstream that emits `data:{...}`.
-  if (!line.startsWith("data:")) return line;
+  // Parse EXACTLY as handleLine does: `line.trimStart()`, then `data:` with the
+  // space OPTIONAL, then `.trim()` on the payload. The terminal handed to us is the
+  // RAW upstream line whenever that chunk carried no tool_call fragments of its own,
+  // so ANY divergence from handleLine silently skips the rewrite on a line handleLine
+  // already accepted — and the client gets `finish_reason:"tool_calls"` for a call
+  // that was dropped. Two divergences existed: the missing `trimStart()`, and the
+  // missing payload `.trim()`. The latter is NOT redundant with JSON.parse's own
+  // whitespace tolerance: JSON.parse accepts only space/tab/CR/LF, while
+  // String.prototype.trim also strips U+00A0, U+FEFF, U+2028 and the rest of the
+  // Unicode WhiteSpace set, so a payload handleLine parsed happily would throw here.
+  const trimmed = line.trimStart();
+  if (!trimmed.startsWith("data:")) return line;
   try {
-    const obj = JSON.parse(line.slice("data:".length));
+    const obj = JSON.parse(trimmed.slice("data:".length).trim());
     const choice = Array.isArray(obj?.choices) ? obj.choices[0] : undefined;
     if (!choice || typeof choice !== "object") return line;
     // ONLY `tool_calls` is the lie worth correcting. A turn that already ended on
@@ -429,9 +651,47 @@ export function makeToolTurnGuardStream(
   // Streaming tool-call arguments arrive in fragments across chunks (standard
   // OpenAI streaming); accumulate per index so the terminal check can judge the
   // ASSEMBLED arguments for truncation (the length-cut broken-JSON case).
-  const toolCallAcc = new Map<number, { id?: string; name?: string; args: string }>();
+  const toolCallAcc: ToolCallAcc = new Map();
   let terminalFinishReason: string | null = null;
   let terminalLine: string | null = null;
+  /**
+   * Latched on the first parsed chunk of a MULTI-CHOICE stream (`n > 1`). `n` reaches
+   * the upstream verbatim (ChatCompletionRequestSchema is `.passthrough()` and
+   * single.ts forwards the request body), so a multi-choice stream is reachable — and
+   * every part of this guard's state machine is single-choice: one `toolCallAcc`, one
+   * `terminalLine`, one `content`/`reasoning` pair, and `stripToolCallsFromChunk` /
+   * `markTerminalLengthCut` both look at `choices[0]` only. Half-applying it produced
+   * strictly WRONG output, not merely incomplete: a terminal rewritten for choice 0
+   * while choice 1 kept `finish_reason:"tool_calls"` (one chunk saying both that a call
+   * is coming and that it is not), and a `choices[1]` tool-call fragment forwarded LIVE
+   * at `index: 0`, which is exactly the option-B corruption the guard exists to prevent.
+   * So: latch, and become a pure passthrough for the rest of the stream. Extending the
+   * state machine per choice is a feature, not a fix — no client of this proxy sends
+   * `n > 1` today, and an untested per-choice machine is a worse bet than none.
+   */
+  const requestedChoices = ((): number => {
+    const n = originalBody.n;
+    if (typeof n === "number") return n;
+    if (typeof n === "string" && n.trim().length > 0) return Number(n);
+    return 1;
+  })();
+  /**
+   * Latched from the REQUEST, before a single byte of the response is seen. Sniffing
+   * the response cannot work on the standard wire format: an OpenAI-compatible n>1
+   * stream sends ONE CHOICE PER CHUNK, so `choices.length > 1` never fires and the
+   * first chunk is an ordinary `index: 0` — indistinguishable from n=1. The guard
+   * would therefore treat choice 0 as a single-choice turn and WITHHOLD its tool-call
+   * fragments (option B), then latch on the first `index: 1` chunk, at which point
+   * `finishNormally`'s multi-choice early-out emits `[DONE]` and the withheld call is
+   * lost outright. `n` is in the body the client sent us, so ask it there instead.
+   */
+  let multiChoice = Number.isFinite(requestedChoices) && requestedChoices > 1;
+  if (multiChoice) {
+    ctx.logger.warn(
+      { stage: "single", model: target, n: requestedChoices },
+      "single: multi-choice request (n>1); tool-turn guard disabled for this turn",
+    );
+  }
 
   /**
    * True when nothing that COMMITS THE CLIENT to this turn has reached it yet —
@@ -445,76 +705,20 @@ export function makeToolTurnGuardStream(
    */
   const nothingReachedClient = (): boolean => content === "" && reasoning === "";
 
-  const ToolCallDeltaSchema = z
-    .object({
-      index: z.number().optional(),
-      id: z.string().optional(),
-      function: z.object({ name: z.string().optional(), arguments: z.string().optional() }).passthrough().optional(),
-    })
-    .passthrough();
-
-  const accumulateToolCallDelta = (tc: unknown): void => {
-    const parsed = ToolCallDeltaSchema.safeParse(tc);
-    if (!parsed.success) return;
-    const idx = typeof parsed.data.index === "number" ? parsed.data.index : 0;
-    const cur = toolCallAcc.get(idx) ?? { args: "" };
-    if (parsed.data.id) cur.id = parsed.data.id;
-    if (parsed.data.function?.name) cur.name = parsed.data.function.name;
-    if (typeof parsed.data.function?.arguments === "string") cur.args += parsed.data.function.arguments;
-    toolCallAcc.set(idx, cur);
-  };
-
-  /**
-   * Message-shaped view of the buffered tool call(s) (`{id,type,function}`), or
-   * undefined when none were buffered. Used to judge completeness via
-   * `toolCallArgsBroken` / `detectIncompleteToolTurn` before deciding whether to
-   * emit the assembled call or recover.
-   */
-  const buildAssembledCalls = ():
-    | { id?: string; type: string; function: { name?: string; arguments: string } }[]
-    | undefined =>
-    toolCallAcc.size > 0
-      ? [...toolCallAcc.values()].map((c) => ({
-          id: c.id,
-          type: "function",
-          function: { name: c.name, arguments: c.args },
-        }))
-      : undefined;
-
-  /**
-   * STRICT runnability check for the mid-flight-cut SALVAGE path only. On a cut
-   * (no finish_reason) we cannot tell an empty-arguments no-arg tool call from a
-   * call truncated BEFORE its arguments began — so, unlike `toolCallArgsBroken`
-   * (which ignores empty args, correct for a CLEAN finish where empty means a
-   * no-arg tool), salvage requires every call to have a name AND non-empty
-   * arguments that parse as JSON. Anything short of that recovers instead — the
-   * safe choice, since re-asking yields a clean call rather than executing a tool
-   * with empty/partial input.
-   */
-  const assembledCallsRunnable = (
-    calls: { function: { name?: string; arguments: string } }[],
-  ): boolean =>
-    calls.length > 0 &&
-    calls.every((c) => {
-      if (!c.function.name || c.function.arguments.length === 0) return false;
-      return isJsonObjectString(c.function.arguments);
-    });
-
   /**
    * Emittability check for a CLEAN terminal/end (finishNormally / reconcile). Looser
    * than `assembledCallsRunnable`: an empty-arguments call is fine here (a genuinely
    * finished no-arg tool sends `arguments: ""`), but a call is NOT emittable if it
    * lacks a name or carries non-empty arguments that are not a JSON object — those go to
-   * recovery. Complements `detectIncompleteToolTurn`, which only inspects broken
-   * args for `finish_reason:"length"`; this catches a broken/nameless call under
-   * ANY finish reason (e.g. a truncated `finish_reason:"tool_calls"`).
+   * recovery. Also the emit-time gate on the fail-open path, where it decides whether
+   * the buffered call is handed to the client or dropped and the terminal rewritten.
    */
   const assembledCallsEmittable = (
     calls: { function: { name?: string; arguments: string } }[],
   ): boolean =>
     calls.length > 0 &&
     calls.every((c) => {
-      if (!c.function.name) return false;
+      if (!c.function.name?.trim()) return false; // whitespace-only is as undispatchable as absent
       if (c.function.arguments.length === 0) return true; // no-arg tool on a clean finish
       return isJsonObjectString(c.function.arguments);
     });
@@ -540,11 +744,31 @@ export function makeToolTurnGuardStream(
     return true;
   };
 
+  /**
+   * Hand back whatever option B was holding when the multi-choice latch fires LATE
+   * (an upstream that returns n>1 the client did not ask for). Passthrough starts
+   * from the next line, so anything still buffered — assembled tool calls, a held
+   * choice-0 terminal — has to go out now or it never does.
+   */
+  const flushHeldStateForLateMultiChoice = (controller: SseSink): void => {
+    emitAssembledToolCalls(controller);
+    toolCallAcc.clear();
+    if (terminalLine !== null) {
+      controller.enqueue(encoder.encode(terminalLine + "\n\n"));
+      terminalLine = null;
+      terminalFinishReason = null;
+    }
+  };
+
   const handleLine = (line: string, controller: SseSink): void => {
-    if (terminalLine !== null) return; // holding everything after the terminal chunk (incl. [DONE])
+    // Holding everything after the terminal chunk (incl. [DONE]) — but the multi-choice
+    // DETECTOR below still gets to see these lines. On a sequential n>1 stream choice
+    // 0's terminal arrives before choice 1's first chunk, so returning here first would
+    // silently discard every later choice instead of latching into passthrough.
+    const held = terminalLine !== null;
     const trimmed = line.trimStart();
     if (!trimmed.startsWith("data:")) {
-      controller.enqueue(encoder.encode(line + "\n"));
+      if (!held) controller.enqueue(encoder.encode(line + "\n"));
       return;
     }
     const payload = trimmed.slice("data:".length).trim();
@@ -556,22 +780,53 @@ export function makeToolTurnGuardStream(
     // normalize it, but the guard's own framing must be canonical regardless.
     if (payload === "[DONE]") return;
     if (payload.length === 0) {
-      controller.enqueue(encoder.encode(line + "\n"));
+      if (!held) controller.enqueue(encoder.encode(line + "\n"));
       return;
     }
     let obj: unknown;
     try {
       obj = JSON.parse(payload);
     } catch {
-      controller.enqueue(encoder.encode(line + "\n"));
+      if (!held) controller.enqueue(encoder.encode(line + "\n"));
       return;
     }
     const parsed = StreamChunkSchema.safeParse(obj);
     if (!parsed.success) {
+      if (!held) controller.enqueue(encoder.encode(line + "\n"));
+      return;
+    }
+    const choices = parsed.data.choices;
+    if (!multiChoice && choices !== undefined && choices.length > 0) {
+      // Secondary net only — `n` from the request is the primary latch. It catches an
+      // upstream that returns n>1 unasked, and it cannot fire before the first `index`
+      // that is not 0, which on a sequential stream is chunk 2 at the earliest.
+      // `index` must be compared NUMERICALLY but not TYPE-strictly: a single-choice
+      // stream may omit it entirely (Ollama, llama.cpp) and `undefined !== 0` would
+      // latch every such stream into passthrough, disabling the guard everywhere;
+      // meanwhile an upstream serialising it as the STRING "1" would slip past
+      // `typeof === "number"` and leave the guard on for a real multi-choice stream.
+      // A non-numeric string yields NaN, which is `!== 0` — latching off is the
+      // conservative reading of an `index` we cannot interpret.
+      const firstIndex = choices[0]?.index;
+      const firstIndexIsNonZero =
+        typeof firstIndex === "number"
+          ? firstIndex !== 0
+          : typeof firstIndex === "string" && firstIndex.trim().length > 0 && Number(firstIndex) !== 0;
+      multiChoice = choices.length > 1 || firstIndexIsNonZero;
+      if (multiChoice) {
+        ctx.logger.warn(
+          { stage: "single", model: target, choices: choices.length, index: firstIndex },
+          "single: multi-choice stream (n>1) not declared by the request; tool-turn guard disabled",
+        );
+        flushHeldStateForLateMultiChoice(controller);
+      }
+    }
+    if (multiChoice) {
       controller.enqueue(encoder.encode(line + "\n"));
       return;
     }
-    const choice = parsed.data.choices?.[0];
+    if (held) return;
+    const choice = choices?.[0];
     const delta = choice?.delta;
     let hadToolCalls = false;
     let hadVisibleText = false;
@@ -590,7 +845,7 @@ export function makeToolTurnGuardStream(
       }
       if (Array.isArray(delta.tool_calls)) {
         hadToolCalls = true;
-        for (const tc of delta.tool_calls) accumulateToolCallDelta(tc);
+        for (const tc of delta.tool_calls) accumulateToolCallDelta(toolCallAcc, tc);
       }
     }
     if (choice?.finish_reason != null) {
@@ -635,7 +890,7 @@ export function makeToolTurnGuardStream(
    * Does NOT close the stream (the caller owns that). `terminal` is the held line.
    */
   const reconcileTerminalTurn = async (controller: SseSink, terminal: string): Promise<void> => {
-    const assembledCalls = buildAssembledCalls();
+    const assembledCalls = buildAssembledCalls(toolCallAcc);
     const reconstructed = {
       choices: [
         {
@@ -646,9 +901,13 @@ export function makeToolTurnGuardStream(
     };
     const incomplete =
       detectIncompleteToolTurn(reconstructed) ??
-      // detectIncompleteToolTurn only inspects broken args for finish_reason
-      // "length"; a truncated/nameless call under any OTHER finish (e.g.
-      // "tool_calls") would otherwise be emitted as runnable. Catch it here.
+      // Belt-and-braces. `detectIncompleteToolTurn` now judges runnability under every
+      // finish_reason (it used to only do so for "length"), so this arm is not known to
+      // be reachable — the two checks differ only in that `assembledCallsEmittable`
+      // additionally rejects non-object JSON arguments, which `toolCallArgsBroken`
+      // already covers. Kept because the two predicates are maintained separately and
+      // the failure it guards against — shipping a nameless call as runnable — is worse
+      // than a redundant test.
       (assembledCalls && !assembledCallsEmittable(assembledCalls) ? ("broken_tool_call" as const) : null);
     // Terminal-state instrumentation: one line per tool-carrying stream, so a
     // real-session stall is diagnosable from the log alone (finish_reason,
@@ -684,7 +943,19 @@ export function makeToolTurnGuardStream(
     // broken or absent — do NOT emit it. Because nothing was forwarded for the
     // tool call, the recovery splices a FRESH call and the client sees only the
     // clean recovered arguments (no concatenation) — this PRESERVES recovery.
-    const recovered = await runStreamingRecoveryWithKeepalive(ctx, resilience, target, originalBody, incomplete, controller, encoder);
+    // A refusal is not a malfunction to retry — see NO_RETRY_FINISH_REASONS. Skipping
+    // straight to the fail-open path keeps the turn honest (unrunnable call dropped,
+    // `content_filter` terminal preserved) without re-running the filtered turn.
+    const retryBlocked = terminalFinishReason !== null && NO_RETRY_FINISH_REASONS.has(terminalFinishReason);
+    if (retryBlocked) {
+      ctx.logger.warn(
+        { stage: "single", model: target, finish_reason: terminalFinishReason, incomplete },
+        "single: unrunnable tool turn under a no-retry finish_reason; dropping the call without a retry",
+      );
+    }
+    const recovered = retryBlocked
+      ? false
+      : await runStreamingRecoveryWithKeepalive(ctx, resilience, target, originalBody, incomplete, controller, encoder);
     if (!recovered) {
       // Fail open: the retry never reached the client — deliver the original
       // terminal so the turn ends honestly (its finish_reason signals the cut).
@@ -706,7 +977,15 @@ export function makeToolTurnGuardStream(
   const finishNormally = async (controller: SseSink): Promise<void> => {
     buffer += decoder.decode();
     if (buffer.length > 0) handleLine(buffer, controller);
-    const assembledCalls = buildAssembledCalls();
+    if (multiChoice) {
+      // Passthrough stream: nothing was buffered or held, so there is nothing to
+      // reconcile. Without this the `terminalLine === null` branch below would read
+      // the empty accumulators as "the stream delivered nothing" and fire a billed
+      // recovery retry against a turn that completed perfectly.
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      return;
+    }
+    const assembledCalls = buildAssembledCalls(toolCallAcc);
     if (terminalLine === null) {
       // Stream ENDED (cleanly) with no finish_reason chunk.
       if (assembledCalls && assembledCallsEmittable(assembledCalls)) {
@@ -779,6 +1058,13 @@ export function makeToolTurnGuardStream(
       controller.close(); // the CLIENT is gone — nobody to recover for
       return;
     }
+    if (multiChoice) {
+      // Passthrough stream: every byte the upstream produced was already forwarded, so
+      // the client is committed and a spliced replacement would duplicate it. Same
+      // honest-failure semantics as the committed-content case at the bottom.
+      controller.error(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
     if (terminalLine !== null) {
       // Cut happened after the terminal chunk was already held back: the turn is a
       // normal finish that merely lost its trailing [DONE] to a late upstream error.
@@ -795,7 +1081,7 @@ export function makeToolTurnGuardStream(
     // complete-call path, and covers the mixed content+complete-call case too
     // (which would otherwise error after forwarding content). Only a BROKEN/absent
     // buffered call falls through to recovery / honest error below.
-    const assembledCalls = buildAssembledCalls();
+    const assembledCalls = buildAssembledCalls(toolCallAcc);
     if (assembledCalls && assembledCallsRunnable(assembledCalls)) {
       emitAssembledToolCalls(controller);
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));

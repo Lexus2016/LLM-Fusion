@@ -659,6 +659,21 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(up.modelsCalled()).toEqual(["s"]);
   });
 
+  it("GAP(M4): propagates a NON-CircuitOpenError thrown by the fallback synth", async () => {
+    // The handoff's catch narrows on `instanceof CircuitOpenError` and rethrows
+    // everything else — but nothing exercised the rethrow, so `catch { }` (swallow
+    // ALL errors and quietly return the original access error) survives the suite.
+    // A fallback that dies on a socket error is NOT "lost the probe race"; hiding it
+    // behind the primary's 404 erases the only signal that the fallback is broken too.
+    const up = makeUpstream((body) => {
+      if (body.model === "s") return jsonResponse({ error: "model not found" }, 404);
+      throw new Error("fallback-boom");
+    });
+    await expect(
+      fusionStrategy.execute(ctx(up.client, req({ model: "fusion-bypass" }), "fusion-bypass")),
+    ).rejects.toThrow("fallback-boom");
+  });
+
   it("proceeds below min_panel_success when the shortfall is permanently-gated members (403/410)", async () => {
     const cfg = parseConfig({
       upstream: { base_url: "https://mock.test", api_key_env: "X" },
@@ -2159,6 +2174,125 @@ describe("fusion strategy — synth completeness guard", () => {
     expect(control.text).toContain('"cT"');
   });
 
+  it("GAP(M11): adopts a retry whose tool call genuinely takes NO arguments", async () => {
+    // `completionHasBrokenToolArgs` special-cases `arguments: ""` as a no-arg tool.
+    // Nothing locks that: deleting the `args.length === 0 ||` clause leaves the whole
+    // suite green while reintroducing the exact bug src/anthropic.ts documents —
+    // "treating a throw as truncation misreported every no-arg tool call".
+    let judgeFallbackCalls = 0;
+    const up = makeUpstream((body) => {
+      const nudged = systemContents(body).some((c) => c.includes("stopped while still planning"));
+      if (body.model === "j") {
+        if (!nudged) return jsonResponse(judgeOk);
+        judgeFallbackCalls += 1;
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                content: "",
+                tool_calls: [{ id: "cF", type: "function", function: { name: "list_files", arguments: '{"dir":"."}' } }],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        });
+      }
+      if (body.model === "s") {
+        if (nudged) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  content: "",
+                  tool_calls: [{ id: "cN", type: "function", function: { name: "list_files", arguments: "" } }],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+        return jsonResponse({ choices: [{ message: { content: "" }, finish_reason: "stop" }] });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ tools: TOOLS })));
+    const text = await res.text();
+    expect(judgeFallbackCalls).toBe(0); // the no-arg retry IS runnable; no fallback needed
+    expect(text).toContain('"cN"');
+  });
+
+  it("GAP(M2): a CUT stream never releases a scalar-argument tool call as runnable", async () => {
+    // terminalLine === null path. The `runnable` gate asks isJsonObjectString; swapping
+    // it back for a bare JSON.parse leaves the suite green while shipping the client a
+    // tool call whose `arguments` decode to `5` — not a parameter object, not runnable.
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        if (systemContents(body).some((c) => c.includes("stopped while still planning"))) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  content: "",
+                  tool_calls: [{ id: "c9", type: "function", function: { name: "write_file", arguments: '{"path":"ok.py"}' } }],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+        // Scalar arguments AND no finish_reason chunk.
+        return sseResponse([
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "write_file", arguments: "5" } }] } }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    expect(synthCalls).toBe(2); // routed to recovery, not released
+    expect(assembledToolArgs(text)).toEqual(['{"path":"ok.py"}']);
+  });
+
+  it("GAP(M3): a TERMINATED stream never delivers a scalar-argument tool call", async () => {
+    // terminalLine !== null path. `brokenArgs` is the only thing that flags a scalar
+    // here (finish_reason is "tool_calls", so lengthCutMidToolCall abstains); with a
+    // bare JSON.parse it flags nothing and the unrunnable call is passed straight
+    // through with a tool_calls finish — the whole suite stays green.
+    let synthCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "j") return jsonResponse(judgeOk);
+      if (body.model === "s") {
+        synthCalls += 1;
+        if (systemContents(body).some((c) => c.includes("stopped while still planning"))) {
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  content: "",
+                  tool_calls: [{ id: "c9", type: "function", function: { name: "write_file", arguments: '{"path":"ok.py"}' } }],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+        return sseResponse([
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "write_file", arguments: "[1,2]" } }] } }] },
+          { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+        ]);
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ stream: true, tools: TOOLS })));
+    const text = await res.text();
+    expect(synthCalls).toBe(2); // routed to recovery
+    expect(text).not.toContain("[1,2]");
+    expect(assembledToolArgs(text)).toEqual(['{"path":"ok.py"}']);
+  });
+
   it("streaming: emits SSE keepalive comments while the recovery retry runs", async () => {
     // The recovery retry runs synchronously inside the stream's flush — during
     // it the client would otherwise see total silence and can time out. SSE
@@ -2569,6 +2703,10 @@ describe("fusion strategy — bounded judge input", () => {
   const MIDDLE_OMISSION = /\n…\[(\d+) chars omitted from the middle of the conversation\]…\n/;
   /** A high or low surrogate without its partner: the mojibake this render must never contain. */
   const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  const PANEL_MSG_HEAD = 6000;
+  const PANEL_MSG_TAIL = 2000;
+  const isHigh = (u: number): boolean => u >= 0xd800 && u <= 0xdbff;
+  const isLow = (u: number): boolean => u >= 0xdc00 && u <= 0xdfff;
 
   /**
    * The rendered request alone. The judge's user message wraps it in
@@ -2852,6 +2990,76 @@ describe("fusion strategy — bounded judge input", () => {
     expect(panelInput).not.toContain("chars omitted");
   });
 
+  /**
+   * `…[N chars omitted]…` is user-visible text, and the surrogate nudge changes how
+   * many characters are actually dropped. Pull the three parts back out so a test can
+   * assert the number still reconstructs the original length exactly.
+   */
+  const PER_MESSAGE_OMISSION = /^([\s\S]*)\n…\[(\d+) chars omitted\]…\n([\s\S]*)$/;
+  const splitCapped = (capped: string): { head: string; omitted: number; tail: string } => {
+    const m = PER_MESSAGE_OMISSION.exec(capped);
+    expect(m).not.toBeNull();
+    return { head: m![1]!, omitted: Number(m![2]!), tail: m![3]! };
+  };
+
+  it("the per-message cap does not cut through a UTF-16 surrogate pair (judge render)", async () => {
+    // Same function, the OTHER cut site. The ceiling nudges its slice boundaries off a
+    // surrogate pair; `capPanelMessageContent`, which this render calls on EVERY message
+    // once the conversation crosses PANEL_MAX_CHARS, used to slice at a fixed 6000/-2000
+    // offset with no such guard. So in exactly the large-context case the ceiling exists
+    // for, the render arrived already split and the emoji on the boundary reached the
+    // judge as the mojibake the ceiling's own comment says it must never produce.
+    const content = `${"X".repeat(5999)}${"\u{1F642}".repeat(100_500)}`;
+    expect(content.length).toBeGreaterThan(200_000); // -> capPerMessage = true
+    const at = content.charCodeAt(5999); // offset 6000 lands mid-astral-character
+    expect(at >= 0xd800 && at <= 0xdbff).toBe(true);
+
+    const messages: ChatCompletionRequest["messages"] = [{ role: "user", content }];
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req({ messages })));
+    expect(res.status).toBe(200);
+
+    const render = judgeRender(up.recorded.find((b) => b.model === "j")!);
+    expect(render).toContain("chars omitted"); // the per-message cap did fire
+    expect(LONE_SURROGATE.test(render)).toBe(false);
+  });
+
+  it("the per-message cap does not cut a surrogate pair on the PANEL path either", async () => {
+    // The same helper feeds compressPanelMessages, so the corruption reached every panel
+    // member too — measured, not inferred. The trailing "Y" makes the TAIL boundary land
+    // on a low surrogate as well, so both slices have to nudge in the same fixture.
+    const content = `${"X".repeat(5999)}${"\u{1F642}".repeat(100_500)}Y`;
+    expect(content.length).toBe(207_000);
+    expect(isHigh(content.charCodeAt(5999))).toBe(true); // head boundary: mid-pair
+    expect(isLow(content.charCodeAt(content.length - 2000))).toBe(true); // tail boundary: mid-pair
+
+    const messages: ChatCompletionRequest["messages"] = [{ role: "user", content }];
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req({ messages })));
+    expect(res.status).toBe(200);
+
+    const panelInput = userContents(up.recorded.find((b) => b.model === "m1")!).join("\n");
+    expect(LONE_SURROGATE.test(panelInput)).toBe(false);
+
+    // Both boundaries nudged inward by one code unit: 6000 -> 5999, 2000 -> 1999.
+    const { head, omitted, tail } = splitCapped(panelInput);
+    expect(head.length).toBe(5999);
+    expect(tail.length).toBe(1999);
+    // `…[N chars omitted]…` is user-visible, so N must be what was ACTUALLY dropped.
+    // Nudging the boundaries without re-deriving N (i.e. keeping the old fixed
+    // `length - PANEL_MSG_HEAD - PANEL_MSG_TAIL`) would report 199 000 here while
+    // 199 002 characters are really gone.
+    expect(omitted).toBe(199_002);
+    expect(content.length - PANEL_MSG_HEAD - PANEL_MSG_TAIL).toBe(199_000); // the naive number
+    expect(head.length + omitted + tail.length).toBe(content.length);
+    // And the kept text is still the real head and the real tail of the message.
+    expect(head).toBe(content.slice(0, 5999));
+    expect(tail).toBe(content.slice(content.length - 1999));
+
+    // The judge sees the same capped content, equally well-formed.
+    expect(LONE_SURROGATE.test(judgeRender(up.recorded.find((b) => b.model === "j")!))).toBe(false);
+  });
+
   it("leaves a short conversation verbatim (no marker, no loss)", async () => {
     const up = makeUpstream(defaultChat(true));
     const res = await fusionStrategy.execute(
@@ -2861,6 +3069,164 @@ describe("fusion strategy — bounded judge input", () => {
     const judgeInput = userContents(up.recorded.find((b) => b.model === "j")!).join("\n");
     expect(judgeInput).toContain("user: explain redis EVAL");
     expect(judgeInput).not.toContain("omitted");
+  });
+});
+
+describe("fusion strategy — bounded judge panel answers", () => {
+  /** The EXPERT ANSWERS ceiling from src/strategies/fusion.ts, restated so a test can pin it. */
+  const JUDGE_PANEL_MAX_CHARS = 120_000;
+  const EXPERT_OMISSION = /\n…\[(\d+) chars omitted from the middle of this expert's answer\]…\n/;
+
+  /**
+   * The EXPERT ANSWERS half of the judge's user message. Only this half is under
+   * JUDGE_PANEL_MAX_CHARS — the request half has its own, separate ceiling.
+   */
+  const judgeExperts = (body: RecordedBody): string => {
+    const text = userContents(body).join("\n");
+    const sep = "\n\nEXPERT ANSWERS:\n";
+    const at = text.indexOf(sep);
+    expect(at).toBeGreaterThan(0);
+    return text.slice(at + sep.length);
+  };
+
+  /** The body a panel member answers with: `size` filler chars, marked at both ends. */
+  const answer = (model: string, size: number): string => {
+    const tag = model.toUpperCase();
+    return `${tag}-HEAD${"z".repeat(size)}${tag}-TAIL`;
+  };
+
+  /** Panel members answer with `size` chars each, marked at both ends so loss is visible. */
+  const bigPanelChat = (size: number): ChatHandler => sizedPanelChat({ m1: size, m2: size, m3: size });
+
+  /** Panel members answer with PER-MODEL sizes — the unequal case even splitting starves. */
+  const sizedPanelChat = (sizes: Record<string, number>): ChatHandler => {
+    const base = defaultChat(true);
+    return (body, signal) => {
+      const size = sizes[body.model];
+      if (size === undefined) return base(body, signal);
+      return jsonResponse({ choices: [{ message: { content: answer(body.model, size) } }] });
+    };
+  };
+
+  /** Split a rendered EXPERT ANSWERS block into member -> excerpt. */
+  const expertSections = (experts: string): Map<string, string> => {
+    const out = new Map<string, string>();
+    const re = /--- Expert \d+ \(([^)]+)\) ---\n/g;
+    const hits = [...experts.matchAll(re)];
+    hits.forEach((h, k) => {
+      const start = h.index! + h[0].length;
+      const end = k + 1 < hits.length ? hits[k + 1]!.index! - 2 : experts.length; // -2 = "\n\n"
+      out.set(h[1]!, experts.slice(start, end));
+    });
+    return out;
+  };
+
+  it("bounds the EXPERT ANSWERS half of the judge call", async () => {
+    // `buildPanelBody` strips max_tokens, so nothing in this proxy caps a panel answer:
+    // the judge body grew as panel_size x answer_size while only the request half was
+    // bounded. Three 200k-char answers render at ~600k chars — ~150k tokens of body on
+    // top of a request half already at its own 120k ceiling, which overflows a 128k
+    // judge into the exact silent degrade JUDGE_REQUEST_MAX_CHARS exists to prevent.
+    const up = makeUpstream(bigPanelChat(200_000));
+    const res = await fusionStrategy.execute(ctxMinSuccess(up.client, req(), 3));
+    expect(res.status).toBe(200);
+
+    const experts = judgeExperts(up.recorded.find((b) => b.model === "j")!);
+    expect(experts.length).toBeLessThanOrEqual(JUDGE_PANEL_MAX_CHARS);
+    expect(experts).toMatch(EXPERT_OMISSION);
+
+    // Every expert is EXCERPTED, never dropped: a judge that silently never saw expert 3
+    // cannot report the disagreement expert 3 raised.
+    for (const m of ["m1", "m2", "m3"]) {
+      expect(experts).toContain(`(${m}) ---`);
+      expect(experts).toContain(`${m.toUpperCase()}-HEAD`);
+      expect(experts).toContain(`${m.toUpperCase()}-TAIL`);
+    }
+  });
+
+  it("leaves panel answers under the ceiling verbatim", async () => {
+    const up = makeUpstream(bigPanelChat(1000));
+    const res = await fusionStrategy.execute(ctxMinSuccess(up.client, req(), 3));
+    expect(res.status).toBe(200);
+
+    const experts = judgeExperts(up.recorded.find((b) => b.model === "j")!);
+    expect(experts).not.toMatch(EXPERT_OMISSION);
+    expect(experts).toContain(`M1-HEAD${"z".repeat(1000)}M1-TAIL`);
+  });
+
+  it("does NOT excerpt the panel answers handed to the synth", async () => {
+    // buildSynthContext is deliberately unbounded: the synth must keep the experts'
+    // actual artifacts (code, formulas, exact text). Only the judge view is capped.
+    const up = makeUpstream(bigPanelChat(200_000));
+    const res = await fusionStrategy.execute(ctxMinSuccess(up.client, req(), 3));
+    expect(res.status).toBe(200);
+
+    // buildSynthContext is appended as a SYSTEM message, not a user one.
+    const synthInput = systemContents(up.recorded.find((b) => b.model === "s")!).join("\n");
+    expect(synthInput).not.toMatch(EXPERT_OMISSION);
+    expect(synthInput).toContain(`M1-HEAD${"z".repeat(200_000)}M1-TAIL`);
+  });
+
+  it("water-fills the budget: one long answer is not starved by two short ones", async () => {
+    // An even budget/n split is a cap on each SHARE, not a division of the budget: the
+    // two 2k answers use 4k of their combined ~80k allowance and forfeit the rest, so
+    // the render lands at ~44k against a 120k ceiling while ~160k chars of the ONLY
+    // substantive answer are dropped. The ceiling still HOLDS under even splitting —
+    // this is the ceiling defeating its own purpose, which is why equal-length fixtures
+    // cannot see it: there, even splitting and water-filling agree exactly.
+    const up = makeUpstream(sizedPanelChat({ m1: 200_000, m2: 2_000, m3: 2_000 }));
+    const res = await fusionStrategy.execute(ctxMinSuccess(up.client, req(), 3));
+    expect(res.status).toBe(200);
+
+    const experts = judgeExperts(up.recorded.find((b) => b.model === "j")!);
+    expect(experts.length).toBeLessThanOrEqual(JUDGE_PANEL_MAX_CHARS);
+    // Even splitting renders ~44 074 chars here. Water-filling uses the budget.
+    expect(experts.length).toBeGreaterThan(119_800);
+
+    const sections = expertSections(experts);
+    expect([...sections.keys()].sort()).toEqual(["m1", "m2", "m3"]);
+    // The short answers are handed over WHOLE — they never needed their full share.
+    expect(sections.get("m2")).toBe(answer("m2", 2_000));
+    expect(sections.get("m3")).toBe(answer("m3", 2_000));
+    // The long one gets everything the short ones did not claim, not a flat third.
+    const long = sections.get("m1")!;
+    expect(long).toMatch(EXPERT_OMISSION);
+    expect(long.length).toBeGreaterThan(115_000);
+    expect(long).toContain("M1-HEAD");
+    expect(long).toContain("M1-TAIL");
+  });
+
+  it("holds the ceiling when the HEADERS alone overrun it", async () => {
+    // `panel` is z.array(z.string().min(1)).min(1) — no max count, no bound on a member
+    // name — so a single absurd model name drives the per-answer budget negative, and
+    // excerpting every answer to zero would STILL emit an over-ceiling header block.
+    const huge = "n".repeat(130_000);
+    const cfg = parseConfig({
+      upstream: { base_url: "https://mock.test", api_key_env: "X", max_concurrency: 4 },
+      models: { "fusion-1": { strategy: "fusion", panel: [huge], judge: "j", synth: "s" } },
+    });
+    const up = makeUpstream(sizedPanelChat({ [huge]: 5_000 }));
+    const entry = cfg.models["fusion-1"]!;
+    const capabilities = new CapabilityService({ client: up.client, getOverrides: () => cfg.overrides, logger });
+    const res = await fusionStrategy.execute({
+      request: req(),
+      config: cfg,
+      client: up.client,
+      capabilities,
+      logger,
+      modelConfig: entry,
+    });
+    expect(res.status).toBe(200);
+
+    const experts = judgeExperts(up.recorded.find((b) => b.model === "j")!);
+    expect(experts.length).toBeLessThanOrEqual(JUDGE_PANEL_MAX_CHARS);
+    // Degraded to a whole-block excerpt: the ceiling wins over the header block, and the
+    // cut still reports what it dropped.
+    expect(experts).toMatch(/\n…\[(\d+) chars omitted from the middle of the panel\]…\n/);
+    expect(experts.startsWith("--- Expert 1 (")).toBe(true);
+    // The synth is still handed the answer intact.
+    const synthInput = systemContents(up.recorded.find((b) => b.model === "s")!).join("\n");
+    expect(synthInput).toContain(answer(huge, 5_000));
   });
 });
 

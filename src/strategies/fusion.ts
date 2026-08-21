@@ -906,27 +906,83 @@ function approxTotalChars(msgs: unknown[]): number {
   return total;
 }
 
+const isHighSurrogate = (unit: number): boolean => unit >= 0xd800 && unit <= 0xdbff;
+const isLowSurrogate = (unit: number): boolean => unit >= 0xdc00 && unit <= 0xdfff;
+
+/**
+ * The first `n` UTF-16 code units of `s`, shortened by one when that boundary would
+ * cut a surrogate pair in half.
+ *
+ * A lone surrogate survives `JSON.stringify` as an escaped orphan (`\udXXX`) and
+ * decodes to U+FFFD on the far side, so an emoji or a CJK-extension glyph sitting on
+ * a slice boundary reaches the upstream model as mojibake. Nudging inward costs one
+ * character. The nudge cannot CREATE an orphan: a low surrogate at `n - 1` is either
+ * paired with `n - 2` (kept whole) or was already lone in the input.
+ *
+ * Scope, deliberately: this is surrogate-safe, NOT grapheme-safe. A combining mark, a
+ * ZWJ emoji sequence or a regional-indicator flag pair still splits at the boundary —
+ * that yields one visually broken cluster next to an explicit omission marker, not the
+ * JSON round-trip corruption a lone surrogate causes, so it is not worth a segmenter.
+ *
+ * Every truncation point that feeds an upstream prompt goes through this pair.
+ */
+function sliceHeadSafe(s: string, n: number): string {
+  if (n <= 0) return "";
+  if (n >= s.length) return s;
+  return s.slice(0, isHighSurrogate(s.charCodeAt(n - 1)) ? n - 1 : n);
+}
+
+/** The last `n` code units of `s`, shortened by one when that would cut a pair. */
+function sliceTailSafe(s: string, n: number): string {
+  if (n <= 0) return "";
+  if (n >= s.length) return s;
+  const raw = s.length - n;
+  return s.slice(isLowSurrogate(s.charCodeAt(raw)) ? raw + 1 : raw);
+}
+
+/**
+ * `text` excerpted to at most `budget` code units: head + `marker(omitted)` + tail,
+ * both slices surrogate-safe.
+ *
+ * The marker counts against the budget — sizing the two halves at exactly budget/2
+ * puts the RESULT over the ceiling the caller named. Its worst-case width is reserved
+ * up front (`text.length` bounds the digit count). The number it reports is the count
+ * ACTUALLY dropped, which the surrogate nudge can raise by up to two; deriving it from
+ * the realised slice lengths keeps that user-visible number truthful.
+ *
+ * A budget under the marker's own width leaves no room for head+tail+marker, so the
+ * head alone is returned.
+ */
+function excerptMiddle(text: string, budget: number, marker: (omitted: number) => string): string {
+  if (text.length <= budget) return text;
+  const half = Math.floor((budget - marker(text.length).length) / 2);
+  if (half <= 0) return sliceHeadSafe(text, budget);
+  const head = sliceHeadSafe(text, half);
+  const tail = sliceTailSafe(text, half);
+  return `${head}${marker(text.length - head.length - tail.length)}${tail}`;
+}
+
 /** Cap a single message's text content (head + tail with omission marker). */
 function capPanelMessageContent(content: unknown): unknown {
   const max = PANEL_MSG_HEAD + PANEL_MSG_TAIL;
+  // Fixed 6000/2000 widths rather than excerptMiddle's even split: the head of a
+  // pasted file carries the imports and signatures and is worth more than the tail.
+  const cap = (text: string): string => {
+    const head = sliceHeadSafe(text, PANEL_MSG_HEAD);
+    const tail = sliceTailSafe(text, PANEL_MSG_TAIL);
+    return `${head}\n…[${text.length - head.length - tail.length} chars omitted]…\n${tail}`;
+  };
 
   if (typeof content === "string") {
-    if (content.length <= max) return content;
-    const omitted = content.length - max;
-    return `${content.slice(0, PANEL_MSG_HEAD)}\n…[${omitted} chars omitted]…\n${content.slice(-PANEL_MSG_TAIL)}`;
+    return content.length <= max ? content : cap(content);
   }
 
   if (Array.isArray(content)) {
-    return content.map((part) => {
+    return content.map((part: unknown) => {
       if (typeof part === "object" && part !== null && "text" in part) {
-        const rec = part as Record<string, unknown>;
-        if (typeof rec.text === "string" && rec.text.length > max) {
-          const text = rec.text;
-          const omitted = text.length - max;
-          return {
-            ...rec,
-            text: `${text.slice(0, PANEL_MSG_HEAD)}\n…[${omitted} chars omitted]…\n${text.slice(-PANEL_MSG_TAIL)}`,
-          };
+        const text = part.text;
+        if (typeof text === "string" && text.length > max) {
+          return { ...part, text: cap(text) };
         }
       }
       return part;
@@ -1152,7 +1208,7 @@ async function runJudge(
           "ORIGINAL USER REQUEST:\n" +
           renderRequestForJudge(ctx.request) +
           "\n\nEXPERT ANSWERS:\n" +
-          renderPanelForJudge(panelAnswers),
+          renderPanelForJudgeBounded(panelAnswers),
       },
     ],
   };
@@ -2375,6 +2431,11 @@ function buildSynthContext(
   );
 }
 
+/**
+ * The panel answers verbatim. This is the SYNTH's view: `buildSynthContext` must keep
+ * every artifact (code, formulas, exact text), so it is deliberately unbounded there.
+ * The judge gets `renderPanelForJudgeBounded` instead.
+ */
 function renderPanelForJudge(panelAnswers: PanelAnswer[]): string {
   return panelAnswers
     .map((a, i) => `--- Expert ${i + 1} (${a.member}) ---\n${a.content}`)
@@ -2382,9 +2443,121 @@ function renderPanelForJudge(panelAnswers: PanelAnswer[]): string {
 }
 
 /**
- * Ceiling for the rendered request handed to the judge / bineval, applied only once
- * the conversation has crossed `PANEL_MAX_CHARS` and every message is 8 KB-capped
- * like the panel's. The per-message cap alone does not bound growth there: a long
+ * Ceiling for the EXPERT ANSWERS half of the judge's user message.
+ *
+ * `JUDGE_REQUEST_MAX_CHARS` bounds the request half only; the panel half grew as
+ * panel_size x answer_size with no bound at all, and nothing in this proxy caps an
+ * answer — `buildPanelBody` STRIPS `max_tokens`/`max_completion_tokens`, so a member
+ * runs to its own output ceiling. On the shipped `fusion-coder` (4-member panel) four
+ * answers at a routine 32k-token maximum are ~512 000 chars, and with the ~121 800-char
+ * fixed part (system prompt + a request half at its own ceiling) the judge call reaches
+ * ~634 000 chars. Overflow on this call is the same SILENT degrade
+ * `JUDGE_REQUEST_MAX_CHARS` exists to prevent (`stream:false` +
+ * `response_format: json_object` -> 400 -> `runJudge` returns null), so bounding one
+ * half and not the other bounded nothing.
+ *
+ * CHARACTERS, NOT TOKENS — and the two are not interchangeable. This is a UTF-16 code
+ * unit bound, chosen because it is the only quantity available without shipping a
+ * tokenizer per upstream model. The conversion is language-dependent: English prose
+ * runs ~4 chars/token, so the two ceilings together hold a ~240 000-char body at
+ * ~60k tokens, comfortably inside any modern judge. CJK runs ~1 char/token and
+ * emoji-dense text ~1-2, so the SAME 240 000 chars can approach ~240k tokens and still
+ * 400 a 128k-context judge — the ceiling narrows the window, it does not close it.
+ * For the shipped configs that is acceptable because both presets judge on `glm-5.2`
+ * (1M context per `fusion.example.yaml`), which absorbs the CJK worst case with room
+ * to spare; a deployment that moves the judge to a ~128k model (`gpt-oss:120b` ships
+ * on the `fusion-researcher` panel and could be promoted) and serves CJK traffic needs
+ * a lower value here, not a different algorithm.
+ *
+ * Same value as the request ceiling: the two halves are equally worth reading.
+ */
+const JUDGE_PANEL_MAX_CHARS = 120_000;
+
+/**
+ * Max-min fair ("water-filling") split of `budget` across `lengths`.
+ *
+ * An even `budget / n` split is a cap on each SHARE, not a division of the budget:
+ * an answer shorter than its share silently forfeits the difference. Three answers of
+ * 200 000 / 2 000 / 2 000 chars against a ~119 930 budget get ~39 976 each, so the two
+ * short ones use 4 000 of their 79 952 and the render lands at ~44 000 against a
+ * 120 000 ceiling — ~76 000 chars of budget thrown away and ~160 000 chars of the only
+ * substantive answer dropped. Water-filling hands the unclaimed remainder back to the
+ * answers still over their share and repeats until nothing changes, so a short answer
+ * costs the long one only what it actually uses.
+ */
+function waterFillShares(lengths: number[], budget: number): number[] {
+  const shares = new Array<number>(lengths.length).fill(0);
+  let remaining = budget;
+  let active = lengths.map((_, i) => i);
+  while (active.length > 0) {
+    const share = Math.floor(remaining / active.length);
+    const settled = active.filter((i) => (lengths[i] ?? 0) <= share);
+    if (settled.length === 0) {
+      // Everyone still active wants more than the share — the split is final.
+      for (const i of active) shares[i] = share;
+      break;
+    }
+    for (const i of settled) {
+      const len = lengths[i] ?? 0;
+      shares[i] = len;
+      remaining -= len;
+    }
+    active = active.filter((i) => (lengths[i] ?? 0) > share);
+  }
+  return shares;
+}
+
+/**
+ * The panel answers for the JUDGE, bounded to `JUDGE_PANEL_MAX_CHARS`.
+ *
+ * Every answer is excerpted to its water-filled share rather than dropping the trailing
+ * experts: a judge that never sees expert 4 cannot report the disagreement expert 4
+ * raised, and nothing in its output would reveal that it never saw it — the same
+ * reason `renderRequestForJudge` slices by character instead of dropping messages.
+ * Under the ceiling the answers pass through verbatim.
+ */
+function renderPanelForJudgeBounded(panelAnswers: PanelAnswer[]): string {
+  const full = renderPanelForJudge(panelAnswers);
+  if (full.length <= JUDGE_PANEL_MAX_CHARS || panelAnswers.length === 0) return full;
+
+  // Headers and separators are not negotiable — charge them to the budget first, so
+  // the result honours the ceiling and not just the contents.
+  const lengths = panelAnswers.map((a) => a.content.length);
+  const budget = JUDGE_PANEL_MAX_CHARS - (full.length - lengths.reduce((n, l) => n + l, 0));
+
+  // Degenerate config: the headers ALONE overrun the ceiling. `panel` is
+  // `z.array(z.string().min(1)).min(1)` — no max count and no bound on a member name —
+  // so one absurd model name reaches this, not just thousands of members. Excerpting
+  // even to zero content would still emit an over-ceiling header block, so fall back to
+  // treating the whole render as one string: the ceiling holds, the head (expert 1) and
+  // the tail (the last expert) survive, and the cut is still surrogate-safe.
+  if (budget <= 0) {
+    return excerptMiddle(
+      full,
+      JUDGE_PANEL_MAX_CHARS,
+      (n) => `\n…[${n} chars omitted from the middle of the panel]…\n`,
+    );
+  }
+
+  const shares = waterFillShares(lengths, budget);
+  return panelAnswers
+    .map(
+      (a, i) =>
+        `--- Expert ${i + 1} (${a.member}) ---\n` +
+        excerptMiddle(
+          a.content,
+          shares[i] ?? 0,
+          (n) => `\n…[${n} chars omitted from the middle of this expert's answer]…\n`,
+        ),
+    )
+    .join("\n\n");
+}
+
+/**
+ * Ceiling for the rendered request handed to the judge / bineval, applied
+ * UNCONDITIONALLY over the whole render — see point 2 on `renderRequestForJudge`:
+ * it is deliberately NOT gated on `PANEL_MAX_CHARS`. The per-message cap, which IS
+ * gated on that threshold, does not bound growth on its own: a long
  * agent session accumulates hundreds of user turns, and this render walks the
  * ORIGINAL array, so it also sees the turns `compressPanelMessages` dropped.
  * The judge call is `stream:false` with `response_format: json_object`, so overflow
@@ -2444,31 +2617,15 @@ function renderRequestForJudge(request: ChatCompletionRequest): string {
       typeof capped === "string" ? capped : Array.isArray(m.content) ? "[multimodal content]" : "";
     if (text.length > 0) lines.push(`${role}: ${text}`);
   }
-  const joined = lines.join("\n");
-  if (joined.length <= JUDGE_REQUEST_MAX_CHARS) return joined;
-
   // Over budget: keep the head (system prompts + original task) and the tail (the
   // instruction actually in play), excerpt the middle. Head and tail are character
-  // slices so an over-long message is cut, never dropped.
-  //
-  // The marker counts against the budget too — sizing the two halves at exactly
-  // MAX/2 puts the RESULT over the ceiling the constant names, which is the one
-  // number this function exists to honour. Reserve the worst-case marker width
-  // (`joined.length` bounds the digit count) before splitting.
-  const marker = (n: number) => `\n…[${n} chars omitted from the middle of the conversation]…\n`;
-  const half = Math.floor((JUDGE_REQUEST_MAX_CHARS - marker(joined.length).length) / 2);
-
-  // Never cut through a UTF-16 surrogate pair: a lone half survives JSON.stringify
-  // as an escaped orphan and decodes to U+FFFD on the far side, so an emoji or a
-  // CJK-extension glyph sitting on the boundary reaches the judge as mojibake.
-  // Nudging inward by one code unit costs a character and keeps the text well-formed.
-  const isHighSurrogate = (c: number) => c >= 0xd800 && c <= 0xdbff;
-  const isLowSurrogate = (c: number) => c >= 0xdc00 && c <= 0xdfff;
-  const headEnd = isHighSurrogate(joined.charCodeAt(half - 1)) ? half - 1 : half;
-  const rawTailStart = joined.length - half;
-  const tailStart = isLowSurrogate(joined.charCodeAt(rawTailStart)) ? rawTailStart + 1 : rawTailStart;
-
-  return `${joined.slice(0, headEnd)}${marker(tailStart - headEnd)}${joined.slice(tailStart)}`;
+  // slices so an over-long message is cut, never dropped — and surrogate-safe, so
+  // the cut cannot manufacture the mojibake described on `sliceHeadSafe`.
+  return excerptMiddle(
+    lines.join("\n"),
+    JUDGE_REQUEST_MAX_CHARS,
+    (n) => `\n…[${n} chars omitted from the middle of the conversation]…\n`,
+  );
 }
 
 // --- Shared helpers --------------------------------------------------------

@@ -102,11 +102,33 @@ type RouteDecision = z.infer<typeof RouteDecisionSchema>;
  */
 const MAX_ROUTER_CACHE_SIZE = 256;
 const routerCache = new Map<string, "simple" | "fusion">();
-const routerPending = new Map<string, Promise<"simple" | "fusion">>();
+const routerPending = new Map<string, Promise<"simple" | "fusion" | null>>();
 
-/** Stable hash of a router request body for use as a cache key. */
-function routerCacheKey(body: Record<string, unknown>): string {
-  return createHash("sha256").update(JSON.stringify(body)).digest("hex");
+/**
+ * Stable cache key for a router classification.
+ *
+ * The body alone is NOT enough, because both the upstream call and the
+ * hallucination guard depend on context the body does not carry:
+ *
+ *  - `provider`: each model is bound to a provider group and `dispatch` resolves
+ *    `router.poolFor(entry.provider)`, so two smart models naming the same router
+ *    against different groups are different endpoints with different credentials,
+ *    quotas and health. Sharing a call across them bills one group for the other's
+ *    request and lets a dead router in group A open the breaker for a healthy
+ *    router of the same name in group B.
+ *  - `hasImages`: `renderRequestForRouter` compacts the transcript, and an
+ *    `image_url` sitting in an OMITTED message never reaches the render — so two
+ *    requests can render identically while `requestHasImages` differs. The
+ *    hallucination guard below runs inside the SHARED call against the OWNER's
+ *    request, so without this discriminator a waiter would inherit a guard verdict
+ *    computed for a different request: an owner whose buried image makes the
+ *    router's "user sent a screenshot" TRUE caches a decision the guard would have
+ *    rejected for an image-less waiter.
+ */
+function routerCacheKey(body: Record<string, unknown>, provider: string | undefined, hasImages: boolean): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ body, provider: provider ?? "", hasImages }))
+    .digest("hex");
 }
 
 /** Test-only: clear the router decision cache and any in-flight promises. */
@@ -150,6 +172,14 @@ export const smartStrategy: Strategy = {
       throw new FusionError("smart strategy invoked with a non-smart model config", 500, "internal_error");
     }
     const cfg = ctx.modelConfig;
+
+    // Before ANY route is chosen. The check after `classify` below covers the
+    // common case (the client leaves during the router round trip), but the
+    // escalation branch right underneath returns straight into a full fusion
+    // panel without ever calling `classify` — so a caller that had already gone
+    // by the time we were dispatched would slip past it and buy a panel nobody
+    // reads. Cheapest possible exit: nothing has been reserved or spent yet.
+    ctx.signal?.throwIfAborted();
 
     // Agent-loop escalation (see SmartModelSchema.escalate_on_tool_error): when
     // the latest tool result looks like a failure the model is recovering from an
@@ -256,7 +286,7 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
   // before an early cache-hit return would leak that probe (the early return records
   // no outcome), wedging the breaker half-open forever and collapsing ALL routing to
   // the default. The breaker is therefore checked only on the real-call path below.
-  const key = routerCacheKey(body);
+  const key = routerCacheKey(body, cfg.provider, requestHasImages(ctx.request));
   const cached = routerCache.get(key);
   if (cached !== undefined) {
     ctx.logger.debug(
@@ -274,7 +304,13 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
       { router, model: ctx.request.model },
       "smart: router cache coalesce; awaiting in-flight classifier",
     );
-    return inFlight;
+    // `null` means "the shared call reached no decision". Resolve it HERE, against
+    // this caller's own `cfg.default` — `classifyUncached` closes over the OWNER's
+    // config, and the cache key hashes only the router body, so two smart models
+    // sharing a router and rendering the same transcript collide. Returning the
+    // owner's default would route a `default: simple` waiter into a full panel it
+    // never asked for (and vice versa).
+    return (await inFlight) ?? fallback;
   }
 
   if (!resilience.breaker.canAttempt(router)) {
@@ -290,15 +326,18 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
     routerPending.delete(key);
   });
   routerPending.set(key, promise);
-  return promise;
+  return (await promise) ?? fallback;
 }
 
 /**
  * The actual upstream classifier call. Isolated from `classify` so the cache
  * wrapper can short-circuit on a hit / coalesce in-flight duplicates. Returns
- * the configured `default` route on any failure (error, timeout, non-OK status,
- * unparseable/invalid JSON) — never throws. Only a successfully parsed router
- * decision is written to the cache; a failure must NOT be cached, so a
+ * `null` — NOT a route — on any failure (error, timeout, non-OK status,
+ * unparseable/invalid JSON); never throws. The `null` is deliberate: this call
+ * is SHARED with coalesced waiters that may carry a different `cfg.default`, so
+ * only `classify` may turn "no decision" into a concrete route, using the
+ * config of the caller actually being answered. Only a successfully parsed
+ * router decision is written to the cache; a failure must NOT be cached, so a
  * transient blip self-heals on the next identical request.
  */
 async function classifyUncached(
@@ -307,9 +346,8 @@ async function classifyUncached(
   resilience: Resilience,
   body: Record<string, unknown>,
   key: string,
-): Promise<"simple" | "fusion"> {
+): Promise<"simple" | "fusion" | null> {
   const router = cfg.router;
-  const fallback = cfg.default;
 
   const startedAt = Date.now();
   let result: ChatCompletionResult;
@@ -324,9 +362,17 @@ async function classifyUncached(
   // caller's signal in meant their disconnect cancelled the classification every
   // coalesced caller was waiting on, silently routing live requests to `default`
   // instead — a stranger's hang-up changing another user's routing. The stage
-  // timeout already bounds the call, and its answer lands in `routerCache`, so an
-  // orphaned one is not even wasted. The caller's own disconnect is honoured where
-  // it belongs: the abort check on the classified route in `execute`.
+  // timeout already bounds the call, and its answer lands in `routerCache`, so a
+  // later identical request still profits from it. The caller's own disconnect is
+  // honoured where it belongs: the abort check on the classified route in `execute`.
+  //
+  // Accepted cost of that choice: `limiterFor` composes the per-model gate with the
+  // SHARED global limiter (`concurrency.ts`), so a fully abandoned router call keeps
+  // one global slot until the router answers or the stage timeout fires — up to
+  // `router_timeout_s` of head-of-line blocking for unrelated models. Refcounting the
+  // live waiters and aborting only when the last one leaves would recover that slot,
+  // but the bookkeeping is not worth one slot in a bounded window; measured worst case
+  // is a single slot per distinct hung router body.
   const timeoutMs = ctx.config.defaults.router_timeout_s * 1000;
   const stageAbort = new AbortController();
   const signal = stageAbort.signal;
@@ -364,12 +410,12 @@ async function classifyUncached(
       {
         router,
         model: ctx.request.model,
-        route: fallback,
+        route: cfg.default,
         reason: err instanceof Error ? err.message : String(err),
       },
       "smart: router call failed; using default route",
     );
-    return fallback;
+    return null;
   }
   ctx.usage?.record(router, result);
 
@@ -391,20 +437,20 @@ async function classifyUncached(
       resilience.breaker.recordSuccess(router);
     }
     ctx.logger.warn(
-      { router, model: ctx.request.model, route: fallback, status: result.kind === "json" ? result.status : undefined },
+      { router, model: ctx.request.model, route: cfg.default, status: result.kind === "json" ? result.status : undefined },
       "smart: router returned a non-OK response; using default route",
     );
-    return fallback;
+    return null;
   }
 
   resilience.breaker.recordSuccess(router);
   const decision = parseRouteDecision(extractContent(result.data));
   if (decision === null) {
     ctx.logger.warn(
-      { router, model: ctx.request.model, route: fallback },
+      { router, model: ctx.request.model, route: cfg.default },
       "smart: router returned unparseable/invalid JSON; using default route",
     );
-    return fallback;
+    return null;
   }
 
   // Hallucination guard: the router (an LLM) can confabulate multimodal input —
@@ -416,10 +462,10 @@ async function classifyUncached(
   // is handled). Do NOT cache it.
   if (claimsImage(decision.reason) && !requestHasImages(ctx.request)) {
     ctx.logger.warn(
-      { router, model: ctx.request.model, route: fallback, reason: decision.reason },
+      { router, model: ctx.request.model, route: cfg.default, reason: decision.reason },
       "smart: router claimed an image/screenshot that is not present; treating decision as untrustworthy, using default route",
     );
-    return fallback;
+    return null;
   }
 
   ctx.logger.info(

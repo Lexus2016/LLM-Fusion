@@ -72,6 +72,21 @@ describe("makeReasoningPromotionTransform — think tags across delta boundaries
   }
   const chunk = (content: string) => `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n`;
 
+  it("a `data:` line with leading whitespace is still filtered, not forwarded verbatim", async () => {
+    // The prefix test used to run on the raw line, so ` data: {...}` missed the
+    // transform entirely and reached the client with its `reasoning` field intact.
+    // This transform is explicitly fail-CLOSED about chain-of-thought (an unparsable
+    // chunk that merely mentions tool_calls suppresses the buffer), so silently
+    // passing a whole chunk through on a whitespace technicality was the one hole
+    // in that stance. The leading-space form is not spec-legal SSE; the point is
+    // that the cost of tolerating it is one `trimStart()`.
+    const leaked = ` data: ${JSON.stringify({ choices: [{ delta: { reasoning: "PRIVATE-COT" } }] })}\n`;
+    const out = await pump([leaked, chunk("answer"), "data: [DONE]\n"]);
+    expect(out).not.toContain("PRIVATE-COT");
+    expect(out).not.toContain("reasoning");
+    expect(out).toContain("answer");
+  });
+
   it("strips a tag split across two content deltas and suppresses the block body", async () => {
     const out = await pump([chunk("Hello <th"), chunk("ink>secret</think> world"), "data: [DONE]\n"]);
     expect(out).not.toContain("secret");

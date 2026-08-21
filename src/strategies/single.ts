@@ -7,7 +7,12 @@ import {
   logUpstreamFailure,
 } from "../attribution";
 import { promoteReasoningNonStream, makeReasoningPromotionTransform } from "../reasoning";
-import { detectIncompleteToolTurn, makeToolTurnGuardStream, retryToolTurn } from "./tool_turn_guard";
+import {
+  detectIncompleteToolTurn,
+  makeToolTurnGuardStream,
+  retryToolTurn,
+  toolTurnRetryBlocked,
+} from "./tool_turn_guard";
 
 /**
  * `single` strategy — 1:1 passthrough to a single target model. Supports both
@@ -134,7 +139,10 @@ export const singleStrategy: Strategy = {
     let responseData = result.data;
     if (hasTools && result.status < 400) {
       const incomplete = detectIncompleteToolTurn(responseData);
-      if (incomplete !== null) {
+      // `toolTurnRetryBlocked`: a `content_filter` turn was REFUSED, not malformed by
+      // accident — re-prompting it with "Emit the tool call NOW" just re-runs the
+      // refusal. Leave the upstream response exactly as it came.
+      if (incomplete !== null && !toolTurnRetryBlocked(responseData)) {
         const recovered = await retryToolTurn(ctx, resilience, target, body, incomplete);
         if (recovered !== null) responseData = recovered;
       }

@@ -1270,6 +1270,27 @@ describe("single strategy — tool-turn completeness guard", () => {
     expect(noSpace.text).not.toContain('"finish_reason":"tool_calls"');
     expect(noSpace.text).not.toContain("tool_calls");
     expect(noSpace.text).toContain("[DONE]");
+
+    // 5) A dropped broken call under `finish_reason:"content_filter"`. Same shape as
+    // case 3 but with the OTHER non-tool terminal the OpenAI API defines, and it is
+    // the case that pins the predicate rather than the outcome: `!== "tool_calls"`
+    // and `=== "stop"` agree on cases 1-4, so a mutant that narrows the guard to
+    // `=== "stop"` survived the whole suite. Here they disagree — the mutant would
+    // rewrite `content_filter` to `"length"`, erasing the one signal that tells the
+    // client the turn was refused rather than truncated, and turning a refusal into
+    // an Anthropic `max_tokens` that invites an auto-continuation loop.
+    const filtered = await runFailOpen([
+      { choices: [{ delta: { role: "assistant", content: "I cannot help with that." } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_f", type: "function", function: { name: "write", arguments: '{"path":"guide.html","content":"<html><h1>trunc' } }] } }] },
+      { choices: [{ delta: {}, finish_reason: "content_filter" }] },
+    ]);
+    // 1, not 2: `content_filter` is on NO_RETRY_FINISH_REASONS — the refusal is not
+    // re-prompted. The drop-and-preserve behaviour this case pins is unaffected.
+    expect(filtered.calls).toBe(1);
+    expect(filtered.text).toContain('data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}'); // untouched
+    expect(filtered.text).not.toContain('"finish_reason":"length"');
+    expect(filtered.text).not.toContain("tool_calls"); // the broken call was still dropped
+    expect(filtered.text).not.toContain("trunc");
   });
 });
 
@@ -1530,5 +1551,733 @@ describe("tool-turn guard — client disconnect mid-pull", () => {
     expect(pipeErr.message).toBe("client socket gone");
     expect(state.cancelled).toBe(true); // the guard released the upstream
     expect(recoveries()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADVERSARIAL REVIEW (R6-T2) — each `it` below encodes the behaviour the guard
+// SHOULD have and currently does not. They are expected to FAIL until fixed.
+// ---------------------------------------------------------------------------
+describe("tool-turn guard — adversarial review regressions (D1-D6)", () => {
+  const TOOLS = [{ type: "function", function: { name: "write", parameters: { type: "object" } } }];
+
+  const rawSse = (frames: string[]): Response =>
+    new Response(frames.join("") + "data: [DONE]\n\n", {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+
+  /**
+   * Drive one guarded streaming turn with EXTRA request fields (e.g. `n`);
+   * `recovery` builds the retry response.
+   */
+  const runGuardedRequest = async (
+    extra: Record<string, unknown>,
+    original: () => Response,
+    recovery: () => Response = () => sseResponse([]),
+  ): Promise<{ calls: number; text: string }> => {
+    let calls = 0;
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: (_u, init) => {
+            calls += 1;
+            if (String(init?.body ?? "").includes("Emit the tool call NOW")) return recovery();
+            return original();
+          },
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(
+      ctxWith(client, {
+        model: "fast-glm",
+        stream: true,
+        tools: TOOLS,
+        messages: [{ role: "user", content: "make guide.html" }],
+        ...extra,
+      }),
+    );
+    const text = await res.text();
+    return { calls, text };
+  };
+
+  /** Drive one guarded streaming turn; `recovery` builds the retry response. */
+  const runGuarded = (
+    original: () => Response,
+    recovery: () => Response = () => sseResponse([]),
+  ): Promise<{ calls: number; text: string }> => runGuardedRequest({}, original, recovery);
+
+  /** Every `finish_reason` string present in the guard's output, in order. */
+  const finishReasonsOf = (text: string): string[] => {
+    const out: string[] = [];
+    for (const m of text.matchAll(/"finish_reason":\s*"([^"]*)"/g)) {
+      if (m[1] !== undefined) out.push(m[1]);
+    }
+    return out;
+  };
+
+  const brokenCallDelta = (choiceIndex: number, id: string) => ({
+    index: choiceIndex,
+    delta: {
+      tool_calls: [
+        {
+          index: 0,
+          id,
+          type: "function",
+          function: { name: "write", arguments: '{"path":"guide.html","content":"<html>trunc' },
+        },
+      ],
+    },
+  });
+
+  it("D1: an n>1 stream latches the guard OFF — no half-applied terminal rewrite", async () => {
+    // `n` is passthrough (ChatCompletionRequestSchema is .passthrough(), and single.ts
+    // forwards the request body), so a multi-choice answer is reachable.
+    // markTerminalLengthCut inspects and mutates `choices[0]` only, so it used to
+    // rewrite choice 0 to "length" while choice 1 kept `finish_reason:"tool_calls"` —
+    // one chunk telling the client both that a call is coming and that it is not.
+    // The fix is the multiChoice latch: the guard becomes a pure passthrough, so the
+    // terminal stays exactly as the upstream sent it, self-consistent.
+    const terminal = {
+      choices: [
+        { index: 0, delta: {}, finish_reason: "tool_calls" },
+        { index: 1, delta: {}, finish_reason: "tool_calls" },
+      ],
+    };
+    const { calls, text } = await runGuarded(() =>
+      rawSse([
+        `data: ${JSON.stringify({ choices: [brokenCallDelta(0, "c0"), brokenCallDelta(1, "c1")] })}\n\n`,
+        `data: ${JSON.stringify(terminal)}\n\n`,
+      ]),
+    );
+    expect(calls).toBe(1); // no recovery retry: the guard did not judge this turn
+    expect(text).toContain(JSON.stringify(terminal)); // byte-identical terminal
+    expect(text).not.toContain('"finish_reason":"length"'); // nothing half-rewritten
+    expect(finishReasonsOf(text)).toEqual(["tool_calls", "tool_calls"]);
+  });
+
+  it("D2: an n>1 stream latches OFF, so a choices[1] delta is no longer swallowed by choices[0]", async () => {
+    // handleLine judged the whole CHUNK by `choices[0]`: a chunk whose first choice
+    // carried tool-call fragments took the option-B suppression path and was dropped
+    // wholesale — silently destroying whatever `choices[1]` carried in the same chunk.
+    // (And stripToolCallsFromChunk deletes `delta.tool_calls` from `choices[0]` only,
+    // so the mirror case leaked a truncated fragment instead.) The latch makes the
+    // guard forward the chunk VERBATIM, which is the only correct answer for a stream
+    // its single-choice state machine cannot model.
+    const chunk = {
+      choices: [brokenCallDelta(0, "c0"), { index: 1, delta: { content: "choice-1 answer" } }],
+    };
+    const { calls, text } = await runGuarded(() =>
+      rawSse([
+        `data: ${JSON.stringify(chunk)}\n\n`,
+        `data: ${JSON.stringify({
+          choices: [
+            { index: 0, delta: {}, finish_reason: "tool_calls" },
+            { index: 1, delta: {}, finish_reason: "stop" },
+          ],
+        })}\n\n`,
+      ]),
+    );
+    expect(text).toContain("choice-1 answer"); // was dropped with the whole chunk
+    expect(calls).toBe(1);
+    expect(text).toContain(JSON.stringify(chunk)); // verbatim, fragment still at index 1
+    expect(finishReasonsOf(text)).toEqual(["tool_calls", "stop"]); // nothing rewritten
+  });
+
+  it("D2b: the multiChoice latch does NOT mis-fire on a single-choice stream that omits `index`", async () => {
+    // `index` is optional in practice (Ollama and llama.cpp omit it). Latching on
+    // `choices[0].index !== 0` without a typeof check would read `undefined !== 0` as
+    // true and disable the guard for every such upstream. Here the guard must stay ON:
+    // buffer the broken call, withhold it, and run recovery.
+    const { calls, text } = await runGuarded(
+      () =>
+        rawSse([
+          `data: ${JSON.stringify({
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    { index: 0, id: "c", type: "function", function: { name: "write", arguments: '{"path":"a","content":"trunc' } },
+                  ],
+                },
+              },
+            ],
+          })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "tool_calls" }] })}\n\n`,
+        ]),
+      () =>
+        sseResponse([
+          {
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    { index: 0, id: "r", type: "function", function: { name: "write", arguments: '{"path":"a.html","content":"ok"}' } },
+                  ],
+                },
+              },
+            ],
+          },
+          { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        ]),
+    );
+    expect(calls).toBe(2); // the guard fired recovery, so it was NOT latched off
+    expect(text).not.toContain("trunc"); // the broken fragment never reached the client
+    expect(text).toContain('"content\\":\\"ok');
+  });
+
+  /** The original turn every D3 case recovers from: one broken call + a tool_calls terminal. */
+  const brokenOriginal = () =>
+    sseResponse([
+      { choices: [brokenCallDelta(0, "c")] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    ]);
+
+  it("R1a: a SEQUENTIAL n>1 stream (one choice per chunk) latches OFF before withholding anything", async () => {
+    // The regression the D1/D2 tests missed: a real OpenAI-compatible n>1 stream sends
+    // ONE choice per chunk, so `choices.length > 1` never fires. Chunk 1 (index 0)
+    // looked single-choice, option B withheld its tool fragments; chunk 2 (index 1)
+    // latched the guard into passthrough; then finishNormally's multiChoice early-out
+    // skipped emitAssembledToolCalls and the withheld call was LOST. The latch has to
+    // come from the REQUEST (`n`), before any chunk is seen.
+    const { calls, text } = await runGuardedRequest(
+      { n: 2 },
+      () =>
+        rawSse([
+          `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c0", type: "function", function: { name: "write", arguments: '{"path":"a.html"}' } }] } }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ index: 1, delta: { content: "choice-1 answer" } }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ index: 1, delta: {}, finish_reason: "stop" }] })}\n\n`,
+        ]),
+    );
+    expect(calls).toBe(1);
+    expect(text).toContain('"path\\":\\"a.html'); // choice 0's call survived
+    expect(text).toContain("choice-1 answer");
+    expect(finishReasonsOf(text)).toEqual(["tool_calls", "stop"]);
+  });
+
+  it("R1b: choice 0's terminal arriving FIRST does not discard the later choice-1 chunks", async () => {
+    // The worse ordering: `terminalLine !== null` is checked ahead of the latch, so
+    // once choice 0 finished, every subsequent choice-1 chunk was silently swallowed
+    // by the held-terminal path.
+    const { calls, text } = await runGuardedRequest(
+      { n: 2 },
+      () =>
+        rawSse([
+          `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "choice-0 answer" } }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ index: 1, delta: { content: "choice-1 answer" } }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ index: 1, delta: {}, finish_reason: "stop" }] })}\n\n`,
+        ]),
+    );
+    expect(calls).toBe(1);
+    expect(text).toContain("choice-0 answer");
+    expect(text).toContain("choice-1 answer");
+  });
+
+  it("R1c: the first-chunk detector still catches an upstream that returns n>1 unasked, including a STRING index", async () => {
+    // Secondary safety net: the request said nothing about `n`, but the upstream
+    // answered with a second choice anyway. `index` is also accepted as a numeric
+    // STRING here — some gateways serialise it that way, and a `typeof === "number"`
+    // test alone would let the guard keep judging a stream it cannot model.
+    // The stream carries a BROKEN call on purpose: that is what discriminates a
+    // latched-off guard (pure passthrough, one upstream call, fragment forwarded
+    // verbatim) from a live one (fragment withheld, recovery fired, 2 calls).
+    const { calls, text } = await runGuarded(() =>
+      rawSse([
+        `data: ${JSON.stringify({ choices: [{ index: "1", delta: { tool_calls: [{ index: 0, id: "c", type: "function", function: { name: "write", arguments: '{"path":"a","content":"trunc' } }] } }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ index: "1", delta: {}, finish_reason: "tool_calls" }] })}\n\n`,
+      ]),
+    );
+    expect(calls).toBe(1); // latched off: no recovery attempt
+    expect(text).toContain("trunc"); // passthrough is verbatim, warts and all
+    expect(finishReasonsOf(text)).toEqual(["tool_calls"]); // no terminal rewrite either
+  });
+
+  it("R1d: a LATE latch hands back what option B was holding instead of dropping it", async () => {
+    // Unasked n>1 in its worst ordering: choice 0 completes (tool fragments withheld,
+    // terminal held) before choice 1 shows up at all. The latch cannot fire any
+    // earlier, so it has to FLUSH — assembled call first, then the held terminal —
+    // before passthrough resumes, and the detector has to run ahead of the
+    // held-terminal early-return or the choice-1 chunks never reach it.
+    const { calls, text } = await runGuarded(() =>
+      rawSse([
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c0", type: "function", function: { name: "write", arguments: '{"path":"a.html"}' } }] } }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ index: 1, delta: { content: "choice-1 answer" } }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ index: 1, delta: {}, finish_reason: "stop" }] })}\n\n`,
+      ]),
+    );
+    expect(calls).toBe(1); // no recovery: the turn was runnable, just multi-choice
+    expect(text).toContain('"path\\":\\"a.html'); // withheld call flushed, not lost
+    expect(text).toContain("choice-1 answer"); // not swallowed by the held terminal
+    expect(finishReasonsOf(text)).toEqual(["tool_calls", "stop"]);
+  });
+
+  it("R1e: an n>1 stream that omits `index` ENTIRELY is only survivable via the request latch", async () => {
+    // The case that makes the construction-time latch load-bearing rather than
+    // belt-and-braces. R1a/R1b are killed by either mechanism (the late latch flushes
+    // what it held, so the outcome is right by luck of the wire format); here there is
+    // no `index` on any chunk and `choices.length` is always 1, so NOTHING in the
+    // response distinguishes two sequential choices from one — Ollama and llama.cpp
+    // both omit `index`, which is precisely why the guard tolerates its absence. With
+    // the guard live, choice 0's terminal is held and every later line is swallowed:
+    // choice 1 vanishes. `n` from the request is the only signal that exists.
+    // Both spellings of `n`: some gateways re-serialise query/form params as strings,
+    // and a `typeof === "number"` read would silently disarm the latch for those.
+    for (const n of [2, "2"]) {
+      const { calls, text } = await runGuardedRequest({ n }, () =>
+        rawSse([
+          `data: ${JSON.stringify({ choices: [{ delta: { content: "answer A" } }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ delta: { content: "answer B" } }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`,
+        ]),
+      );
+      expect(calls).toBe(1);
+      expect(text).toContain("answer A");
+      expect(text).toContain("answer B");
+      expect(finishReasonsOf(text)).toEqual(["stop", "stop"]);
+    }
+  });
+
+  it("R1f: the request latch does NOT mis-fire on a single-choice stream (n absent, n:1, no `index`)", async () => {
+    // The other half of R1e. A latch read from the request is only safe if it stays
+    // off for every ordinary turn — `n` absent, `n: 1`, and chunks with no `index`
+    // field at all (Ollama, llama.cpp). If it mis-fired the guard would be disabled
+    // proxy-wide and every broken tool call would ship untouched.
+    for (const extra of [{}, { n: 1 }]) {
+      const { calls, text } = await runGuardedRequest(extra, () =>
+        rawSse([
+          `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "c", type: "function", function: { name: "write", arguments: '{"path":"a","content":"trunc' } }] } }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "tool_calls" }] })}\n\n`,
+        ]),
+      );
+      expect(calls).toBe(2); // guard live: recovery attempted
+      expect(text).not.toContain("trunc"); // fragment withheld, not passed through
+      expect(finishReasonsOf(text)).toEqual(["length"]);
+    }
+  });
+
+  it("R2: a recovery that sends ONLY a bare terminal is NOT recovery — the guard fails open", async () => {
+    // A retry answering with nothing but `finish_reason:"tool_calls"` delivers an EMPTY
+    // tool turn: no call to run, no prose. Counting it as a replacement suppressed the
+    // held original terminal AND skipped the fail-open rewrite, handing the client
+    // exactly the actionless tool_calls terminal this guard exists to eliminate.
+    // Classification now happens BEFORE the enqueue, so a bare terminal is neither
+    // forwarded nor counted, and no double-terminal is possible.
+    for (const fin of ["tool_calls", "stop"]) {
+      const { calls, text } = await runGuarded(brokenOriginal, () =>
+        sseResponse([{ choices: [{ index: 0, delta: {}, finish_reason: fin }] }]),
+      );
+      expect(calls).toBe(2);
+      expect(finishReasonsOf(text)).toEqual(["length"]); // fail open, terminal made honest
+      expect(text).not.toContain("trunc");
+    }
+  });
+
+  it("R3: a whitespace-only tool name is not dispatchable", () => {
+    const call = (name: string) => ({
+      choices: [
+        {
+          finish_reason: "tool_calls",
+          message: { role: "assistant", content: null, tool_calls: [{ id: "c", type: "function", function: { name, arguments: "{}" } }] },
+        },
+      ],
+    });
+    expect(detectIncompleteToolTurn(call("   "))).toBe("broken_tool_call");
+    expect(detectIncompleteToolTurn(call("\t\n"))).toBe("broken_tool_call");
+    expect(detectIncompleteToolTurn(call("write"))).toBeNull();
+  });
+
+  it("R3b: a whitespace-only name is dropped on the fail-open path too, not shipped as runnable", async () => {
+    // Parity with R3 one layer down. `assembledCallsEmittable` decides whether the
+    // buffered call is handed to the client when recovery fails; a bare truthiness
+    // test on the name passes `"   "` and ships an undispatchable call under a
+    // `tool_calls` terminal — exactly the actionless turn the guard exists to stop.
+    const { text } = await runGuarded(() =>
+      rawSse([
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c", type: "function", function: { name: "   ", arguments: '{"path":"a"}' } }] } }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`,
+      ]),
+    );
+    expect(finishReasonsOf(text)).toEqual(["length"]); // dropped, so the terminal is corrected
+    expect(text).not.toContain('"path":"a"');
+  });
+
+  it("R3c: a synthesised terminal calls a whitespace-named recovery call unrunnable, not `tool_calls`", async () => {
+    // Third and last name check: `assembledCallsRunnable` picks the finish_reason when
+    // a retry produces calls but never terminates. Announcing `tool_calls` for a call
+    // named "  " tells the client to dispatch a tool that cannot be looked up.
+    const { calls, text } = await runGuarded(brokenOriginal, () =>
+      sseResponse([
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "r", type: "function", function: { name: "  ", arguments: '{"path":"a"}' } }] } }] },
+      ]),
+    );
+    expect(calls).toBe(2);
+    expect(finishReasonsOf(text)).toEqual(["length"]);
+  });
+
+  it("R4a: a partially-valid parallel call SET is retried as a whole, matching the stream path", async () => {
+    // One runnable `read` plus a nameless tail. The set is retried rather than shipped,
+    // because a client that rejects the malformed entry rejects the whole assistant
+    // message — and the STREAM path has always behaved this way (assembledCallsEmittable
+    // requires EVERY call to be emittable). The valid call is not lost if the retry
+    // fails: retryToolTurn returns null and the ORIGINAL response ships untouched.
+    const partial = {
+      id: "x",
+      choices: [
+        {
+          index: 0,
+          finish_reason: "stop",
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              { id: "c1", type: "function", function: { name: "read", arguments: '{"path":"a"}' } },
+              { id: "c2", type: "function", function: { arguments: '{"path":"b"}' } },
+            ],
+          },
+        },
+      ],
+    };
+    expect(detectIncompleteToolTurn(partial)).toBe("broken_tool_call");
+
+    // ...and when the retry fails, the original set survives verbatim.
+    let calls = 0;
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: () => {
+            calls += 1;
+            return jsonResponse(partial);
+          },
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(
+      ctxWith(client, { model: "fast-glm", tools: TOOLS, messages: [{ role: "user", content: "x" }] }),
+    );
+    const body = await res.text();
+    expect(calls).toBe(2);
+    expect(body).toContain('"name":"read"'); // the valid call was not lost
+  });
+
+  it("R4b: a content_filter turn is never re-prompted, on either path", async () => {
+    // "Emit the tool call NOW" against a turn the upstream REFUSED re-runs the refusal:
+    // it burns a call, and at best returns the same refusal. The broken call is still
+    // dropped and `content_filter` still survives on the stream path — the client is
+    // told, honestly, that the turn was filtered and carries nothing to execute.
+    const filteredCalls = [{ id: "c", type: "function", function: { name: "write", arguments: '{"path":"a","content":"trunc' } }];
+
+    // Stream path: no retry, call dropped, terminal preserved.
+    const { calls, text } = await runGuarded(() =>
+      sseResponse([
+        { choices: [{ index: 0, delta: { role: "assistant", content: "I cannot help with that." } }] },
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, ...filteredCalls[0] }] } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "content_filter" }] },
+      ]),
+    );
+    expect(calls).toBe(1); // recovery NOT attempted
+    expect(finishReasonsOf(text)).toEqual(["content_filter"]);
+    expect(text).not.toContain("trunc");
+
+    // Non-stream path: no retry either.
+    let nsCalls = 0;
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: () => {
+            nsCalls += 1;
+            return jsonResponse({
+              id: "x",
+              choices: [{ index: 0, finish_reason: "content_filter", message: { role: "assistant", content: "I cannot help with that.", tool_calls: filteredCalls } }],
+            });
+          },
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(
+      ctxWith(client, { model: "fast-glm", tools: TOOLS, messages: [{ role: "user", content: "x" }] }),
+    );
+    await res.text();
+    expect(nsCalls).toBe(1);
+  });
+
+  it("D3a: an error-only recovery chunk is NOT recovery — the original terminal still ships", async () => {
+    // streamRetryToolTurn used to count ANY non-empty `data:` payload as a forwarded
+    // chunk. A 200 stream carrying only `data: {"error":...}` (Ollama / vLLM / OpenRouter
+    // all signal mid-stream failure this way, so the status>=400 check never sees it)
+    // therefore reported success, the held original terminal was suppressed, and the
+    // client got an error object plus [DONE] with NO finish_reason at all — downstream,
+    // an Anthropic `message_delta` with `stop_reason: null`.
+    const { calls, text } = await runGuarded(brokenOriginal, () =>
+      sseResponse([{ error: { message: "upstream overloaded", type: "server_error" } }]),
+    );
+    expect(calls).toBe(2);
+    // Fail-open: the held original terminal is delivered, rewritten because the buffered
+    // call was dropped as unrunnable.
+    expect(finishReasonsOf(text)).toEqual(["length"]);
+    expect(text).not.toContain("trunc");
+  });
+
+  it("D3b: a role-only recovery chunk is NOT recovery — the original terminal still ships", async () => {
+    // Same root cause as D3a but far more likely: nearly every upstream opens with a
+    // role-only delta, so a recovery stream that died right after its first chunk hit
+    // `forwarded > 0` and suppressed the original terminal — replacing a broken turn
+    // with an empty, terminal-less one.
+    const { calls, text } = await runGuarded(brokenOriginal, () =>
+      sseResponse([{ choices: [{ index: 0, delta: { role: "assistant" } }] }]),
+    );
+    expect(calls).toBe(2);
+    expect(finishReasonsOf(text)).toEqual(["length"]);
+  });
+
+  it("D3c: recovery that forwards content then DIES gets a synthesised \"length\" terminal", async () => {
+    // Real content reached the client, so failing open would splice two answers
+    // together — the retry's turn stands. But it never sent a terminal, so one is
+    // synthesised. The stream demonstrably broke mid-flight, which is what "length"
+    // means: cut before the model was done.
+    const { calls, text } = await runGuarded(brokenOriginal, () =>
+      sseThenError([{ choices: [{ index: 0, delta: { content: "writing the file" } }] }]),
+    );
+    expect(calls).toBe(2);
+    expect(text).toContain("writing the file");
+    expect(finishReasonsOf(text)).toEqual(["length"]);
+  });
+
+  it("D3d: recovery that forwards content and ends CLEANLY with no terminal gets \"stop\"", async () => {
+    // The ambiguous case, and the only one with no strictly honest answer: a clean EOF
+    // could be a sloppy upstream that never emits finish_reason, or an intermediary that
+    // closed tidily on a truncated turn. "stop" is chosen because nothing reported a cut;
+    // "length" here would make every turn from such an upstream look truncated and drive
+    // endless client-side auto-continuation.
+    const { calls, text } = await runGuarded(brokenOriginal, () =>
+      sseResponse([{ choices: [{ index: 0, delta: { content: "done, file written" } }] }]),
+    );
+    expect(calls).toBe(2);
+    expect(text).toContain("done, file written");
+    expect(finishReasonsOf(text)).toEqual(["stop"]);
+  });
+
+  it("D3e: recovery that forwards a COMPLETE tool call but no terminal gets \"tool_calls\"", async () => {
+    // The client holds a name and JSON-object arguments — an executable call. That IS
+    // why the turn ended; "length" would be the lie here, and would stop the client
+    // from dispatching a call it can run.
+    const { calls, text } = await runGuarded(brokenOriginal, () =>
+      sseThenError([
+        {
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  { index: 0, id: "r1", type: "function", function: { name: "write", arguments: '{"path":"a.html",' } },
+                ],
+              },
+            },
+          ],
+        },
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '"content":"hi"}' } }] } }] },
+      ]),
+    );
+    expect(calls).toBe(2);
+    expect(finishReasonsOf(text)).toEqual(["tool_calls"]);
+  });
+
+  it("D3f: recovery that forwards a TRUNCATED tool call and no terminal gets \"length\", not \"tool_calls\"", async () => {
+    // The retry's own fragments do not assemble into valid JSON. Telling the client
+    // "tool_calls" would order it to execute garbage; "length" maps to Anthropic
+    // max_tokens and prompts a clean re-ask.
+    const { calls, text } = await runGuarded(brokenOriginal, () =>
+      sseThenError([{ choices: [brokenCallDelta(0, "r1")] }]),
+    );
+    expect(calls).toBe(2);
+    expect(finishReasonsOf(text)).toEqual(["length"]);
+  });
+
+  it("D3g: a recovery that sends its OWN terminal gets exactly one, un-synthesised", async () => {
+    // The control case: sawFinishReason must suppress both the synthesised terminal and
+    // the held original one. Two terminals in one turn would be a worse bug than none.
+    const { calls, text } = await runGuarded(brokenOriginal, () =>
+      sseResponse([
+        { choices: [{ index: 0, delta: { content: "no tool needed" } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      ]),
+    );
+    expect(calls).toBe(2);
+    expect(finishReasonsOf(text)).toEqual(["stop"]);
+  });
+
+  it("D4a: the NON-STREAM twin recovers a truncated call under finish_reason:\"tool_calls\"", async () => {
+    // The stream path always caught this via `assembledCallsEmittable` (see the
+    // "assembledCallsEmittable: a CLEAN tool_calls finish..." test). The non-stream path
+    // has only detectIncompleteToolTurn, whose broken-args branch used to be gated on
+    // finish_reason === "length" — so /v1 non-stream shipped an unparseable call
+    // verbatim with `finish_reason:"tool_calls"`, no retry billed, no honesty fix.
+    // The gate is now `hasCalls` under any finish_reason, so the two paths agree.
+    let calls = 0;
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: () => {
+            calls += 1;
+            return jsonResponse({
+              id: "x",
+              choices: [
+                {
+                  index: 0,
+                  finish_reason: "tool_calls",
+                  message: {
+                    role: "assistant",
+                    content: null,
+                    tool_calls: [
+                      { id: "c", type: "function", function: { name: "write", arguments: '{"path":"a","content":"trunc' } },
+                    ],
+                  },
+                },
+              ],
+            });
+          },
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(
+      ctxWith(client, { model: "fast-glm", tools: TOOLS, messages: [{ role: "user", content: "x" }] }),
+    );
+    await res.text();
+    expect(calls).toBe(2); // a recovery retry must be attempted, as on the stream path
+  });
+
+  it("D4b: the NON-STREAM twin recovers a NAMELESS call", async () => {
+    // toolCallArgsBroken inspects `arguments` only, never `function.name`. The stream
+    // path's assembledCallsEmittable has always required a name; the non-stream path did
+    // not, so a call with nothing to dispatch was delivered as runnable — and it also
+    // makes the Anthropic non-stream converter's schema fail (`name: z.string()` is
+    // required), which falls back to returning the raw OpenAI body on /v1/messages.
+    // `toolCallNameMissing` now closes that gap for both paths.
+    let calls = 0;
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: () => {
+            calls += 1;
+            return jsonResponse({
+              id: "x",
+              choices: [
+                {
+                  index: 0,
+                  finish_reason: "length",
+                  message: {
+                    role: "assistant",
+                    content: null,
+                    tool_calls: [{ id: "c", type: "function", function: { arguments: '{"path":"a"}' } }],
+                  },
+                },
+              ],
+            });
+          },
+        },
+      ]),
+    });
+    const res = await singleStrategy.execute(
+      ctxWith(client, { model: "fast-glm", tools: TOOLS, messages: [{ role: "user", content: "x" }] }),
+    );
+    await res.text();
+    expect(calls).toBe(2);
+  });
+
+  it("D5: markTerminalLengthCut parses a terminal EXACTLY as handleLine does (trimStart + payload trim)", async () => {
+    // handleLine accepts `line.trimStart()` and then `payload.trim()`s before parsing;
+    // markTerminalLengthCut used to do neither. Any line handleLine accepted but the
+    // rewrite could not re-parse silently kept `finish_reason:"tool_calls"` for a call
+    // the guard had just dropped. Two divergences, pinned separately:
+    //
+    //  (a) LEADING WHITESPACE before `data:`. Not spec-legal SSE (the field name is
+    //      everything before the first colon, so " data" is not "data") — but handleLine
+    //      deliberately accepts it, and a half-accepting guard is the bug.
+    //  (b) A payload prefix that String.trim strips and JSON.parse REJECTS. JSON's
+    //      whitespace set is only space/tab/CR/LF; trim's is the full Unicode WhiteSpace
+    //      set plus U+FEFF. So `data:\u00A0{...}` parses in handleLine and threw here.
+    //      This is why `trimStart()` alone is not parity.
+    for (const frame of [
+      (c: unknown) => ` data:${JSON.stringify(c)}\n\n`,
+      (c: unknown) => `data:\u00A0${JSON.stringify(c)}\n\n`,
+    ]) {
+      const { text } = await runGuarded(() =>
+        rawSse([
+          frame({ choices: [brokenCallDelta(0, "c")] }),
+          frame({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+        ]),
+      );
+      expect(text).toContain('"finish_reason":"length"');
+      expect(text).not.toContain('"finish_reason":"tool_calls"');
+      expect(text).not.toContain("trunc");
+    }
+  });
+
+  it("D3h: a recovery's OWN terminal is forwarded and is the turn's only one — no synthesis, no held original", async () => {
+    // Reworked. The original D3h asserted that a terminal-ONLY retry counts as a
+    // replacement turn; R2 showed that was pinning a workaround (it shipped an empty
+    // tool turn), so that half now lives in R2 with the opposite expectation. What
+    // survives is the real invariant: once the retry has sent something substantive,
+    // its terminal goes out verbatim and nothing else follows it. `length` is chosen
+    // deliberately — a synthesised terminal for a retry that produced prose and no
+    // tool calls would say "stop", so dropping the retry's own terminal is visible.
+    const { calls, text } = await runGuarded(brokenOriginal, () =>
+      sseResponse([
+        { choices: [{ index: 0, delta: { content: "partial answer" } }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "length" }] },
+      ]),
+    );
+    expect(calls).toBe(2);
+    expect(text).toContain("partial answer");
+    expect(finishReasonsOf(text)).toEqual(["length"]);
+  });
+
+  it("D6: a failed recovery splices NOTHING but data: lines into the original turn", async () => {
+    // forwardLine used to enqueue every line of the retry stream verbatim. The
+    // cosmetic half was the blank separator trailing the swallowed `[DONE]` — a stray
+    // empty SSE line ahead of the fail-open terminal. The non-cosmetic half is the
+    // `event:` field: SSE `event:` is STICKY, naming the type of the NEXT dispatched
+    // event, and on the fail-open path that next event is the guard's OWN terminal.
+    // A retry that died after `event: error` therefore re-labelled the original
+    // terminal as an error event; `id:` similarly rewrote the client's Last-Event-ID
+    // from a stream that is not the one it is reading.
+    const noisyRetry = () =>
+      new Response(": keepalive\n\nevent: error\nid: 42\ndata: [DONE]\n\n", {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    const { calls, text } = await runGuarded(
+      () =>
+        sseResponse([
+          { choices: [brokenCallDelta(0, "c")] },
+          { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        ]),
+      noisyRetry,
+    );
+    expect(calls).toBe(2);
+    expect(text).not.toContain("event:"); // would re-type the guard's own terminal
+    expect(text).not.toContain("id: 42"); // not this stream's event id
+    expect(text).not.toContain("keepalive"); // the guard emits its own pings
+    expect(text.startsWith("\n\n")).toBe(false); // no leaked separator
+    expect(finishReasonsOf(text)).toEqual(["length"]); // fail-open, terminal rewritten
   });
 });

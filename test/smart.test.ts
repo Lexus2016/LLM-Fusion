@@ -7,7 +7,7 @@ import { parseConfig } from "../src/config";
 import { createLogger } from "../src/logging";
 import { createResilience } from "../src/concurrency";
 import { jsonResponse, sseResponse } from "./helpers";
-import type { ChatCompletionRequest, FetchFn, StrategyContext, UpstreamClient } from "../src/types";
+import type { ChatCompletionRequest, ChatMessage, FetchFn, StrategyContext, UpstreamClient } from "../src/types";
 
 const logger = createLogger({ level: "silent" });
 
@@ -188,6 +188,19 @@ function reqWithToolResult(model: string, toolContent: string): ChatCompletionRe
       { role: "tool", content: toolContent },
     ],
   };
+}
+
+/** Settle a request without throwing, so the assertion under test fails first. */
+function outcomeOf(p: Promise<Response>): Promise<Response | unknown> {
+  return p.then(
+    (res) => res,
+    (err: unknown) => err,
+  );
+}
+
+/** The name of a rejection reason, for asserting on an abort without casting. */
+function nameOf(err: unknown): string {
+  return err instanceof Error ? err.name : String(err);
 }
 
 describe("smart strategy", () => {
@@ -527,6 +540,157 @@ describe("smart strategy", () => {
     // Guard caught the fabricated image; default=simple runs, fusion panel does NOT.
     expect(called).toContain("deepseek");
     for (const p of PANEL) expect(called).not.toContain(p);
+  });
+
+  it("two smart models on DIFFERENT provider groups do not share one router decision", async () => {
+    // The cache is module-level and was keyed on the router body alone, but the body
+    // says nothing about WHERE the call goes: `dispatch` resolves
+    // `router.poolFor(entry.provider)`, so the same router name under two provider
+    // groups is two endpoints with two sets of credentials, quotas and health. A
+    // shared call bills one group for the other's request, and a dead router in one
+    // group would open the breaker for the healthy same-named router in the other.
+    //
+    // Its own config: the shared one has a single implied group, and two groups make
+    // `provider` mandatory on every model in it.
+    const smartOn = (group: string): Record<string, unknown> => ({
+      strategy: "smart",
+      provider: group,
+      router: "rt",
+      default: "simple",
+      simple: { target: "deepseek" },
+      fusion: { panel: ["p1", "p2", "p3"], judge: "jdg", synth: "syn" },
+    });
+    const account = (id: string): Record<string, unknown> => ({ id, api_key_env: "X" });
+    const twoGroups = parseConfig({
+      upstream,
+      providers: {
+        "group-a": { base_url: "https://a.test", accounts: [account("a1")] },
+        "group-b": { base_url: "https://b.test", accounts: [account("b1")] },
+      },
+      models: { "smart-a": smartOn("group-a"), "smart-b": smartOn("group-b") },
+    });
+
+    __resetRouterCacheForTesting();
+    const up = makeUpstream(chatWith(routeSimple));
+    const on = (model: string): StrategyContext => {
+      const entry = twoGroups.models[model];
+      if (!entry) throw new Error(`missing '${model}'`);
+      return {
+        request: req(model),
+        config: twoGroups,
+        client: up.client,
+        capabilities: new CapabilityService({
+          client: up.client,
+          getOverrides: () => twoGroups.overrides,
+          logger,
+        }),
+        logger,
+        modelConfig: entry,
+      };
+    };
+
+    await smartStrategy.execute(on("smart-a"));
+    await smartStrategy.execute(on("smart-b"));
+
+    expect(up.routerBodies()).toHaveLength(2);
+    // The bodies really are byte-identical — the key must separate them anyway.
+    expect(JSON.stringify(up.routerBodies()[0])).toBe(JSON.stringify(up.routerBodies()[1]));
+  });
+
+  it("an image buried in an OMITTED message does not share a decision with an image-less request", async () => {
+    // `renderRequestForRouter` compacts anything outside ROUTER_RECENT_WINDOW, so an
+    // `image_url` in a dropped message never produces a `[has image]` marker: the two
+    // renders below are identical while `requestHasImages` disagrees. That matters
+    // because the hallucination guard runs INSIDE the shared call, against the
+    // OWNER's request — so a cached "trusted" decision made for the request that has
+    // the image would be served to the one that does not, silently bypassing the
+    // guard for it.
+    __resetRouterCacheForTesting();
+    const filler = (i: number): ChatMessage => ({ role: "assistant", content: `step ${i}` });
+    const base = (withImage: boolean): ChatCompletionRequest => ({
+      model: "smart-inline",
+      messages: [
+        { role: "user", content: "start the task" }, // index 0 — always kept
+        filler(1),
+        withImage
+          ? { role: "assistant", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,AAA" } }] }
+          : filler(2), // index 2 — inside the omitted gap
+        filler(3),
+        filler(4),
+        filler(5),
+        filler(6),
+        filler(7),
+        filler(8),
+        { role: "user", content: "now finish it" },
+      ],
+    });
+
+    // The image-carrying request routes to `simple` -> `deepseek`, and
+    // `assertSingleVisionCapable` runs real discovery the moment images are
+    // present, so the mock has to answer for it or the test 400s before it can
+    // observe the cache at all.
+    const show = (): Response =>
+      jsonResponse({ capabilities: ["completion", "vision"], model_info: {} });
+    const up = makeUpstream(chatWith(routeSimple), show);
+    await smartStrategy.execute(ctx(up.client, base(true), "smart-inline"));
+    await smartStrategy.execute(ctx(up.client, base(false), "smart-inline"));
+
+    const bodies = up.routerBodies();
+    expect(bodies).toHaveLength(2); // no cache hit
+    // Prove the premise: the rendered transcripts really are identical, and the
+    // buried image left no `[has image]` marker for the router to see.
+    const rendered = bodies.map((b) => JSON.stringify(b.messages));
+    expect(rendered[0]).toBe(rendered[1]);
+    expect(rendered[0]).not.toContain("has image");
+  });
+
+  it("a guard-rejected decision is NOT cached: the next identical request re-asks the router", async () => {
+    // The source comment on the hallucination guard says "Do NOT cache it", and
+    // nothing pinned that. It matters twice over. A cached rejection would (a) serve
+    // the untrustworthy decision's fallback to every later identical request without
+    // the guard ever running again, and (b) make one confabulation permanent for the
+    // lifetime of the process — the router never gets a chance to answer honestly.
+    __resetRouterCacheForTesting();
+    let call = 0;
+    const up = makeUpstream(
+      chatWith(() => {
+        call += 1;
+        // First answer fabricates an image and is rejected; the second is honest.
+        return call === 1 ? routeFusionClaimingImage() : routeFusion();
+      }),
+    );
+
+    const first = await smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+    expect(first.status).toBe(200);
+    expect(up.modelsCalled()).toContain("deepseek"); // guard forced default=simple
+    for (const p of PANEL) expect(up.modelsCalled()).not.toContain(p);
+
+    const second = await smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+    expect(second.status).toBe(200);
+    // Two router calls, not one: the rejected decision never entered the cache.
+    expect(up.routerBodies()).toHaveLength(2);
+    // And the honest second decision is trusted — the fusion panel actually runs.
+    for (const p of PANEL) expect(up.modelsCalled()).toContain(p);
+  });
+
+  it("a router failure recorded as no-decision is NOT cached either", async () => {
+    // Same invariant on the other three no-decision paths: `classifyUncached`
+    // returns `null` and `classify` maps it to the caller's default, but nothing
+    // is written to `routerCache`, so a transient blip self-heals on the next
+    // request instead of pinning `default` for the process lifetime.
+    __resetRouterCacheForTesting();
+    let call = 0;
+    const up = makeUpstream(
+      chatWith(() => {
+        call += 1;
+        return call === 1 ? routerError() : routeFusion();
+      }),
+    );
+
+    await smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+    await smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+    expect(up.routerBodies()).toHaveLength(2);
+    for (const p of PANEL) expect(up.modelsCalled()).toContain(p);
   });
 
   it("router reason naming a diagram as OUTPUT (no image) -> NOT flagged, fusion trusted", async () => {
@@ -1206,6 +1370,14 @@ describe("smart router coalescing vs client disconnect", () => {
       // A real fetch fails the moment its signal aborts. Honouring that here is
       // what lets the tests below observe a caller's signal reaching (or, with
       // the fix, NOT reaching) a call that other callers share.
+      // An ALREADY-aborted signal never fires `abort`, so the listener below
+      // would hang where a real fetch rejects at once. No current test hits this
+      // (the router signal is `stageAbort`, never pre-aborted), but it turns into
+      // a suite hang the moment someone re-wires `ctx.signal` into the call.
+      if (signal?.aborted) {
+        entered();
+        return Promise.reject(new DOMException("This operation was aborted", "AbortError"));
+      }
       signal?.addEventListener(
         "abort",
         () => failWith(new DOMException("This operation was aborted", "AbortError")),
@@ -1224,19 +1396,6 @@ describe("smart router coalescing vs client disconnect", () => {
       answer: (route) => answerWith(route === "simple" ? routeSimple() : routeFusion()),
       fail: (message) => failWith(new Error(message)),
     };
-  }
-
-  /** Settle a request without throwing, so the assertion under test fails first. */
-  function outcomeOf(p: Promise<Response>): Promise<Response | unknown> {
-    return p.then(
-      (res) => res,
-      (err: unknown) => err,
-    );
-  }
-
-  /** The name of a rejection reason, for asserting on an abort without casting. */
-  function nameOf(err: unknown): string {
-    return err instanceof Error ? err.name : String(err);
   }
 
   it("caller A's disconnect neither rejects nor degrades caller B's coalesced classification", async () => {
@@ -1331,6 +1490,36 @@ describe("smart router coalescing vs client disconnect", () => {
     expect(nameOf(err)).toBe("AbortError");
   });
 
+  it("a coalesced waiter falls back to ITS OWN default route, not the owner's", async () => {
+    // `routerCacheKey` hashes only the ROUTER body (router model + rendered
+    // transcript). Two smart models that share a router therefore share a key,
+    // even when their `default` routes differ. `classifyUncached` closes over the
+    // OWNER's `cfg.default` and returns it on failure, so every coalesced waiter
+    // inherits a fallback it was never configured with — here `smart-default-fusion`
+    // (default: fusion) is silently degraded to the owner's `simple`. The reverse
+    // pairing is worse: a `default: simple` model coalesced behind a `default:
+    // fusion` owner pays for a whole panel it never asked for.
+    const router = gatedRouterUpstream();
+    const resilience = createResilience({ maxConcurrency: 4 });
+    const mk = (model: string): StrategyContext => ({
+      ...ctx(router.up.client, req(model), model),
+      resilience,
+    });
+
+    const a = smartStrategy.execute(mk("smart-inline")); // default: simple
+    const b = smartStrategy.execute(mk("smart-default-fusion")); // default: fusion
+    await router.inFlight;
+    router.fail("router upstream exploded");
+    await a;
+    await b;
+
+    const called = router.up.modelsCalled();
+    expect(called.filter((m) => m === "rt")).toHaveLength(1); // coalescing happened
+    // The waiter's own default is `fusion`, so its panel must run.
+    expect(called).toContain("p1");
+    expect(called.filter((m) => m === "deepseek")).toHaveLength(1); // only the owner went simple
+  });
+
   it("a genuine router failure still trips the breaker after the owning caller left", async () => {
     // failureThreshold 1: one recordFailure("rt") flips the breaker open, so the
     // state assertion is a second witness independent of the spy.
@@ -1359,5 +1548,73 @@ describe("smart router coalescing vs client disconnect", () => {
     expect(resilience.breaker.getState("rt")).toBe("open");
     expect(nameOf(err)).toBe("AbortError"); // and the departed caller still stops
     expect(router.up.modelsCalled()).toEqual(["rt"]);
+  });
+});
+
+// --- A caller that is already gone must not be charged for an escalation ----
+//
+// `execute` checks `ctx.signal?.throwIfAborted()` right after `classify`, but the
+// `escalate_on_tool_error` branch returns BEFORE `classify` is ever reached, so
+// that check does not guard it. An already-disconnected client whose latest tool
+// result looks like a failure therefore pays for a whole fusion panel (3 panel
+// members + judge + synth, plus a fallback simple call if the panel fails) with
+// nobody left to read the answer — the single most expensive path in the strategy.
+describe("smart escalation vs a caller that already left", () => {
+  beforeEach(() => __resetRouterCacheForTesting());
+
+  it("spends zero upstream calls when the signal is already aborted on the tool-error escalation path", async () => {
+    const gone = new AbortController();
+    gone.abort(); // the client is gone before the strategy is even entered
+    const up = makeUpstream(chatWith(routeSimple));
+
+    const err = await outcomeOf(
+      smartStrategy.execute({
+        // `smart-inline` leaves escalate_on_tool_error at its default (true), and
+        // this tool result matches TOOL_ERROR_PATTERNS, so escalation fires.
+        ...ctx(up.client, reqWithToolResult("smart-inline", "TypeError: boom"), "smart-inline"),
+        resilience: createResilience({ maxConcurrency: 4 }),
+        signal: gone.signal,
+      }),
+    );
+
+    // Not one token: no router call (escalation skips it) AND no panel.
+    expect(up.modelsCalled()).toEqual([]);
+    expect(nameOf(err)).toBe("AbortError");
+  });
+
+  it("still escalates to the full panel when the caller is connected", async () => {
+    // Guards the fix from over-reach: the abort check must not short-circuit a
+    // live escalation. Same request, live signal -> the panel actually runs.
+    const up = makeUpstream(chatWith(routeSimple));
+    const res = await smartStrategy.execute({
+      ...ctx(up.client, reqWithToolResult("smart-inline", "TypeError: boom"), "smart-inline"),
+      resilience: createResilience({ maxConcurrency: 4 }),
+      signal: new AbortController().signal,
+    });
+
+    expect(res.status).toBe(200);
+    expect(up.routerBodies()).toHaveLength(0); // escalation skips the router
+    expect(up.modelsCalled()).toEqual([...PANEL, "jdg", "syn"]);
+  });
+
+  it("spends zero upstream calls when an already-gone caller takes the ordinary routed path", async () => {
+    // The same over-charge exists one branch further down for any pre-aborted
+    // caller: without a top-of-execute check, `classify` issues a real router
+    // call for a request nobody is reading. The post-classify check only stops
+    // the sub-strategy, not the classifier itself.
+    const gone = new AbortController();
+    gone.abort();
+    const up = makeUpstream(chatWith(routeSimple));
+
+    const err = await outcomeOf(
+      smartStrategy.execute({
+        ...ctx(up.client, req("smart-inline"), "smart-inline"),
+        resilience: createResilience({ maxConcurrency: 4 }),
+        signal: gone.signal,
+      }),
+    );
+
+    expect(up.modelsCalled()).toEqual([]);
+    expect(nameOf(err)).toBe("AbortError");
   });
 });

@@ -368,8 +368,15 @@ export function makeReasoningPromotionTransform(): TransformStream<Uint8Array, U
   };
 
   const handleLine = (line: string): string => {
-    if (!line.startsWith("data:")) return line; // blank separators, comments, etc.
-    const payload = line.slice("data:".length).trim();
+    // `trimStart()` before the prefix test: without it a `data:` line carrying any
+    // leading whitespace misses this transform entirely and is forwarded VERBATIM,
+    // reasoning fields and all. That is a fail-OPEN in a transform whose whole
+    // purpose is to fail closed (see `unparsedToolCalls` below) — the leading-space
+    // form is not spec-legal SSE, but the cost of accepting it is one `trimStart()`
+    // and the cost of rejecting it is chain-of-thought in an agent transcript.
+    const trimmed = line.trimStart();
+    if (!trimmed.startsWith("data:")) return line; // blank separators, comments, etc.
+    const payload = trimmed.slice("data:".length).trim();
     if (payload.length === 0) return line;
     if (payload === "[DONE]") {
       const tail = tailChunkLine();
