@@ -367,6 +367,20 @@ async function accumulateStreamAndTrack(
   const decoder = new TextDecoder();
   let accumulatedRaw = "";
   let calledFirstToken = false;
+  // First-token detection scans only what has newly arrived. Re-scanning the WHOLE
+  // accumulated buffer on every chunk is quadratic, and the trigger is real: a
+  // provider that streams its thinking phase in a field `hasUsableDelta` does not
+  // recognise (`reasoning_details`, vendor `thinking`) never flips the latch, so
+  // every chunk re-parses every earlier chunk. Measured on synthetic 194-byte SSE:
+  // 2000 unrecognised deltas => ~2e6 JSON.parse calls and ~2.1s of SYNCHRONOUS
+  // event-loop stall — the whole single-threaded gateway blocks.
+  // `scanFrom` only ever advances to just past the LAST newline in the buffer, so a
+  // `data:` line split across two reads is scanned once, whole, when its newline
+  // arrives — never as two halves that both fail to parse.
+  let scanFrom = 0;
+  // First non-whitespace char of the body, latched once: distinguishes a raw JSON
+  // response from an SSE stream without re-trimming the whole buffer per chunk.
+  let firstNonWs = "";
   const toolCalls: unknown[] = [];
 
   const captureToolCalls = (delta: unknown): void => {
@@ -402,28 +416,36 @@ async function accumulateStreamAndTrack(
         accumulatedRaw += chunkStr;
 
         if (accumulatedRaw.length > 0 && !calledFirstToken) {
-          const trimmed = accumulatedRaw.trim();
-          if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+          if (firstNonWs === "") {
+            const m = /\S/.exec(accumulatedRaw);
+            if (m) firstNonWs = m[0];
+          }
+          if (firstNonWs === "{" || firstNonWs === "[") {
             // Raw JSON response
             calledFirstToken = true;
             onFirstToken();
-          } else if (trimmed.includes("data:")) {
-            // Check if we received the first real data chunk in SSE
-            const lines = trimmed.split("\n");
-            for (const line of lines) {
-              const tl = line.trim();
-              if (tl.startsWith("data:") && tl !== "data: [DONE]") {
-                try {
-                  const payload = tl.slice("data:".length).trim();
-                  const chunk = JSON.parse(payload);
-                  const delta = chunk.choices?.[0]?.delta;
-                  if (hasUsableDelta(delta)) {
-                    calledFirstToken = true;
-                    onFirstToken();
-                    break;
+          } else if (firstNonWs !== "") {
+            // SSE: scan only the newly-arrived complete lines. Everything before
+            // `scanFrom` was already scanned and did not yield a usable delta.
+            const lastNl = accumulatedRaw.lastIndexOf("\n");
+            if (lastNl >= scanFrom) {
+              const segment = accumulatedRaw.slice(scanFrom, lastNl + 1);
+              scanFrom = lastNl + 1;
+              for (const line of segment.split("\n")) {
+                const tl = line.trim();
+                if (tl.startsWith("data:") && tl !== "data: [DONE]") {
+                  try {
+                    const payload = tl.slice("data:".length).trim();
+                    const chunk = JSON.parse(payload);
+                    const delta = chunk.choices?.[0]?.delta;
+                    if (hasUsableDelta(delta)) {
+                      calledFirstToken = true;
+                      onFirstToken();
+                      break;
+                    }
+                  } catch {
+                    // ignore
                   }
-                } catch {
-                  // ignore
                 }
               }
             }
@@ -502,6 +524,15 @@ async function runPanel(
   return new Promise<{ answers: PanelAnswer[]; permanentlyUnavailable: number }>((resolve) => {
     const adversarialIdx =
       opts.adversarialModel !== null ? members.indexOf(opts.adversarialModel) : -1;
+    // Latched the moment the panel resolves. Aborting a straggler is best-effort —
+    // the abort check sits before `reader.read()`, so a member whose stream already
+    // reached `done` returns normally and used to push into `answers` AFTER the
+    // consumer had taken the array by reference. The judge then analysed N answers
+    // while the synth was handed N+1 and `panel_ok` under-reported both: the same
+    // request produced different fusion output run to run. The latch stops the late
+    // push (and the pointless post-resolve abort sweep); the array is also snapshot
+    // at resolve so nothing can mutate what the caller holds.
+    let settled = false;
     const checkFinished = () => {
       const successfulCount = answers.length;
       if (successfulCount >= minSuccess) {
@@ -521,14 +552,16 @@ async function runPanel(
           }
         }
         if (adversarialDone) {
-          resolve({ answers, permanentlyUnavailable: countPermanentlyUnavailable() });
+          settled = true;
+          resolve({ answers: [...answers], permanentlyUnavailable: countPermanentlyUnavailable() });
           return true;
         }
         // Adversarial still running: keep waiting. Other stragglers already aborted.
         return false;
       }
       if (completedCount === members.length) {
-        resolve({ answers, permanentlyUnavailable: countPermanentlyUnavailable() });
+        settled = true;
+        resolve({ answers: [...answers], permanentlyUnavailable: countPermanentlyUnavailable() });
         return true;
       }
       return false;
@@ -561,6 +594,7 @@ async function runPanel(
         .then((ans) => {
           completed[i] = true;
           completedCount++;
+          if (settled) return;
           if (ans) {
             answers.push(ans);
           }
@@ -569,6 +603,7 @@ async function runPanel(
         .catch((err) => {
           completed[i] = true;
           completedCount++;
+          if (settled) return;
           if (!controller.signal.aborted) {
             ctx.logger.warn(
               { member, reason: err instanceof Error ? err.message : String(err) },
@@ -2309,22 +2344,84 @@ function renderPanelForJudge(panelAnswers: PanelAnswer[]): string {
 }
 
 /**
+ * Total budget for the rendered request handed to the judge / bineval. The role
+ * filter alone does not bound growth: a long agent session accumulates hundreds of
+ * user turns, and one pasted file in a single `user` message is already unbounded.
+ * The judge call is `stream:false` with `response_format: json_object`, so overflow
+ * comes back as an upstream 400 and `runJudge` returns null — a SILENT degrade to
+ * raw panel answers. Bounded input is cheaper than that failure mode.
+ */
+const JUDGE_REQUEST_MAX_CHARS = 120_000;
+
+/**
  * Render the user's instruction for the judge: the `user`/`system` messages only.
  * The judge needs to know WHAT WAS ASKED to adjudicate factual conflicts, but the
  * assistant/tool history is what the panel already digested into its answers, so
  * re-sending it would just bloat the judge call (often the bulk of a large context).
+ *
+ * Bounded twice.
+ *
+ * 1. Per message via `capPanelMessageContent` (head+tail, so a single pasted file
+ *    cannot dominate) — but ONLY when the whole conversation exceeds
+ *    `PANEL_MAX_CHARS`, which is the exact condition `compressPanelMessages` uses
+ *    to start capping the panel's own messages. Gating on the same total over the
+ *    same array is the point: below the threshold the panel members answer against
+ *    verbatim text, so the judge must adjudicate against verbatim text too.
+ *    Ungated, an ordinary request with one 10 KB pasted file (total far under
+ *    200k) left the judge reading an 8 KB excerpt of a question the panel saw in
+ *    full — a judge less informed than the thing it judges.
+ * 2. Over the whole render, unconditionally — head and tail lines are kept and the
+ *    middle is replaced with an omission marker, because the first system prompt
+ *    and the latest instruction are the two things the judge actually adjudicates
+ *    against. This is the judge's own budget, not the panel's: the judge call is
+ *    `stream:false` + `json_object`, so overflow is a silent degrade (see
+ *    `JUDGE_REQUEST_MAX_CHARS`). It stays in force in both branches.
  */
 function renderRequestForJudge(request: ChatCompletionRequest): string {
   const messages: ChatMessage[] = Array.isArray(request.messages) ? request.messages : [];
+  // Same predicate, same input array, same threshold as compressPanelMessages.
+  const capPerMessage = approxTotalChars(messages) > PANEL_MAX_CHARS;
   const lines: string[] = [];
+  let total = 0;
   for (const m of messages) {
     const role = typeof m.role === "string" ? m.role : "user";
     if (role !== "user" && role !== "system") continue;
+    const capped = capPerMessage ? capPanelMessageContent(m.content) : m.content;
     const text =
-      typeof m.content === "string" ? m.content : Array.isArray(m.content) ? "[multimodal content]" : "";
-    if (text.length > 0) lines.push(`${role}: ${text}`);
+      typeof capped === "string" ? capped : Array.isArray(m.content) ? "[multimodal content]" : "";
+    if (text.length > 0) {
+      const line = `${role}: ${text}`;
+      lines.push(line);
+      total += line.length + 1;
+    }
   }
-  return lines.join("\n");
+  if (total <= JUDGE_REQUEST_MAX_CHARS) return lines.join("\n");
+
+  // Over budget: keep the head (system prompts + original task) and the tail (the
+  // instruction actually in play), drop the middle.
+  const half = Math.floor(JUDGE_REQUEST_MAX_CHARS / 2);
+  const head: string[] = [];
+  let headChars = 0;
+  let i = 0;
+  for (; i < lines.length; i++) {
+    const line = lines[i];
+    if (line === undefined) continue;
+    if (headChars + line.length > half) break;
+    head.push(line);
+    headChars += line.length + 1;
+  }
+  const tail: string[] = [];
+  let tailChars = 0;
+  let j = lines.length - 1;
+  for (; j >= i; j--) {
+    const line = lines[j];
+    if (line === undefined) continue;
+    if (tailChars + line.length > half) break;
+    tail.unshift(line);
+    tailChars += line.length + 1;
+  }
+  const omitted = j - i + 1;
+  return [...head, `…[${omitted} message(s) omitted]…`, ...tail].join("\n");
 }
 
 // --- Shared helpers --------------------------------------------------------
@@ -2395,7 +2492,6 @@ const ToolSchema = z
   })
   .passthrough();
 
-/** True when the conversation already contains a `role:"tool"` message. */
 /**
  * True when the LATEST message is a tool result — i.e. the agent is mid-loop,
  * mechanically continuing ("read this tool output, pick the next call"). A fresh
@@ -2524,7 +2620,7 @@ async function buildPanelWebContext(
     return null;
   }
   const gcfg: WebGroundingConfig = {
-    apiKey: apiKey as string,
+    apiKey,
     maxResults: ws.max_results,
     timeoutMs: ws.timeout_s * 1000,
     maxContextChars: ws.max_context_chars,

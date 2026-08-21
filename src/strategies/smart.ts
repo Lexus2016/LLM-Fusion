@@ -202,6 +202,13 @@ async function executeFusionWithFallback(ctx: StrategyContext, cfg: SmartModelCo
   try {
     return await fusionStrategy.execute({ ...ctx, modelConfig });
   } catch (err) {
+    // Client disconnect is not a fusion failure worth compensating for: there is
+    // nobody left to answer, so falling back would spend a limiter slot and one
+    // knowingly-doomed upstream call on a dead request. Detect via the client
+    // signal, not the error name — a client disconnect often surfaces as an
+    // aggregated FusionError ("all panel members failed"), while a *stage*
+    // timeout surfaces as an AbortError and must still fall back to simple.
+    if (ctx.signal?.aborted) throw err;
     // If fusion fails at any stage (panel failure, judge error, synth timeout,
     // circuit open, etc.), degrade to simple so the request still gets a response.
     ctx.logger.warn(
@@ -451,12 +458,6 @@ function resolveFusion(ctx: StrategyContext, cfg: SmartModelConfig): FusionModel
   return target;
 }
 
-/** Parse the router content as a route decision; null on any failure. */
-/**
- * Does a free-text router reason claim the request carried an image, screenshot,
- * photo, or other visual/attached content? Used by the hallucination guard to
- * catch a router that invents multimodal input to justify its route.
- */
 /**
  * Does a free-text router reason AFFIRMATIVELY claim the request carried an
  * image, screenshot, photo, or other visual/attached content? Used by the
@@ -499,6 +500,7 @@ function claimsImage(reason: string | undefined): boolean {
   );
 }
 
+/** Parse the router content as a route decision; null on any failure. */
 function parseRouteDecision(content: string | null): RouteDecision | null {
   if (content === null) return null;
   // Same fence/prose-tolerance as the judge: extract the balanced JSON object so a

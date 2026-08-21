@@ -433,7 +433,9 @@ export function openAiToAnthropicResponse(
                     .array(
                       z.object({
                         id: z.string(),
-                        function: z.object({ name: z.string(), arguments: z.string() }).passthrough(),
+                        function: z
+                          .object({ name: z.string(), arguments: z.string().default("") })
+                          .passthrough(),
                       }).passthrough(),
                     )
                     .optional(),
@@ -472,13 +474,9 @@ export function openAiToAnthropicResponse(
 
   let toolInputsComplete = true;
   for (const tc of message?.tool_calls ?? []) {
-    let input: Record<string, unknown> = {};
-    try {
-      input = JSON.parse(tc.function.arguments);
-    } catch {
-      input = {};
-      toolInputsComplete = false;
-    }
+    const parsedInput = parseToolArguments(tc.function.arguments);
+    if (parsedInput === null) toolInputsComplete = false;
+    const input: Record<string, unknown> = parsedInput ?? {};
     contentBlocks.push({
       type: "tool_use",
       id: tc.id,
@@ -500,6 +498,31 @@ export function openAiToAnthropicResponse(
       output_tokens: usage.completionTokens,
     },
   };
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Parse a tool call's `arguments` string, or `null` when it is NOT a complete,
+ * runnable object — i.e. truncated/unparseable JSON, or a scalar/array where an
+ * object is required. An EMPTY string is a legitimate no-arg call and parses to
+ * `{}`: `JSON.parse("")` throws, so treating a throw as truncation misreported
+ * every no-arg tool call as "max_tokens".
+ *
+ * Duplicated on purpose: the sibling is `isParsableJson` in
+ * src/strategies/fusion.ts; lifting it into a shared module is a separate pass.
+ */
+function parseToolArguments(args: string): Record<string, unknown> | null {
+  if (args.length === 0) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(args);
+  } catch {
+    return null;
+  }
+  return isJsonObject(parsed) ? parsed : null;
 }
 
 function finishReasonToAnthropic(
@@ -590,6 +613,31 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
     data: unknown,
   ): void => {
     controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+  };
+
+  /**
+   * Emit `message_start` exactly once. Anthropic SSE requires it before any
+   * other event, and an upstream body of only `data: [DONE]` (or only comments)
+   * reaches the flush tail without a single parsed chunk — the tail then has to
+   * open the message itself, or the client sees message_delta/message_stop with
+   * no message_start at all.
+   */
+  const ensureStarted = (controller: TransformStreamDefaultController<Uint8Array>): void => {
+    if (started) return;
+    started = true;
+    emit(controller, "message_start", {
+      type: "message_start",
+      message: {
+        id: opts.reqId,
+        type: "message",
+        role: "assistant",
+        model: opts.model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    });
   };
 
   const stopActiveBlock = (controller: TransformStreamDefaultController<Uint8Array>): void => {
@@ -779,22 +827,7 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
         if (payload === "[DONE]") continue;
         try {
           const obj = JSON.parse(payload);
-          if (!started) {
-            started = true;
-            emit(controller, "message_start", {
-              type: "message_start",
-              message: {
-                id: opts.reqId,
-                type: "message",
-                role: "assistant",
-                model: opts.model,
-                content: [],
-                stop_reason: null,
-                stop_sequence: null,
-                usage: { input_tokens: 0, output_tokens: 0 },
-              },
-            });
-          }
+          ensureStarted(controller);
           handleChunk(obj, controller);
         } catch {
           // Malformed SSE line. Fail closed on tool turns for the same reason
@@ -813,22 +846,7 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
           if (payload !== "[DONE]") {
             try {
               const obj = JSON.parse(payload);
-              if (!started) {
-                started = true;
-                emit(controller, "message_start", {
-                  type: "message_start",
-                  message: {
-                    id: opts.reqId,
-                    type: "message",
-                    role: "assistant",
-                    model: opts.model,
-                    content: [],
-                    stop_reason: null,
-                    stop_sequence: null,
-                    usage: { input_tokens: 0, output_tokens: 0 },
-                  },
-                });
-              }
+              ensureStarted(controller);
               handleChunk(obj, controller);
             } catch {
               /* ignore */
@@ -836,6 +854,12 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
           }
         }
       }
+
+      // The tail always closes a well-formed message, even when not one chunk
+      // parsed (e.g. a body of only `data: [DONE]`): open it first, so
+      // message_delta/message_stop can never precede message_start. In the
+      // normal path `started` is already true and this is a no-op.
+      ensureStarted(controller);
 
       // A false-partial think tag carried to the very end of the stream is
       // literal text (e.g. "<tho…") — surface it instead of swallowing it. The
@@ -858,14 +882,7 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
       // content but stop_reason:"end_turn" and never runs the tool.
       const toolInputsComplete =
         toolBlockIndex.size > 0 &&
-        [...toolArgs.values()].every((args) => {
-          try {
-            JSON.parse(args);
-            return true;
-          } catch {
-            return false;
-          }
-        });
+        [...toolArgs.values()].every((args) => parseToolArguments(args) !== null);
       const stopReason = finishReasonToAnthropic(
         finishReason,
         toolBlockIndex.size > 0 ? [{ type: "tool_use" }] : [],

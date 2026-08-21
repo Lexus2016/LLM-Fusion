@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { parseConfig, createConfigManager, findPanelContentionOverlaps } from "../src/config";
 import { createLogger } from "../src/logging";
-import { mkdtempSync, writeFileSync, renameSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, renameSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -276,17 +276,44 @@ describe("config hot-reload", () => {
     renameSync(tmp, path);
   }
 
-  async function waitFor(pred: () => boolean, timeoutMs: number): Promise<void> {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
+  /**
+   * Poll `pred` until it holds.
+   *
+   * Two hardenings over a plain sleep-poll, both aimed at full-suite load:
+   *  - `pred()` is re-checked once AFTER the deadline expires. Under CPU
+   *    saturation the vitest worker gets descheduled while `Date.now()` keeps
+   *    advancing, so the budget can burn out with the reload callback already
+   *    queued (or even already run). Without this re-check that is a spurious
+   *    failure.
+   *  - optional `poke`, invoked at most every ~750ms of waiting, to re-issue the
+   *    pending write. On macOS libuv starts the FSEvents stream asynchronously,
+   *    so a rename landing right after `watch()` returns can be missed; a poke
+   *    self-heals that in <1s instead of burning the whole budget.
+   *
+   * A `poke` MUST re-write the SAME content as the write being waited on —
+   * otherwise the wait can succeed against content the test never asserted.
+   */
+  async function waitFor(pred: () => boolean, timeoutMs: number, poke?: () => void): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let lastPoke = Date.now();
+    while (Date.now() < deadline) {
       if (pred()) return;
+      if (poke && Date.now() - lastPoke >= 750) {
+        poke();
+        lastPoke = Date.now();
+      }
       await new Promise((r) => setTimeout(r, 50));
     }
+    // Starved past the deadline with the work possibly already done.
+    if (pred()) return;
     throw new Error("waitFor timed out");
   }
 
   it("survives repeated atomic saves — the watcher re-arms (fires more than once)", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "llm-fusion-cfg-"));
+    // realpath: on macOS mkdtempSync returns /var/folders/... which is a symlink
+    // to /private/var/...; resolving it removes one class of FSEvents path
+    // mismatch between the watched dir and the renamed-in file. Belt-and-braces.
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "llm-fusion-cfg-")));
     const path = join(dir, "fusion.yaml");
     writeFileSync(path, yaml("glm-5.2"));
     const mgr = await createConfigManager(path, createLogger({ level: "silent" }));
@@ -298,14 +325,31 @@ describe("config hot-reload", () => {
       // Two SEPARATE atomic saves. With the old single-shot fs.watch the FIRST
       // rename detached the watcher from the new inode, so the SECOND save was
       // silently missed and `reloads` stalled at 1 — the exact bug this guards.
-      writeAtomic(path, yaml("kimi-k2.7-code"));
-      await waitFor(() => reloads >= 1, 8000);
-      writeAtomic(path, yaml("deepseek-v4-pro"));
-      await waitFor(() => reloads >= 2, 8000);
+      const target = (): string | null => {
+        const m = mgr.config.models["fast"];
+        return m && m.strategy === "single" ? m.target : null;
+      };
+
+      const firstContent = yaml("kimi-k2.7-code");
+      writeAtomic(path, firstContent);
+      // poke re-writes the IDENTICAL content, so a re-delivered reload can only
+      // ever observe "kimi-k2.7-code" here — never a value the test asserts on.
+      await waitFor(() => reloads >= 1, 8000, () => writeAtomic(path, firstContent));
+
+      // Baseline: a poke above may legitimately have produced more than one
+      // reload, so the second save must be proven by a FRESH reload plus the new
+      // content — not by the running total crossing 2.
+      const afterFirst = reloads;
+      const secondContent = yaml("deepseek-v4-pro");
+      writeAtomic(path, secondContent);
+      await waitFor(
+        () => reloads > afterFirst && target() === "deepseek-v4-pro",
+        8000,
+        () => writeAtomic(path, secondContent),
+      );
 
       expect(reloads).toBeGreaterThanOrEqual(2);
-      const m = mgr.config.models["fast"];
-      expect(m && m.strategy === "single" ? m.target : null).toBe("deepseek-v4-pro");
+      expect(target()).toBe("deepseek-v4-pro");
     } finally {
       mgr.close();
       rmSync(dir, { recursive: true, force: true });

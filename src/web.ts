@@ -64,7 +64,7 @@ export interface WebGroundingConfig {
 }
 
 /** A Tavily key is "present" iff it is a non-empty trimmed string. */
-export function webGroundingEnabled(apiKey: string | undefined): boolean {
+export function webGroundingEnabled(apiKey: string | undefined): apiKey is string {
   return typeof apiKey === "string" && apiKey.trim().length > 0;
 }
 

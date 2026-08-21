@@ -1,10 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { mkdtemp, writeFile, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { MiddlewareHandler } from "hono";
 import pino from "pino";
-import { createConfigEditorApp } from "../src/panel/config_editor";
+import { createConfigEditorApp, createSerializer, BACKUP_RETENTION } from "../src/panel/config_editor";
 import { loadConfigFile } from "../src/config";
 
 const logger = pino({ level: "silent" });
@@ -318,5 +318,160 @@ describe("config editor — global settings & restart (Task 2)", () => {
     expect(res.status).toBe(200);
     expect((await res.json()).restarting).toBe(true);
     expect(restarted).toBe(1);
+  });
+});
+
+describe("config editor — concurrent saves & backup retention", () => {
+  it("two concurrent saves both land; neither is lost and the file stays valid", async () => {
+    const { app, path } = await setup();
+    // Fired without awaiting the first: the two handlers interleave at every
+    // await inside applyEdit. Unserialized, both read the same base text and the
+    // later rename discards the earlier model.
+    const [a, b] = await Promise.all([
+      put(app, "/admin/config/models/model-a", { strategy: "single", target: "t-a" }),
+      put(app, "/admin/config/models/model-b", { strategy: "single", target: "t-b" }),
+    ]);
+    expect([a.status, b.status]).toEqual([200, 200]);
+    const text = await readFile(path, "utf8");
+    expect(text).toContain("keep this comment"); // still comment-preserving
+    const cfg = await loadConfigFile(path); // parses AND validates
+    expect(Object.keys(cfg.models)).toContain("model-a");
+    expect(Object.keys(cfg.models)).toContain("model-b");
+    expect(Object.keys(cfg.models)).toContain("fast-glm"); // pre-existing model untouched
+    // No temp file left behind, and no two writers shared one temp path.
+    expect((await readdir(dirname(path))).some((f) => f.includes(".tmp-"))).toBe(false);
+  });
+
+  it("eight concurrent saves all land", async () => {
+    const { app, path } = await setup();
+    const names = ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8"];
+    const results = await Promise.all(
+      names.map((n) => put(app, `/admin/config/models/${n}`, { strategy: "single", target: `t-${n}` })),
+    );
+    expect(results.map((r) => r.status)).toEqual(names.map(() => 200));
+    const cfg = await loadConfigFile(path);
+    for (const n of names) expect(Object.keys(cfg.models)).toContain(n);
+  });
+
+  it("prunes backups to the newest BACKUP_RETENTION after a save", async () => {
+    const { app, path, dir } = await setup();
+    // 15 pre-existing backups, oldest first (ISO stamps sort chronologically).
+    const stale = Array.from({ length: 15 }, (_, i) => `fusion.yaml.bak-2000-01-01T00-00-${String(i).padStart(2, "0")}-000Z`);
+    for (const f of stale) await writeFile(join(dir, f), "stale\n", "utf8");
+
+    const res = await put(app, "/admin/config/models/fast-kimi", { strategy: "single", target: "kimi-k2.7-code" });
+    expect(res.status).toBe(200);
+
+    const backups = (await readdir(dir)).filter((f) => f.startsWith("fusion.yaml.bak-")).sort();
+    expect(backups.length).toBe(BACKUP_RETENTION);
+    // The 6 oldest are gone, the newest stale ones and the fresh backup remain.
+    expect(backups).not.toContain(stale[0]);
+    expect(backups).not.toContain(stale[5]);
+    expect(backups).toContain(stale[6]);
+    expect(backups).toContain(stale[14]);
+    expect(backups.at(-1)).not.toBe(stale[14]); // the save's own backup is the newest
+    // Pruning never touches the config itself.
+    expect(await readFile(path, "utf8")).toContain("fast-kimi");
+  });
+
+  // The pruner must only ever delete files it wrote itself. Operators keep
+  // hand-named backups next to ours (`fusion.yaml.bak-legacy-…`); matching on the
+  // bare `.bak-` prefix made them deletion candidates, and because `'l' > '2'` a
+  // lexicographic sort ranked them as the NEWEST — so they were retained while
+  // genuinely newer ISO-stamped backups were deleted first.
+  const HAND_NAMED = [
+    "fusion.yaml.bak-legacy-20260715-164854",
+    "fusion.yaml.bak-manual-keep-forever",
+    ...Array.from({ length: 13 }, (_, i) => `fusion.yaml.bak-manual-${String(i).padStart(2, "0")}`),
+  ];
+  const isoBackups = (files: string[]) =>
+    files.filter((f) => /^fusion\.yaml\.bak-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/.test(f)).sort();
+
+  it("never prunes hand-named backups, however many there are", async () => {
+    const { app, dir } = await setup();
+    // 15 hand-made backups — well past BACKUP_RETENTION on their own.
+    for (const f of HAND_NAMED) await writeFile(join(dir, f), "operator's own\n", "utf8");
+
+    const res = await put(app, "/admin/config/models/fast-kimi", { strategy: "single", target: "kimi-k2.7-code" });
+    expect(res.status).toBe(200);
+
+    const files = await readdir(dir);
+    // Every single one survives — none of them is ours to delete.
+    for (const f of HAND_NAMED) expect(files).toContain(f);
+    // ...and the save's own backup was written and (being alone) not pruned either.
+    expect(isoBackups(files).length).toBe(1);
+  });
+
+  it("prunes only the ISO-stamped backups when both kinds are present", async () => {
+    const { app, path, dir } = await setup();
+    const keepers = ["fusion.yaml.bak-legacy-20260715-164854", "fusion.yaml.bak-manual-keep-forever"];
+    for (const f of keepers) await writeFile(join(dir, f), "operator's own\n", "utf8");
+    // 12 real backups, oldest first.
+    const stale = Array.from(
+      { length: 12 },
+      (_, i) => `fusion.yaml.bak-2000-01-01T00-00-${String(i).padStart(2, "0")}-000Z`,
+    );
+    for (const f of stale) await writeFile(join(dir, f), "stale\n", "utf8");
+
+    const res = await put(app, "/admin/config/models/fast-kimi", { strategy: "single", target: "kimi-k2.7-code" });
+    expect(res.status).toBe(200);
+
+    const files = await readdir(dir);
+    // Hand-named files neither deleted nor counted toward retention.
+    for (const f of keepers) expect(files).toContain(f);
+    const iso = isoBackups(files);
+    expect(iso.length).toBe(BACKUP_RETENTION);
+    // 12 stale + 1 fresh = 13 ours; the 3 oldest ISO ones went, the rest stayed.
+    expect(iso).not.toContain(stale[0]);
+    expect(iso).not.toContain(stale[2]);
+    expect(iso).toContain(stale[3]);
+    expect(iso).toContain(stale[11]);
+    expect(iso.at(-1)).not.toBe(stale[11]); // the save's own backup is the newest
+    expect(await readFile(path, "utf8")).toContain("fast-kimi");
+  });
+
+  it("a rejected edit neither blocks nor corrupts the next edit", async () => {
+    const { app, path } = await setup();
+    // Invalid (fusion without judge/synth) racing a valid save.
+    const [bad, good] = await Promise.all([
+      put(app, "/admin/config/models/broken", { strategy: "fusion", panel: ["a"] }),
+      put(app, "/admin/config/models/fine", { strategy: "single", target: "t" }),
+    ]);
+    expect(bad.status).toBe(400);
+    expect(good.status).toBe(200);
+    // And the queue still works afterwards.
+    const after = await put(app, "/admin/config/models/later", { strategy: "single", target: "t2" });
+    expect(after.status).toBe(200);
+    const cfg = await loadConfigFile(path);
+    expect(Object.keys(cfg.models)).toContain("fine");
+    expect(Object.keys(cfg.models)).toContain("later");
+    expect(Object.keys(cfg.models)).not.toContain("broken");
+    expect(await readFile(path, "utf8")).toContain("keep this comment");
+  });
+
+  it("createSerializer runs jobs one at a time and survives a rejection", async () => {
+    const serialize = createSerializer();
+    let active = 0;
+    let maxActive = 0;
+    const order: string[] = [];
+    const job = (name: string, fail = false) =>
+      serialize(async () => {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((r) => setTimeout(r, 5));
+        order.push(name);
+        active--;
+        if (fail) throw new Error(`boom ${name}`);
+        return name;
+      });
+
+    const first = job("a");
+    const rejected = job("b", true);
+    const third = job("c");
+    await expect(rejected).rejects.toThrow("boom b");
+    expect(await first).toBe("a");
+    expect(await third).toBe("c"); // the rejection did not poison the chain
+    expect(maxActive).toBe(1);
+    expect(order).toEqual(["a", "b", "c"]);
   });
 });

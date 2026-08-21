@@ -138,6 +138,30 @@ function ctx(client: UpstreamClient, request: ChatCompletionRequest, model = "fu
   return { request, config, client, capabilities, logger, modelConfig: entry };
 }
 
+/**
+ * Context whose fusion model requires `min` successful panel answers.
+ * The shared `config` leaves `min_panel_success` at its default of 1, which lets the
+ * panel resolve (and abort the stragglers) as soon as ONE member answers — a test
+ * that needs several members' answers to reach the judge/synth must say so, or it is
+ * only passing because the mock upstream happens to complete every member in the
+ * same microtask batch.
+ */
+function ctxMinSuccess(
+  client: UpstreamClient,
+  request: ChatCompletionRequest,
+  min: number,
+): StrategyContext {
+  const cfg = parseConfig({
+    upstream: { base_url: "https://mock.test", api_key_env: "X", max_concurrency: 4 },
+    defaults: { min_panel_success: min },
+    models: { "fusion-1": { strategy: "fusion", panel: ["m1", "m2", "m3"], judge: "j", synth: "s" } },
+  });
+  const capabilities = new CapabilityService({ client, getOverrides: () => cfg.overrides, logger });
+  const entry = cfg.models["fusion-1"];
+  if (!entry) throw new Error("test config missing 'fusion-1'");
+  return { request, config: cfg, client, capabilities, logger, modelConfig: entry };
+}
+
 /** Default chat handler: panel members answer `ans-<model>`, judge returns valid JSON, synth `final`. */
 function defaultChat(judgeJson = true, synthStream = false): ChatHandler {
   const analysis = { consensus: "they agree", disagreements: [], unique_insights: [], blind_spots: [] };
@@ -499,13 +523,14 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(realCloserAt).toBeGreaterThan(spoofAt); // ...still before the REAL nonce-tagged closer
   });
 
-  it("proceeds on partial panel failure (1 of 3 fails, min_panel_success=1)", async () => {
+  it("proceeds on partial panel failure (1 of 3 fails, min_panel_success=2)", async () => {
     const chat = defaultChat();
     const up = makeUpstream((body) => {
       if (body.model === "m2") return jsonResponse({ error: "boom" }, 500);
       return chat(body);
     });
-    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    // min 2: the panel must actually collect BOTH survivors before it resolves.
+    const res = await fusionStrategy.execute(ctxMinSuccess(up.client, req(), 2));
     expect(res.status).toBe(200);
 
     // Judge saw the two survivors, not the failed member.
@@ -781,7 +806,9 @@ describe("fusion strategy — panel/judge/synth", () => {
 
   it("gives synth the judge analysis AND the raw panel answers (no artifact loss on judge success)", async () => {
     const up = makeUpstream(defaultChat(true));
-    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    // min 3: the assertions below name specific members, so the panel has to wait
+    // for all of them rather than resolving at the first answer.
+    const res = await fusionStrategy.execute(ctxMinSuccess(up.client, req(), 3));
     expect(res.status).toBe(200);
     const synthBody = up.recorded.find((b) => b.model === "s");
     const ctxText = systemContents(synthBody!).join("\n");
@@ -1053,7 +1080,8 @@ describe("fusion strategy — reasoning→content normalization", () => {
       }
       return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
     });
-    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    // min 3: both named members must reach the judge, so the panel waits for all.
+    const res = await fusionStrategy.execute(ctxMinSuccess(up.client, req(), 3));
     expect(res.status).toBe(200);
     const judgeBody = up.recorded.find((b) => b.model === "j");
     expect(judgeBody).toBeDefined();
@@ -2323,3 +2351,212 @@ describe("fusion strategy — web grounding (gated on TAVILY_API_KEY + web_searc
   });
 });
 
+
+describe("fusion strategy — bounded judge input", () => {
+  it("caps every message AND the whole render handed to the judge", async () => {
+    // 40 huge user/system messages: 2M chars of raw context. The role filter alone
+    // does not bound this — it only drops assistant/tool turns.
+    const messages: ChatCompletionRequest["messages"] = [
+      { role: "system", content: `SYSTEM-HEAD${"s".repeat(50_000)}` },
+    ];
+    for (let i = 0; i < 40; i++) {
+      messages.push({ role: "user", content: `U${i}-${"u".repeat(50_000)}` });
+    }
+    messages.push({ role: "user", content: `LAST-INSTRUCTION${"z".repeat(10)}` });
+
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req({ messages })));
+    expect(res.status).toBe(200);
+
+    const judgeBody = up.recorded.find((b) => b.model === "j");
+    expect(judgeBody).toBeDefined();
+    const judgeInput = userContents(judgeBody!).join("\n");
+
+    // Bounded: 2M chars of input, and the judge call stays well under the budget.
+    expect(judgeInput.length).toBeLessThan(150_000);
+    // Per-message cap applied (head+tail with an omission marker).
+    expect(judgeInput).toContain("chars omitted");
+    // Total cap applied — middle messages dropped, not merely shortened.
+    expect(judgeInput).toContain("message(s) omitted");
+    // What the judge actually adjudicates against survives: the system prompt head
+    // and the latest instruction.
+    expect(judgeInput).toContain("SYSTEM-HEAD");
+    expect(judgeInput).toContain("LAST-INSTRUCTION");
+  });
+
+  it("does NOT cap a big single message while the conversation stays under the panel threshold", async () => {
+    // The regression: an ordinary coding request — one ~10 KB pasted file, total far
+    // under PANEL_MAX_CHARS (200k). compressPanelMessages short-circuits here, so the
+    // panel members see this text VERBATIM. The judge must see it verbatim too, or it
+    // adjudicates an 8 KB head+tail excerpt of a question the panel answered in full.
+    const pasted = `FILE-HEAD${"p".repeat(10_000)}FILE-TAIL`;
+    const messages: ChatCompletionRequest["messages"] = [
+      { role: "system", content: "You are a coding assistant." },
+      { role: "user", content: `Review this file:\n${pasted}` },
+    ];
+
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req({ messages })));
+    expect(res.status).toBe(200);
+
+    const judgeInput = userContents(up.recorded.find((b) => b.model === "j")!).join("\n");
+    // Untruncated: the whole pasted body reaches the judge, no per-message marker.
+    expect(judgeInput).toContain(pasted);
+    expect(judgeInput).not.toContain("chars omitted");
+    expect(judgeInput).not.toContain("message(s) omitted");
+
+    // And this is the panel's own behaviour — the invariant the judge now matches.
+    const panelInput = userContents(up.recorded.find((b) => b.model === "m1")!).join("\n");
+    expect(panelInput).toContain(pasted);
+  });
+
+  it("DOES cap per message once the whole conversation crosses the panel threshold", async () => {
+    // Same 10 KB user message, but now the conversation as a whole is over 200k —
+    // exactly when compressPanelMessages starts capping. The gate reads the WHOLE
+    // array (assistant/tool turns included), not just the user/system subset the
+    // judge render keeps, so the bulk here is assistant/tool history.
+    const pasted = `FILE-HEAD${"p".repeat(10_000)}FILE-TAIL`;
+    const messages: ChatCompletionRequest["messages"] = [
+      { role: "system", content: "You are a coding assistant." },
+      { role: "user", content: `Review this file:\n${pasted}` },
+    ];
+    for (let i = 0; i < 20; i++) {
+      messages.push({ role: "assistant", content: `step ${i}` });
+      messages.push({ role: "tool", content: "t".repeat(11_000) });
+    }
+
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req({ messages })));
+    expect(res.status).toBe(200);
+
+    const judgeInput = userContents(up.recorded.find((b) => b.model === "j")!).join("\n");
+    // Capped head+tail: both ends survive, the middle is marked, the whole is gone.
+    expect(judgeInput).not.toContain(pasted);
+    expect(judgeInput).toContain("FILE-HEAD");
+    expect(judgeInput).toContain("FILE-TAIL");
+    expect(judgeInput).toContain("chars omitted");
+    // Still under the total budget, which never depended on the per-message gate.
+    expect(judgeInput.length).toBeLessThan(150_000);
+  });
+
+  it("leaves a short conversation verbatim (no marker, no loss)", async () => {
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(
+      ctx(up.client, req({ messages: [{ role: "user", content: "explain redis EVAL" }] })),
+    );
+    expect(res.status).toBe(200);
+    const judgeInput = userContents(up.recorded.find((b) => b.model === "j")!).join("\n");
+    expect(judgeInput).toContain("user: explain redis EVAL");
+    expect(judgeInput).not.toContain("omitted");
+  });
+});
+
+describe("fusion strategy — first-token scan is linear, not quadratic", () => {
+  it("does not rescan the whole buffer per chunk when deltas carry no recognised field", async () => {
+    // A provider streaming its thinking phase in a field the first-token detector
+    // does not recognise (`reasoning_details`) never flips the latch. The old code
+    // re-scanned (and re-JSON.parse'd) the ENTIRE accumulated buffer on every chunk:
+    // O(n^2) parses, all of it synchronous on the single-threaded gateway.
+    const N = 400;
+    const chunks: unknown[] = [];
+    for (let i = 0; i < N; i++) {
+      chunks.push({ choices: [{ delta: { reasoning_details: `thinking step ${i}` } }] });
+    }
+    chunks.push({ choices: [{ delta: { content: "ans-m1" } }] });
+
+    const parseSpy = vi.spyOn(JSON, "parse");
+    try {
+      const up = makeUpstream((body) => {
+        if (body.model === "m1") return sseResponse(chunks);
+        return defaultChat(true)(body);
+      });
+      // min 3: the panel must not abort m1 early, or the stream is never fully read.
+      const res = await fusionStrategy.execute(ctxMinSuccess(up.client, req(), 3));
+      expect(res.status).toBe(200);
+      // Linear work: ~N parses while streaming + ~N in the final full-body parse
+      // (measured 1213 for N=400, the rest is request/response bookkeeping).
+      // Quadratic would be N*(N+1)/2 ≈ 80_000 — 40x above this bound.
+      expect(parseSpy.mock.calls.length).toBeLessThan(5 * N);
+    } finally {
+      parseSpy.mockRestore();
+    }
+  });
+
+  it("still detects the first token when a data: line is split across two reads", async () => {
+    // The tail scan advances only to the LAST newline, so a `data:` line arriving in
+    // two pieces is scanned once, whole — never as two unparseable halves.
+    const encoder = new TextEncoder();
+    const payload = `data: ${JSON.stringify({ choices: [{ delta: { content: "ans-split" } }] })}\n\n`;
+    const cut = Math.floor(payload.length / 2);
+    const split = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("data: " + JSON.stringify({ choices: [{ delta: {} }] }) + "\n\n"));
+        controller.enqueue(encoder.encode(payload.slice(0, cut)));
+        controller.enqueue(encoder.encode(payload.slice(cut)));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    });
+    const up = makeUpstream((body) => {
+      if (body.model === "m1") {
+        return new Response(split, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return defaultChat(true)(body);
+    });
+    const res = await fusionStrategy.execute(ctxMinSuccess(up.client, req(), 3));
+    expect(res.status).toBe(200);
+    const judgeInput = userContents(up.recorded.find((b) => b.model === "j")!).join("\n");
+    expect(judgeInput).toContain("ans-split"); // the split line was parsed, not lost
+  });
+});
+
+describe("fusion strategy — the panel result is frozen at resolve", () => {
+  it("drops a member that finishes after the panel already settled", async () => {
+    // m3 has already delivered its content and is parked in a pending `reader.read()`
+    // when the panel hits min_panel_success and aborts it. The accumulator checks the
+    // abort BEFORE each read, so a read that is already pending is never interrupted:
+    // m3 returns a perfectly good answer ~25ms after the panel resolved. Before the
+    // settled latch + snapshot it pushed into the array the CONSUMER was still holding,
+    // so the judge analysed 2 answers while the synth was handed 3 and `panel_ok`
+    // logged 2 — the same request producing different output run to run.
+    const enc = new TextEncoder();
+    const up = makeUpstream(async (body) => {
+      if (body.model === "m3") {
+        const late = new ReadableStream<Uint8Array>({
+          start(controller) {
+            const payload = JSON.stringify({ choices: [{ delta: { content: "ans-m3-LATE" } }] });
+            controller.enqueue(enc.encode(`data: ${payload}\n\ndata: [DONE]\n\n`));
+            // The body is complete; only the CLOSE is late. The accumulator is parked
+            // in `reader.read()` and its next event is `done` — no abort check in
+            // between, so the abort the panel fired at min_success is a no-op here.
+            setTimeout(() => controller.close(), 30);
+          },
+        });
+        return new Response(late, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      if (body.model === "j") {
+        await new Promise((r) => setTimeout(r, 60)); // slow judge: the window m3 lands in
+        return jsonResponse({
+          choices: [{ message: { content: JSON.stringify({ consensus: "ok" }) } }],
+        });
+      }
+      if (body.model === "s") return jsonResponse({ choices: [{ message: { content: "final" } }] });
+      // m1/m2 answer after m3 is safely parked in its pending read.
+      await new Promise((r) => setTimeout(r, 5));
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+
+    const res = await fusionStrategy.execute(ctxMinSuccess(up.client, req(), 2));
+    expect(res.status).toBe(200);
+
+    const judgeInput = userContents(up.recorded.find((b) => b.model === "j")!).join("\n");
+    const synthCtx = systemContents(up.recorded.find((b) => b.model === "s")!).join("\n");
+    // The judge and the synth saw the SAME panel: the late answer reached neither.
+    expect(judgeInput).toContain("ans-m1");
+    expect(judgeInput).toContain("ans-m2");
+    expect(judgeInput).not.toContain("ans-m3-LATE");
+    expect(synthCtx).toContain("ans-m1");
+    expect(synthCtx).toContain("ans-m2");
+    expect(synthCtx).not.toContain("ans-m3-LATE");
+  });
+});

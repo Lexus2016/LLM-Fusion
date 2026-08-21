@@ -1078,3 +1078,70 @@ describe("smart config validation", () => {
     expect(up.modelsCalled()).toContain("deepseek");
   });
 });
+
+// --- Client disconnect must NOT be compensated by the simple fallback -------
+//
+// executeFusionWithFallback degrades to `simple` when a fusion stage fails, but
+// a client hang-up is not a failure worth compensating: nobody is left to read
+// the answer, so the fallback would spend a limiter slot and one doomed upstream
+// call on a dead request. The guard keys on the CLIENT signal, never on the
+// error name (a stage timeout also produces an AbortError and must still fall
+// back).
+describe("smart fusion fallback vs client disconnect", () => {
+  beforeEach(() => __resetRouterCacheForTesting());
+
+  /** Router -> fusion, panel all fail; counts how often the simple target ran. */
+  function panelFailsUpstream(onPanel?: () => void): { up: Upstream; simpleCalls: () => number } {
+    let simpleCalls = 0;
+    const up = makeUpstream((body) => {
+      if (body.model === "rt") return routeFusion();
+      if (PANEL.includes(body.model)) {
+        onPanel?.();
+        return jsonResponse({ error: { message: "upstream gone" } }, 500);
+      }
+      if (body.model === "deepseek") {
+        simpleCalls++;
+        return jsonResponse({ choices: [{ message: { content: "fallback-answer" } }] });
+      }
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    return { up, simpleCalls: () => simpleCalls };
+  }
+
+  it("fusion failure while the client signal is aborted propagates; simple is never invoked", async () => {
+    const ac = new AbortController();
+    // The client hangs up while the panel is in flight — exactly the window in
+    // which fusion turns the disconnect into an aggregated AllMembersFailedError.
+    const { up, simpleCalls } = panelFailsUpstream(() => ac.abort());
+    const base = ctx(up.client, req("smart-inline"), "smart-inline");
+
+    await expect(smartStrategy.execute({ ...base, signal: ac.signal })).rejects.toThrow();
+
+    // The fallback path was not entered: its only observable effect is a call to
+    // the resolved simple target.
+    expect(simpleCalls()).toBe(0);
+    expect(up.modelsCalled()).not.toContain("deepseek");
+  });
+
+  it("fusion failure with the client signal NOT aborted still falls back to simple", async () => {
+    const ac = new AbortController(); // live client; never aborted
+    const { up, simpleCalls } = panelFailsUpstream();
+    const base = ctx(up.client, req("smart-inline"), "smart-inline");
+
+    const res = await smartStrategy.execute({ ...base, signal: ac.signal });
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("fallback-answer");
+    expect(simpleCalls()).toBe(1);
+  });
+
+  it("fusion failure with no client signal at all still falls back to simple", async () => {
+    const { up, simpleCalls } = panelFailsUpstream();
+
+    const res = await smartStrategy.execute(ctx(up.client, req("smart-inline"), "smart-inline"));
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("fallback-answer");
+    expect(simpleCalls()).toBe(1);
+  });
+});

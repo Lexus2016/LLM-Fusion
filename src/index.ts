@@ -1,4 +1,8 @@
 import { serve } from "@hono/node-server";
+import { realpathSync } from "node:fs";
+import { isIP } from "node:net";
+import { resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createConfigManager, findPanelContentionOverlaps } from "./config";
 import type { Config } from "./config";
 import { resolveProviders } from "./connectors/resolve";
@@ -8,6 +12,105 @@ import { createApp } from "./server";
 import { createLogger } from "./logging";
 import { resolveAuthToken } from "./auth";
 import type { UpstreamClient } from "./types";
+
+/**
+ * Expand an *already validated* IPv6 literal into its 32 lowercase hex digits
+ * (8 hextets, zero-padded, `::` filled in). Only ever called with a value
+ * `net.isIP` returned 6 for, so the shape is trusted; `undefined` means the
+ * input was not something we can canonicalise and the caller must fail closed.
+ *
+ * Canonicalising is what makes the loopback test an ADDRESS comparison instead
+ * of a string-prefix one: `::1`, `0:0:0:0:0:0:0:1` and `0000:...:0001` all
+ * collapse to the same 32 digits, and a hostname that merely looks like an
+ * address never gets this far.
+ */
+function expandIPv6(addr: string): string | undefined {
+  const halves = addr.split("::");
+  if (halves.length > 2) return undefined;
+
+  const hextets = (part: string): string[] | undefined => {
+    if (part === "") return [];
+    const out: string[] = [];
+    for (const piece of part.split(":")) {
+      if (piece.includes(".")) {
+        // Embedded IPv4 tail (`::ffff:127.0.0.1`) — one dotted quad = two hextets.
+        const octets = piece.split(".");
+        if (octets.length !== 4) return undefined;
+        let hex = "";
+        for (const octet of octets) {
+          const value = Number(octet);
+          if (!Number.isInteger(value) || value < 0 || value > 255) return undefined;
+          hex += value.toString(16).padStart(2, "0");
+        }
+        out.push(hex.slice(0, 4), hex.slice(4, 8));
+      } else {
+        if (piece.length === 0 || piece.length > 4) return undefined;
+        out.push(piece.toLowerCase().padStart(4, "0"));
+      }
+    }
+    return out;
+  };
+
+  const head = hextets(halves[0] ?? "");
+  const tail = halves.length === 2 ? hextets(halves[1] ?? "") : [];
+  if (head === undefined || tail === undefined) return undefined;
+
+  if (halves.length === 1) return head.length === 8 ? head.join("") : undefined;
+  const fill = 8 - head.length - tail.length;
+  if (fill < 0) return undefined;
+  return [...head, ...Array<string>(fill).fill("0000"), ...tail].join("");
+}
+
+/** `::1` — the one IPv6 loopback address, in canonical 32-hex-digit form. */
+const IPV6_LOOPBACK = "0".repeat(31) + "1";
+/** `::ffff:127.x.x.x` — IPv4-mapped 127.0.0.0/8, same form (5 zero hextets, ffff, 0x7f). */
+const IPV6_MAPPED_V4_LOOPBACK_PREFIX = "0".repeat(20) + "ffff" + "7f";
+
+/**
+ * Is `bind` a loopback address? The whole 127.0.0.0/8 block is loopback, as are
+ * the `::1` forms and IPv4-mapped `::ffff:127.*`; `localhost` is the single
+ * non-IP literal we accept (it is in the historical allow-list and operators
+ * rely on it).
+ *
+ * SECURITY: this must PARSE, never prefix-match. `"127.evil.com".startsWith("127.")`
+ * and `"::ffff:127.0.0.1.attacker.tld".startsWith("::ffff:127.")` are both true,
+ * and treating either as loopback would let `assertBindIsSafe` publish an
+ * unauthenticated proxy on a routable interface. `net.isIP` decides first:
+ * anything that is not `localhost` and does not parse as an IP is NOT loopback.
+ */
+export function isLoopbackBind(bind: string): boolean {
+  if (bind === "localhost") return true;
+
+  const version = isIP(bind);
+  // `isIP` returns 4 only for a real dotted quad, so 127.0.0.0/8 is now a
+  // genuine octet test — `127.evil.com` scores 0 and never reaches here.
+  if (version === 4) return bind.startsWith("127.");
+  if (version !== 6) return false;
+
+  const flat = expandIPv6(bind);
+  if (flat === undefined || flat.length !== 32) return false;
+  return flat === IPV6_LOOPBACK || flat.startsWith(IPV6_MAPPED_V4_LOOPBACK_PREFIX);
+}
+
+/**
+ * Fail fast rather than publish an unauthenticated proxy (billed to the
+ * operator's key, plus the admin API) on a routable interface — the Docker
+ * image sets FUSION_BIND=0.0.0.0, so this bites exactly there. Bind loopback
+ * or configure a token; FUSION_ALLOW_OPEN=1 is the explicit escape hatch for
+ * deployments that front the proxy with their own auth.
+ *
+ * Throws (never exits) so the caller's `main().catch` owns the exit code, and
+ * so the decision itself is unit-testable. The message text is asserted on
+ * verbatim by test/bind_guard.test.ts — do not reword it.
+ */
+export function assertBindIsSafe(bind: string, authOn: boolean, allowOpen: boolean): void {
+  if (isLoopbackBind(bind) || authOn || allowOpen) return;
+  throw new Error(
+    `refusing to start: bind '${bind}' is not loopback and no client auth token resolves ` +
+      "(server.auth_token_env). Set the token env var, bind to 127.0.0.1, or set " +
+      "FUSION_ALLOW_OPEN=1 to run an open proxy on a non-loopback interface.",
+  );
+}
 
 /**
  * Entrypoint: load config (FUSION_CONFIG env or ./fusion.yaml), build the
@@ -216,25 +319,8 @@ async function main(): Promise<void> {
   const bind = process.env.FUSION_BIND || manager.config.server.bind;
   const { port } = manager.config.server;
 
-  // Fail fast rather than publish an unauthenticated proxy (billed to the
-  // operator's key, plus the admin API) on a routable interface — the Docker
-  // image sets FUSION_BIND=0.0.0.0, so this bites exactly there. Bind loopback
-  // or configure a token; FUSION_ALLOW_OPEN=1 is the explicit escape hatch for
-  // deployments that front the proxy with their own auth. The whole 127.0.0.0/8
-  // block is loopback (incl. IPv4-mapped ::ffff:127.*), as are the ::1 forms.
-  const isLoopbackBind =
-    bind === "localhost" ||
-    bind === "::1" ||
-    bind === "0:0:0:0:0:0:0:1" ||
-    bind.startsWith("127.") ||
-    bind.startsWith("::ffff:127.");
-  if (!isLoopbackBind && !authOn && !allowOpen) {
-    throw new Error(
-      `refusing to start: bind '${bind}' is not loopback and no client auth token resolves ` +
-        "(server.auth_token_env). Set the token env var, bind to 127.0.0.1, or set " +
-        "FUSION_ALLOW_OPEN=1 to run an open proxy on a non-loopback interface.",
-    );
-  }
+  // Non-loopback fail-fast (see assertBindIsSafe above); throws, caught below.
+  assertBindIsSafe(bind, authOn, allowOpen);
 
   // Startup banner: what is listening, which virtual models are loaded and with
   // which strategy, whether client auth is enforced, and the connector pool
@@ -265,7 +351,32 @@ async function main(): Promise<void> {
   });
 }
 
-main().catch((err) => {
-  console.error("fatal:", err instanceof Error ? err.message : err);
-  process.exit(1);
-});
+/**
+ * True only when this file is the process entrypoint (`tsx src/index.ts`,
+ * `npm start`, the Docker CMD). Importing the module — which the bind-guard
+ * unit tests do to reach `isLoopbackBind` / `assertBindIsSafe` — must NOT boot
+ * the server or install the `process.exit(1)` handler, which would kill the
+ * vitest worker. Paths are realpath'd (npm/tsx may hand us a symlink) and
+ * compared without the extension.
+ */
+function isProcessEntrypoint(): boolean {
+  const argv1 = process.argv[1];
+  if (argv1 === undefined || argv1 === "") return false;
+  const normalize = (p: string): string => {
+    let out = p;
+    try {
+      out = realpathSync(p);
+    } catch {
+      // Extensionless or otherwise unresolvable — compare the literal path.
+    }
+    return resolvePath(out).replace(/\.(ts|tsx|mts|cts|js|mjs|cjs)$/, "");
+  };
+  return normalize(argv1) === normalize(fileURLToPath(import.meta.url));
+}
+
+if (isProcessEntrypoint()) {
+  main().catch((err) => {
+    console.error("fatal:", err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+}

@@ -2,7 +2,9 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import type { Context, MiddlewareHandler } from "hono";
 import type { Logger } from "pino";
-import { readFile, writeFile, rename, copyFile } from "node:fs/promises";
+import { readFile, writeFile, rename, copyFile, readdir, unlink } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
 import { parseDocument, type Document } from "yaml";
 import { z, type ZodError } from "zod";
 import type { Config } from "../config";
@@ -230,6 +232,65 @@ function restoreExtraHeaders(body: unknown, existing: NonNullable<Config["provid
   return parsed.data;
 }
 
+/**
+ * How many `<config>.bak-*` files to keep. Every admin save writes one, so
+ * without a cap the config directory grows forever (one ~16 KB file per click).
+ */
+export const BACKUP_RETENTION = 10;
+
+/**
+ * Serializes async work through a promise chain. Read-modify-write of the config
+ * file has four await points between the read and the rename; two overlapping
+ * admin saves would otherwise interleave and lose (or corrupt) an update.
+ *
+ * A rejected job must NOT poison the chain: the tail always resolves, so the
+ * next caller still runs. The caller still sees the original rejection.
+ */
+export function createSerializer(): <T>(job: () => Promise<T>) => Promise<T> {
+  let tail: Promise<unknown> = Promise.resolve();
+  return <T>(job: () => Promise<T>): Promise<T> => {
+    const run = tail.then(job, job);
+    tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+}
+
+/**
+ * The exact stamp this writer appends: `new Date().toISOString()` with `:` and
+ * `.` replaced by `-`, i.e. `YYYY-MM-DDTHH-MM-SS-mmmZ`.
+ *
+ * Deliberately anchored and exact-width. Anything else that happens to share the
+ * `.bak-` prefix — an operator's `fusion.yaml.bak-legacy-20260715-164854` or
+ * `fusion.yaml.bak-manual-keep-forever` — is NOT ours to delete. Matching on the
+ * bare prefix used to make hand-made backups deletion candidates, and lexicographic
+ * sort put them *after* every ISO stamp (`'l' > '2'`), so the hand-made file was
+ * treated as newest and kept while genuinely newer real backups were deleted first.
+ *
+ * Every field here is fixed-width and zero-padded with separators at identical
+ * offsets, so within this set a lexicographic sort IS a chronological sort.
+ */
+const BACKUP_STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/;
+
+/**
+ * Delete all but the newest `keep` backups of `configPath` that THIS code wrote.
+ * Files matching the `.bak-` prefix with any other stamp shape are left alone and
+ * do not count toward `keep`. Best-effort: any failure is the caller's to log,
+ * never a reason to fail the save.
+ */
+async function pruneBackups(configPath: string, keep: number): Promise<number> {
+  const dir = dirname(configPath);
+  const prefix = `${basename(configPath)}.bak-`;
+  const backups = (await readdir(dir))
+    .filter((f) => f.startsWith(prefix) && BACKUP_STAMP.test(f.slice(prefix.length)))
+    .sort();
+  const doomed = backups.slice(0, Math.max(0, backups.length - keep));
+  for (const f of doomed) await unlink(join(dir, f));
+  return doomed.length;
+}
+
 export function createConfigEditorApp(deps: ConfigEditorDeps): Hono {
   const app = new Hono();
 
@@ -287,7 +348,18 @@ export function createConfigEditorApp(deps: ConfigEditorDeps): Hono {
    */
   const EDITABLE_SECTIONS = new Set(["server", "upstream", "defaults", "pricing", "overrides"]);
 
-  async function applyEdit(
+  // Every write to the config file goes through this one chain — see
+  // createSerializer. Without it, two panel saves (a double-clicked Save, or the
+  // panel's own back-to-back reload-and-save) read the same base text and the
+  // second silently discards the first.
+  const serialize = createSerializer();
+  // Distinguishes the temp files of two writers even when the mutex is bypassed
+  // (a second fusion process editing the same file). Monotonic within a process;
+  // the random suffix covers across processes. Never Date.now() alone — two
+  // writes land in the same millisecond routinely.
+  let tmpSeq = 0;
+
+  async function applyEditLocked(
     mutate: (doc: Document.Parsed) => void,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     let text: string;
@@ -303,13 +375,25 @@ export function createConfigEditorApp(deps: ConfigEditorDeps): Hono {
     try {
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       await copyFile(deps.configPath, `${deps.configPath}.bak-${stamp}`);
-      const tmp = `${deps.configPath}.tmp-${process.pid}`;
+      const tmp = `${deps.configPath}.tmp-${process.pid}-${(tmpSeq += 1)}-${randomBytes(4).toString("hex")}`;
       await writeFile(tmp, doc.toString(), "utf8");
       await rename(tmp, deps.configPath);
     } catch (e) {
       return { ok: false, error: `write failed: ${e instanceof Error ? e.message : String(e)}` };
     }
+    // Housekeeping only — a failure here leaves stale backups, which must never
+    // turn a successful save into a 400.
+    try {
+      const removed = await pruneBackups(deps.configPath, BACKUP_RETENTION);
+      if (removed > 0) deps.logger.debug({ removed, keep: BACKUP_RETENTION }, "config: pruned old backups");
+    } catch (e) {
+      deps.logger.warn({ err: e instanceof Error ? e.message : String(e) }, "config: backup pruning failed");
+    }
     return { ok: true };
+  }
+
+  function applyEdit(mutate: (doc: Document.Parsed) => void): Promise<{ ok: true } | { ok: false; error: string }> {
+    return serialize(() => applyEditLocked(mutate));
   }
 
   async function readBody(c: Context): Promise<unknown | undefined> {

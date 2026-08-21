@@ -374,6 +374,68 @@ describe("anthropic translation", () => {
     expect(anthropic).toMatchObject({ stop_reason: "tool_use" });
   });
 
+  it("treats EMPTY tool arguments as a complete no-arg call, not truncation", () => {
+    // Regression: `JSON.parse("")` throws, so a legitimate no-arg tool call
+    // (arguments: "") was read as a truncated one and reported "max_tokens" —
+    // Claude Code then never ran the tool. fusion.ts / tool_turn_guard.ts have
+    // always treated "" as complete; this path was the odd one out.
+    const openAi = {
+      id: "r-5",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [{ id: "tu-5", function: { name: "list_files", arguments: "" } }],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    };
+    const anthropic = openAiToAnthropicResponse(openAi, "anthropic-fast", {
+      upstreamCalls: 1,
+      promptTokens: 4,
+      completionTokens: 5,
+      totalTokens: 9,
+      costUsd: null,
+    });
+    expect(anthropic).toMatchObject({
+      stop_reason: "tool_use",
+      content: [{ type: "tool_use", id: "tu-5", name: "list_files", input: {} }],
+    });
+  });
+
+  it("treats an OMITTED arguments field like an empty one", () => {
+    // The schema used to require `arguments`, so an upstream that omits it
+    // failed safeParse and the raw OpenAI body was returned verbatim to an
+    // Anthropic client. `.default("")` makes it behave as a no-arg call.
+    const openAi = {
+      id: "r-6",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [{ id: "tu-6", function: { name: "list_files" } }],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    };
+    const anthropic = openAiToAnthropicResponse(openAi, "anthropic-fast", {
+      upstreamCalls: 1,
+      promptTokens: 4,
+      completionTokens: 5,
+      totalTokens: 9,
+      costUsd: null,
+    });
+    expect(anthropic).toMatchObject({
+      type: "message",
+      stop_reason: "tool_use",
+      content: [{ type: "tool_use", id: "tu-6", name: "list_files", input: {} }],
+    });
+  });
+
   it("accepts null assistant content and converts it to an empty string", () => {
     const req: AnthropicRequest = {
       model: "anthropic-fast",
@@ -948,6 +1010,58 @@ describe("anthropic route", () => {
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text).toContain('"stop_reason":"tool_use"');
+  });
+
+  it("streamed no-arg tool call (empty arguments) yields stop_reason:tool_use", async () => {
+    // Regression: the block is opened on id/name, so toolArgs holds "" for a
+    // tool that takes no arguments. `JSON.parse("")` throws, which the
+    // completeness check read as truncation and reported "max_tokens".
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () =>
+          sseResponse([
+            { choices: [{ delta: { tool_calls: [{ index: 0, id: "tu-1", function: { name: "list_files" } }] } }] },
+            { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+          ]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-fast",
+      stream: true,
+      messages: [{ role: "user", content: "list the files" }],
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"type":"tool_use"');
+    expect(text).toContain('"stop_reason":"tool_use"');
+    expect(text).not.toContain('"stop_reason":"max_tokens"');
+  });
+
+  it("emits message_start even when the upstream body is only [DONE]", async () => {
+    // Regression: `[DONE]` is skipped before the message_start branch, so an
+    // empty (or comment-only) 200 body produced message_delta + message_stop
+    // with NO message_start — invalid Anthropic Messages SSE.
+    const routes: MockRoute[] = [
+      {
+        match: (u) => u.endsWith("/v1/chat/completions"),
+        respond: () => sseResponse([]),
+      },
+    ];
+    const res = await postMessages(makeApp(routes), {
+      model: "anthropic-fast",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain('"type":"message_start"');
+    const startAt = text.indexOf("message_start");
+    const deltaAt = text.indexOf("message_delta");
+    const stopAt = text.indexOf("message_stop");
+    expect(startAt).toBeGreaterThanOrEqual(0);
+    expect(deltaAt).toBeGreaterThan(startAt);
+    expect(stopAt).toBeGreaterThan(deltaAt);
   });
 
   it("streamed <think> tag split across deltas leaks neither the tag nor the block body", async () => {
