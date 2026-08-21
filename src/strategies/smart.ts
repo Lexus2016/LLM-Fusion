@@ -169,6 +169,12 @@ export const smartStrategy: Strategy = {
     }
 
     const route = await classify(ctx, cfg);
+    // The classification can outlive the client: it is a SHARED call bound to the
+    // stage timeout, not to `ctx.signal` (see `classifyUncached`). Stop here rather
+    // than spend a limiter slot and a panel's worth of upstream calls answering a
+    // request nobody is reading. Sub-strategies only notice an abort after their
+    // first upstream attempt, so this is the last cheap place to exit.
+    ctx.signal?.throwIfAborted();
 
     if (route === "simple") {
       return executeSimple(ctx, cfg);
@@ -309,12 +315,21 @@ async function classifyUncached(
   let result: ChatCompletionResult;
   // Stage timeout: bound the router independently of the full upstream request
   // timeout so a slow router cannot hang the whole request — on timeout it throws
-  // and the catch below degrades to the default route. The abort frees the
-  // limiter slot promptly; the client's abort signal (if any) is combined in so a
-  // disconnect cancels the router call too.
+  // and the catch below degrades to the default route. The abort frees the limiter
+  // slot promptly.
+  //
+  // `stageAbort` ALONE — deliberately NOT combined with `ctx.signal`. This call is
+  // SHARED: `routerPending` coalesces concurrent identical requests onto it, and
+  // the ctx that happens to own it is just whoever arrived first. Wiring that one
+  // caller's signal in meant their disconnect cancelled the classification every
+  // coalesced caller was waiting on, silently routing live requests to `default`
+  // instead — a stranger's hang-up changing another user's routing. The stage
+  // timeout already bounds the call, and its answer lands in `routerCache`, so an
+  // orphaned one is not even wasted. The caller's own disconnect is honoured where
+  // it belongs: the abort check on the classified route in `execute`.
   const timeoutMs = ctx.config.defaults.router_timeout_s * 1000;
   const stageAbort = new AbortController();
-  const signal = ctx.signal ? AbortSignal.any([ctx.signal, stageAbort.signal]) : stageAbort.signal;
+  const signal = stageAbort.signal;
   try {
     result = await resilience.limiterFor(router)(() =>
       withTimeout(
@@ -326,14 +341,16 @@ async function classifyUncached(
       ),
     );
   } catch (err) {
-    // Client disconnect is not a router health failure: do not trip the breaker.
-    // Still release any reserved half-open probe so the router can be probed again.
-    // Detect via the client signal, not the error name — a router stage timeout
-    // also aborts the fetch and must still count as a failure.
-    if (ctx.signal?.aborted) {
-      resilience.breaker.recordProbeAbandoned(router);
-      throw err;
-    }
+    // NO client-disconnect exemption here, unlike every other breaker call site in
+    // this codebase (`failover.ts`, `fusion.ts`, `single.ts`, `bineval.ts`). Those
+    // calls belong to ONE request, so an abort there really is the client leaving
+    // and must not be blamed on the model. This call is SHARED via `routerPending`
+    // and is no longer wired to any caller's signal (see the `stageAbort` note
+    // above), so a client disconnect cannot cancel it: anything that lands here is
+    // a genuine router failure and is counted as one, even if the caller that
+    // happened to own the call has since gone away. That also makes the "never
+    // throws" contract structural — there is no longer any rethrow path at all,
+    // so a coalesced caller can never inherit a rejection.
     resilience.breaker.recordFailure(router);
     ctx.usage?.recordError(router);
     logUpstreamFailure(ctx.logger, {
@@ -444,6 +461,7 @@ function resolveFusion(ctx: StrategyContext, cfg: SmartModelConfig): FusionModel
       fusion_planning_turn_only: false,
       promote_reasoning_to_content: ref.promote_reasoning_to_content,
       web_search: ref.web_search,
+      image_describe: ref.image_describe,
       bineval: ref.bineval,
     };
   }

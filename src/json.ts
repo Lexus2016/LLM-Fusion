@@ -35,3 +35,29 @@ export function extractJsonObject(text: string): string | null {
   }
   return null;
 }
+
+/**
+ * True when `value` is a plain JSON object — not null, not an array. The only
+ * shape the OpenAI protocol allows for a tool call's `function.arguments`.
+ */
+export function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * True when `text` parses as a JSON OBJECT. A bare `JSON.parse` also accepts
+ * `5`, `true`, `null` and `[1,2]`, which are not runnable tool arguments.
+ *
+ * This lives here because three call sites used to answer the question three
+ * different ways on the same upstream bytes: the OpenAI surface emitted a
+ * scalar-argument tool call as a finished, runnable turn while the Anthropic
+ * surface reported `stop_reason: "max_tokens"` with an empty `input` — an
+ * agent loop that retries forever against a deterministic upstream.
+ */
+export function isJsonObjectString(text: string): boolean {
+  try {
+    return isJsonObject(JSON.parse(text));
+  } catch {
+    return false;
+  }
+}

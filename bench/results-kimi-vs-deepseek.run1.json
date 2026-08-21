@@ -1,0 +1,448 @@
+{
+  "agentic": [
+    {
+      "scenario": "S1-basic",
+      "what": "one correct tool call with correct args",
+      "model": "fast-kimi",
+      "pass": false,
+      "why": "wrong count: 4",
+      "turns": 2,
+      "toolCalls": 1,
+      "maxCallsInOneTurn": 1,
+      "badJson": 0,
+      "hallucinated": 0,
+      "ms": 2284,
+      "finalText": "4",
+      "callTrace": [
+        "read_file({\"path\":\"src/util.ts\"})"
+      ]
+    },
+    {
+      "scenario": "S1-basic",
+      "what": "one correct tool call with correct args",
+      "model": "fast-deepseek",
+      "pass": false,
+      "why": "wrong count: 4",
+      "turns": 2,
+      "toolCalls": 1,
+      "maxCallsInOneTurn": 1,
+      "badJson": 0,
+      "hallucinated": 0,
+      "ms": 1534,
+      "finalText": "4",
+      "callTrace": [
+        "read_file({\"path\":\"src/util.ts\"})"
+      ]
+    },
+    {
+      "scenario": "S2-chain",
+      "what": "multi-step chaining: discover then read",
+      "model": "fast-kimi",
+      "pass": true,
+      "why": "",
+      "turns": 3,
+      "toolCalls": 2,
+      "maxCallsInOneTurn": 1,
+      "badJson": 0,
+      "hallucinated": 0,
+      "ms": 3988,
+      "finalText": "The `parseConfig` function is in `src/config.ts`. It falls back to a default timeout of **47**.",
+      "callTrace": [
+        "list_files({\"dir\":\"src\"})",
+        "read_file({\"path\":\"src/config.ts\"})"
+      ]
+    },
+    {
+      "scenario": "S2-chain",
+      "what": "multi-step chaining: discover then read",
+      "model": "fast-deepseek",
+      "pass": true,
+      "why": "",
+      "turns": 3,
+      "toolCalls": 6,
+      "maxCallsInOneTurn": 5,
+      "badJson": 0,
+      "hallucinated": 0,
+      "ms": 3190,
+      "finalText": "The `parseConfig` function is in `src/config.ts`. It falls back to a default timeout value of **47** milliseconds when no timeout is provided in the config.",
+      "callTrace": [
+        "list_files({\"dir\":\"src\"})",
+        "read_file({\"path\":\"src/config.ts\"})",
+        "read_file({\"path\":\"src/a.ts\"})",
+        "read_file({\"path\":\"src/b.ts\"})",
+        "read_file({\"path\":\"src/c.ts\"})",
+        "read_file({\"path\":\"src/util.ts\"})"
+      ]
+    },
+    {
+      "scenario": "S3-parallel",
+      "what": "batches independent reads instead of serializing",
+      "model": "fast-kimi",
+      "pass": true,
+      "why": "",
+      "extra": {
+        "parallel": true,
+        "turns": 1
+      },
+      "turns": 2,
+      "toolCalls": 3,
+      "maxCallsInOneTurn": 3,
+      "badJson": 0,
+      "hallucinated": 0,
+      "ms": 2848,
+      "finalText": "6",
+      "callTrace": [
+        "read_file({\"path\":\"src/a.ts\"})",
+        "read_file({\"path\":\"src/b.ts\"})",
+        "read_file({\"path\":\"src/c.ts\"})"
+      ]
+    },
+    {
+      "scenario": "S3-parallel",
+      "what": "batches independent reads instead of serializing",
+      "model": "fast-deepseek",
+      "pass": true,
+      "why": "",
+      "extra": {
+        "parallel": true,
+        "turns": 1
+      },
+      "turns": 2,
+      "toolCalls": 3,
+      "maxCallsInOneTurn": 3,
+      "badJson": 0,
+      "hallucinated": 0,
+      "ms": 1992,
+      "finalText": "6",
+      "callTrace": [
+        "read_file({\"path\":\"src/a.ts\"})",
+        "read_file({\"path\":\"src/b.ts\"})",
+        "read_file({\"path\":\"src/c.ts\"})"
+      ]
+    },
+    {
+      "scenario": "S4-restraint",
+      "what": "does NOT reach for a tool when none is needed",
+      "model": "fast-kimi",
+      "pass": true,
+      "why": "",
+      "turns": 1,
+      "toolCalls": 0,
+      "maxCallsInOneTurn": 0,
+      "badJson": 0,
+      "hallucinated": 0,
+      "ms": 1615,
+      "finalText": "391",
+      "callTrace": []
+    },
+    {
+      "scenario": "S4-restraint",
+      "what": "does NOT reach for a tool when none is needed",
+      "model": "fast-deepseek",
+      "pass": true,
+      "why": "",
+      "turns": 1,
+      "toolCalls": 0,
+      "maxCallsInOneTurn": 0,
+      "badJson": 0,
+      "hallucinated": 0,
+      "ms": 898,
+      "finalText": "391",
+      "callTrace": []
+    },
+    {
+      "scenario": "S5-recovery",
+      "what": "recovers from a tool error instead of giving up or fabricating",
+      "model": "fast-kimi",
+      "pass": true,
+      "why": "",
+      "turns": 3,
+      "toolCalls": 2,
+      "maxCallsInOneTurn": 1,
+      "badJson": 0,
+      "hallucinated": 0,
+      "ms": 4099,
+      "finalText": "3",
+      "callTrace": [
+        "read_file({\"path\":\"src/configuration.ts\"})",
+        "read_file({\"path\":\"src/config.ts\"})"
+      ]
+    },
+    {
+      "scenario": "S5-recovery",
+      "what": "recovers from a tool error instead of giving up or fabricating",
+      "model": "fast-deepseek",
+      "pass": true,
+      "why": "",
+      "turns": 3,
+      "toolCalls": 2,
+      "maxCallsInOneTurn": 1,
+      "badJson": 0,
+      "hallucinated": 0,
+      "ms": 2401,
+      "finalText": "3",
+      "callTrace": [
+        "read_file({\"path\":\"src/configuration.ts\"})",
+        "read_file({\"path\":\"src/config.ts\"})"
+      ]
+    },
+    {
+      "scenario": "S6-schema",
+      "what": "honors an enum parameter exactly",
+      "model": "fast-kimi",
+      "pass": false,
+      "why": "bad enum value: \"end-to-end\"",
+      "turns": 3,
+      "toolCalls": 2,
+      "maxCallsInOneTurn": 1,
+      "badJson": 0,
+      "hallucinated": 0,
+      "ms": 4503,
+      "finalText": "The end-to-end test suite (`e2e`) ran successfully: **12 passed, 0 failed**.",
+      "callTrace": [
+        "run_tests({\"suite\":\"end-to-end\"})",
+        "run_tests({\"suite\":\"e2e\"})"
+      ]
+    },
+    {
+      "scenario": "S6-schema",
+      "what": "honors an enum parameter exactly",
+      "model": "fast-deepseek",
+      "pass": true,
+      "why": "",
+      "turns": 2,
+      "toolCalls": 1,
+      "maxCallsInOneTurn": 1,
+      "badJson": 0,
+      "hallucinated": 0,
+      "ms": 2163,
+      "finalText": "The end-to-end test suite passed all 12 tests (12 passed, 0 failed).",
+      "callTrace": [
+        "run_tests({\"suite\":\"e2e\"})"
+      ]
+    }
+  ],
+  "coding": [
+    {
+      "id": "T01",
+      "cat": "coding",
+      "scores": [
+        {
+          "cond": "fast-deepseek",
+          "total": 28,
+          "byScorer": [
+            {
+              "scorer": "gpt-oss:120b",
+              "total": 28,
+              "note": "Correct, complete, no fabricated APIs"
+            }
+          ]
+        },
+        {
+          "cond": "fast-kimi",
+          "total": null,
+          "byScorer": []
+        }
+      ],
+      "latency": {
+        "fast-kimi": 80623,
+        "fast-deepseek": 14521
+      }
+    },
+    {
+      "id": "T02",
+      "cat": "debugging",
+      "scores": [
+        {
+          "cond": "fast-kimi",
+          "total": 29.5,
+          "byScorer": [
+            {
+              "scorer": "gpt-oss:120b",
+              "total": 29,
+              "note": "Accurate bug ID, correct fixes, truthful."
+            },
+            {
+              "scorer": "minimax-m3",
+              "total": 30,
+              "note": "Flawless: correct diagnosis, both fixes, no false race claim, complete code."
+            }
+          ]
+        },
+        {
+          "cond": "fast-deepseek",
+          "total": 19,
+          "byScorer": [
+            {
+              "scorer": "gpt-oss:120b",
+              "total": 22,
+              "note": "Contains false race condition claim, lowers truthfulness."
+            },
+            {
+              "scorer": "minimax-m3",
+              "total": 16,
+              "note": "False claim of race condition on integer in single-threaded JS violates stated criterion."
+            }
+          ]
+        }
+      ],
+      "latency": {
+        "fast-kimi": 12105,
+        "fast-deepseek": 6485
+      }
+    },
+    {
+      "id": "T06",
+      "cat": "coding",
+      "scores": [
+        {
+          "cond": "fast-kimi",
+          "total": 30,
+          "byScorer": [
+            {
+              "scorer": "gpt-oss:120b",
+              "total": 30,
+              "note": "Fully meets criteria, correct Map usage and TTL handling"
+            },
+            {
+              "scorer": "minimax-m3",
+              "total": 30,
+              "note": "Flawless: all criteria met, excellent edge-case handling and trick explanation."
+            }
+          ]
+        },
+        {
+          "cond": "fast-deepseek",
+          "total": 27,
+          "byScorer": [
+            {
+              "scorer": "minimax-m3",
+              "total": 27,
+              "note": "Correct and complete; slightly less polished explanation and minor redundancy with has()."
+            }
+          ]
+        }
+      ],
+      "latency": {
+        "fast-kimi": 46202,
+        "fast-deepseek": 5402
+      }
+    },
+    {
+      "id": "T08",
+      "cat": "debugging",
+      "scores": [
+        {
+          "cond": "fast-deepseek",
+          "total": 19,
+          "byScorer": [
+            {
+              "scorer": "gpt-oss:120b",
+              "total": 19,
+              "note": "EscapeHtml uses DOM, not valid in Node"
+            },
+            {
+              "scorer": "minimax-m3",
+              "total": 19,
+              "note": "escapeHtml uses document.createElement—browser API, crashes in Node.js."
+            }
+          ]
+        },
+        {
+          "cond": "fast-kimi",
+          "total": 28,
+          "byScorer": [
+            {
+              "scorer": "minimax-m3",
+              "total": 28,
+              "note": "Thorough analysis; rewrite uses real escape-html library and correct placeholders."
+            }
+          ]
+        }
+      ],
+      "latency": {
+        "fast-kimi": 16705,
+        "fast-deepseek": 5315
+      }
+    },
+    {
+      "id": "T10",
+      "cat": "coding",
+      "scores": [
+        {
+          "cond": "fast-deepseek",
+          "total": 30,
+          "byScorer": [
+            {
+              "scorer": "gpt-oss:120b",
+              "total": 30,
+              "note": "Fully correct implementation and comprehensive tests"
+            }
+          ]
+        },
+        {
+          "cond": "fast-kimi",
+          "total": null,
+          "byScorer": []
+        }
+      ],
+      "latency": {
+        "fast-kimi": 18553,
+        "fast-deepseek": 10605
+      }
+    },
+    {
+      "id": "T14",
+      "cat": "coding",
+      "scores": [
+        {
+          "cond": "fast-kimi",
+          "total": 29.5,
+          "byScorer": [
+            {
+              "scorer": "gpt-oss:120b",
+              "total": 29,
+              "note": "Full implementation with abort-aware sleep"
+            },
+            {
+              "scorer": "minimax-m3",
+              "total": 30,
+              "note": "Correct full-jitter formula, proper abort-race sleep, rethrows last error."
+            }
+          ]
+        },
+        {
+          "cond": "fast-deepseek",
+          "total": 28.5,
+          "byScorer": [
+            {
+              "scorer": "gpt-oss:120b",
+              "total": 29,
+              "note": "Correct formula and retry with abort handling"
+            },
+            {
+              "scorer": "minimax-m3",
+              "total": 28,
+              "note": "Correct formula and abort handling; lacks defaults and onRetry hook."
+            }
+          ]
+        }
+      ],
+      "latency": {
+        "fast-kimi": 39234,
+        "fast-deepseek": 8613
+      }
+    }
+  ],
+  "meta": {
+    "conditions": [
+      "fast-kimi",
+      "fast-deepseek"
+    ],
+    "proxy": "http://127.0.0.1:8081/v1/chat/completions",
+    "scorers": [
+      "gpt-oss:120b",
+      "minimax-m3"
+    ]
+  }
+}

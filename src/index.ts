@@ -113,6 +113,20 @@ export function assertBindIsSafe(bind: string, authOn: boolean, allowOpen: boole
 }
 
 /**
+ * Parse the FUSION_ALLOW_OPEN escape hatch STRICTLY: only an affirmative spelling
+ * opts in. This used to be `Boolean(process.env.FUSION_ALLOW_OPEN)`, and
+ * `Boolean("0") === true` — so an operator writing `FUSION_ALLOW_OPEN=0` to turn
+ * the hatch OFF published an unauthenticated proxy instead, which is the exact
+ * outcome the guard exists to prevent. Unset, empty and every negative spelling
+ * are false; anything unrecognised is false too, because the safe reading of a
+ * value nobody meant is "do not open the proxy".
+ */
+export function parseAllowOpen(raw: string | undefined): boolean {
+  if (raw === undefined) return false;
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
+/**
  * Entrypoint: load config (FUSION_CONFIG env or ./fusion.yaml), build the
  * Ollama client, wire capability discovery + hot-reload, and start the server.
  */
@@ -212,12 +226,12 @@ async function main(): Promise<void> {
     }
   });
 
-  // FUSION_ALLOW_OPEN=1 is the explicit opt-out from the non-loopback
+  // FUSION_ALLOW_OPEN=1 (or true/yes/on) is the explicit opt-out from the non-loopback
   // fail-fast below: the operator takes responsibility for access control. It
   // un-bricks a configured-but-UNSET token var (which would otherwise 500 every
   // request) — but it never disables a token that actually resolves, so an
   // operator who sets the hatch alongside a valid token keeps their auth.
-  const allowOpen = Boolean(process.env.FUSION_ALLOW_OPEN);
+  const allowOpen = parseAllowOpen(process.env.FUSION_ALLOW_OPEN);
   const getAuthToken = (): string | undefined => {
     const token = resolveAuthToken(manager.config.server.auth_token_env, process.env);
     return allowOpen && token === "" ? undefined : token;

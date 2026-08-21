@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { ChatCompletionResult, StrategyContext } from "../types";
 import type { Resilience } from "../concurrency";
 import { extractAnswer, stripThinkingTags } from "../reasoning";
+import { isJsonObjectString } from "../json";
 
 /**
  * Completeness guard for the SINGLE (passthrough) route — the mirror of the
@@ -138,7 +139,8 @@ export function detectIncompleteToolTurn(
 
 /**
  * True when at least one tool call carries a NON-EMPTY arguments string that is
- * not valid JSON — the signature of an output-cap truncation mid-arguments.
+ * not a JSON OBJECT — either truncated mid-arguments (the output-cap signature)
+ * or a scalar/array, which parses but is not runnable tool input.
  * Empty/absent arguments are NOT judged (some models send "" for no-arg tools);
  * precision over recall, as everywhere in this guard.
  */
@@ -147,11 +149,8 @@ function toolCallArgsBroken(toolCalls: unknown[]): boolean {
     const parsed = RecoveredToolCallSchema.safeParse(tc);
     const args = parsed.success ? parsed.data.function?.arguments : undefined;
     if (typeof args !== "string" || args.length === 0) continue;
-    try {
-      JSON.parse(args);
-    } catch {
-      return true;
-    }
+    // Not merely "does it parse": a scalar or array is not runnable tool input.
+    if (!isJsonObjectString(args)) return true;
   }
   return false;
 }
@@ -364,6 +363,39 @@ function stripToolCallsFromChunk(chunk: unknown): unknown {
 }
 
 /**
+ * Rewrite a terminal chunk's `finish_reason` to `"length"`.
+ *
+ * Only for the fail-open path, and only when the buffered tool call was DROPPED as
+ * unrunnable: the turn then carries no tool call at all, and a surviving
+ * `finish_reason: "tool_calls"` announces one that is not there. An OpenAI-compatible
+ * client that trusts it goes looking for a call to execute, finds none, and either
+ * throws or stalls waiting to append a `tool` message it cannot construct.
+ * `"length"` is the honest signal: the output was cut short. Best-effort — a line
+ * that is not a parseable `data: ` chunk is returned unchanged.
+ */
+function markTerminalLengthCut(line: string): string {
+  // `data:` with the space OPTIONAL, matching handleLine's own parse: the terminal
+  // handed to us is the RAW upstream line whenever that chunk carried no tool_call
+  // fragments of its own, so a stricter prefix would silently skip the rewrite on
+  // any upstream that emits `data:{...}`.
+  if (!line.startsWith("data:")) return line;
+  try {
+    const obj = JSON.parse(line.slice("data:".length));
+    const choice = Array.isArray(obj?.choices) ? obj.choices[0] : undefined;
+    if (!choice || typeof choice !== "object") return line;
+    // ONLY `tool_calls` is the lie worth correcting. A turn that already ended on
+    // `stop` or `length` describes itself honestly even with the call dropped, and
+    // rewriting it would fabricate a token cap that was never hit — `intent_tail`
+    // reaches this branch carrying `stop`.
+    if (choice.finish_reason !== "tool_calls") return line;
+    choice.finish_reason = "length";
+    return `data: ${JSON.stringify(obj)}`;
+  } catch {
+    return line;
+  }
+}
+
+/**
  * Streaming completeness guard for the single route. Every chunk before the
  * terminal (finish_reason-carrying) one is forwarded live and unchanged — a
  * healthy stream is byte-identical to plain passthrough, so first-token latency
@@ -465,19 +497,14 @@ export function makeToolTurnGuardStream(
     calls.length > 0 &&
     calls.every((c) => {
       if (!c.function.name || c.function.arguments.length === 0) return false;
-      try {
-        JSON.parse(c.function.arguments);
-        return true;
-      } catch {
-        return false;
-      }
+      return isJsonObjectString(c.function.arguments);
     });
 
   /**
    * Emittability check for a CLEAN terminal/end (finishNormally / reconcile). Looser
    * than `assembledCallsRunnable`: an empty-arguments call is fine here (a genuinely
    * finished no-arg tool sends `arguments: ""`), but a call is NOT emittable if it
-   * lacks a name or carries non-empty arguments that do not parse — those go to
+   * lacks a name or carries non-empty arguments that are not a JSON object — those go to
    * recovery. Complements `detectIncompleteToolTurn`, which only inspects broken
    * args for `finish_reason:"length"`; this catches a broken/nameless call under
    * ANY finish reason (e.g. a truncated `finish_reason:"tool_calls"`).
@@ -489,12 +516,7 @@ export function makeToolTurnGuardStream(
     calls.every((c) => {
       if (!c.function.name) return false;
       if (c.function.arguments.length === 0) return true; // no-arg tool on a clean finish
-      try {
-        JSON.parse(c.function.arguments);
-        return true;
-      } catch {
-        return false;
-      }
+      return isJsonObjectString(c.function.arguments);
     });
 
   /**
@@ -667,10 +689,15 @@ export function makeToolTurnGuardStream(
       // Fail open: the retry never reached the client — deliver the original
       // terminal so the turn ends honestly (its finish_reason signals the cut).
       // Only re-emit the buffered call if it is actually RUNNABLE — never hand the
-      // client a nameless/truncated tool call to execute. A broken one is dropped
-      // (the terminal chunk already tells the client the turn was truncated).
-      if (assembledCalls && assembledCallsEmittable(assembledCalls)) emitAssembledToolCalls(controller);
-      controller.enqueue(encoder.encode(terminal + "\n\n"));
+      // client a nameless/truncated tool call to execute.
+      const dropped = assembledCalls !== undefined && !assembledCallsEmittable(assembledCalls);
+      if (assembledCalls !== undefined && !dropped) emitAssembledToolCalls(controller);
+      // Dropping the call leaves the turn with NOTHING to execute, so the original
+      // terminal's `finish_reason: "tool_calls"` would be a lie about the payload
+      // the client just received — rewrite it to the cut it actually was. When no
+      // call was buffered at all (narrate-and-stop) the terminal is already honest
+      // and is passed through untouched.
+      controller.enqueue(encoder.encode((dropped ? markTerminalLengthCut(terminal) : terminal) + "\n\n"));
     }
     controller.enqueue(encoder.encode("data: [DONE]\n\n"));
   };
@@ -789,11 +816,35 @@ export function makeToolTurnGuardStream(
     controller.error(err instanceof Error ? err : new Error(String(err)));
   };
 
+  // Draining lives in pull(), NOT start(): start() runs to completion regardless of
+  // whether anyone reads, and controller.enqueue() never blocks, so an upstream that
+  // outruns the client would land in the stream queue in full — a whole generation
+  // resident in memory per stalled connection. pull() is re-invoked only as the
+  // consumer drains, so the queue itself becomes the backpressure signal on
+  // reader.read(). Same reason fusion.ts and reasoning.ts pipe through a
+  // TransformStream; this path needs the explicit form because it also has to
+  // recover, splice and finish the turn.
+  let ended = false;
   return new ReadableStream<Uint8Array>({
-    async start(controller) {
+    async pull(controller) {
+      if (ended) return;
       try {
         for (;;) {
           const { done, value } = await reader.read();
+          // The consumer can go away WHILE this read is in flight, and then the very
+          // next handleLine enqueues into a dead controller, throws, and the catch
+          // below reads that throw as an upstream cut — firing a billed recovery
+          // request for a client that already left. So the check belongs HERE, ahead
+          // of handleLine; the desiredSize check at the bottom of the loop is one
+          // enqueue too late. Two distinct deaths, and desiredSize alone cannot tell
+          // them apart: per spec it is NULL only when the stream ERRORED, while a
+          // cancelled/closed stream reports 0 — indistinguishable from ordinary
+          // backpressure. Cancel is caught by the `ended` latch that cancel() sets.
+          if (ended || controller.desiredSize === null) {
+            ended = true;
+            void reader.cancel().catch(() => {});
+            return;
+          }
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
           let nl: number;
@@ -801,8 +852,17 @@ export function makeToolTurnGuardStream(
             handleLine(buffer.slice(0, nl), controller);
             buffer = buffer.slice(nl + 1);
           }
+          // Queue full — yield. The stream calls pull() again once the client reads,
+          // and reader.read() stays un-awaited until then, stalling the upstream.
+          // Lines that only buffered tool fragments leave desiredSize untouched and
+          // keep the loop running, which is what recovery needs. NULL (errored) exits
+          // here too; a 0 from a closed stream is caught at the top of the next
+          // iteration, before anything enqueues.
+          const desired = controller.desiredSize;
+          if (desired === null || desired <= 0) return;
         }
       } catch (err) {
+        ended = true;
         try {
           // finishAfterCut ends the stream itself (close on recovery/abort,
           // error on an honest mid-stream failure — close() after error() would throw).
@@ -812,6 +872,15 @@ export function makeToolTurnGuardStream(
         }
         return;
       }
+      // Backstop, not the live path. A cancel() that arrives while this pull is
+      // parked on reader.read() latches `ended` AND resolves that read as done —
+      // which would land here looking exactly like an upstream that finished. The
+      // check at the TOP of the loop catches that first (it runs before the `done`
+      // break), so this line is unreachable today; it stays as the guarantee that
+      // moving or weakening the top check cannot silently turn a client walking
+      // away into a reconciled turn plus a billed recovery nobody will read.
+      if (ended) return;
+      ended = true;
       try {
         await finishNormally(controller);
       } finally {
@@ -819,6 +888,9 @@ export function makeToolTurnGuardStream(
       }
     },
     cancel(reason) {
+      // Latch as well as release: pull() may be parked on backpressure, and once the
+      // consumer is gone there is nothing left to finish or recover.
+      ended = true;
       void reader.cancel(reason).catch(() => {});
     },
   });

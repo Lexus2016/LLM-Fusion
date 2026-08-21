@@ -35,15 +35,13 @@ providers:
         api_key_env: OLLAMA_API_KEY
         treat_403_as: passthrough
         quota_markers: []
-      - id: ollama-lexus
-        api_key_env: OLLAMA_API_KEY_2
     type: ollama
     base_url: https://ollama.com
 server:
   bind: 127.0.0.1
     # localhost only. For Docker set 0.0.0.0 here
     # (or run with FUSION_BIND=0.0.0.0) so the host can reach it.
-  port: 8081
+  port: 8088
   # auth_token_env: FUSION_PROXY_TOKEN  # optional: when set, clients must send
   # Authorization: Bearer <value-of-that-env-var>.
   # Unset = unauthenticated (localhost single-user) + startup warning.
@@ -106,7 +104,7 @@ models:
   #   watch the `tool-turn terminal state` log line in real agent-loop sessions.
   fusion-coder:
     strategy: fusion
-    panel: [ kimi-k2.7-code, deepseek-v4-pro:0813-cloud, mistral-large-3:675b-cloud ]
+    panel: [ kimi-k2.7-code, deepseek-v4-pro:0813-cloud, glm-5.2 ]
     # panel: [kimi-k2.7-code, minimax-m3, gpt-oss:120b]   # earlier 3-model alternative, unused
     # Benchmark (bench/fusion-bench.mjs, 15/15 tasks, this panel): the fused answer beat
     # every panel member AND solo glm-5.2 on the 9/15 tasks that completed cleanly
@@ -119,8 +117,8 @@ models:
     # long, rambling generations that eat its own token budget; no per-panel-member
     # request_overrides mechanism exists yet to throttle it (only single/smart.simple
     # support request_overrides — see src/config.ts).
-    judge: glm-5.2 # most reliable structured-JSON (router shoot-out) -> fewer judge-parse failures
-    synth: deepseek-v4-flash:0731-cloud
+    judge: deepseek-v4-flash:0731-cloud # most reliable structured-JSON (router shoot-out) -> fewer judge-parse failures
+    synth: glm-5.2
       # CHANGED 2026-07-07 (fusion-lift bench, docs/llm-fusion-audit.md):
       # as synth, kimi emitted 17-19k-char draft-style output on factual/
       # reasoning tasks and dragged fusion to 0.71 (below every solo);
@@ -138,17 +136,6 @@ models:
       # full panel on EVERY fresh user instruction (a new task /
       # refinement / module — even days into one chat); synth-only
       # only on mid-loop tool-result continuations (cost knob)
-    # IMAGE DESCRIBE pre-stage: every image in the request is described once by
-    # the multimodal `model` (minimax-m3 is natively multimodal, Text+Image
-    # input) and replaced IN PLACE with a text block, so panel/judge/synth run
-    # on pure text — no member needs vision capability and a vision request can
-    # never thin the panel below min_panel_success. All-or-nothing: a describer
-    # failure falls back to the legacy per-member vision gate unchanged.
-    image_describe:
-      enabled: true
-      model: minimax-m3 # same id already verified as the bineval evaluator
-      max_chars: 12000
-      timeout_s: 60
     # Optional BinEval post-synth quality evaluation (non-streaming responses only).
     # Adds one extra evaluator call after the synth stage and returns per-dimension
     # scores in response headers: X-Fusion-Bineval-Score, X-Fusion-Bineval-Dimensions,
@@ -156,7 +143,7 @@ models:
     # Useful for factual consistency checks on research / report outputs.
     bineval:
       enabled: true
-      model: minimax-m3
+      model: deepseek-v4-flash:0731-cloud
         # CHANGED 2026-07-07: glm-5.2 became the coder SYNTH (v0.1.23),
         # so a glm evaluator would self-grade its own answers.
         # deepseek-v4-pro sits outside this pipeline entirely
@@ -179,7 +166,7 @@ models:
     # A failed search degrades silently to an ungrounded panel. Respects
     # fusion_planning_turn_only (no web search on mid-loop tool-result turns).
     web_search:
-      enabled: false
+      enabled: true
         # OFF for the coder (2026-07-07): agent tool-loops route here, and
         # grounding added ~12s of pre-panel silence per deliberate turn
         # (measured 12.7s of a 28.7s time-to-first-byte) while searching
@@ -194,7 +181,7 @@ models:
   #   gpt-oss:120b 13 (most exhaustive coverage + Western lineage).
   fusion-researcher:
     strategy: fusion
-    panel: [ kimi-k2.7-code, deepseek-v4-pro:0813-cloud, gpt-oss:120b ]
+    panel: [ kimi-k2.7-code, deepseek-v4-flash:0731-cloud ]
     judge: glm-5.2
     synth: deepseek-v4-flash:0731-cloud # scored 15/15; cleanest report-ready prose
     tool_mode: deliberate
@@ -204,17 +191,9 @@ models:
     # scores in response headers: X-Fusion-Bineval-Score, X-Fusion-Bineval-Dimensions,
     # and X-Fusion-Bineval-Low-Score when the overall score is below threshold.
     # Useful for factual consistency checks on research / report outputs.
-    # IMAGE DESCRIBE pre-stage (same rationale as fusion-coder): screenshots in
-    # research requests are described once by minimax-m3 (natively multimodal,
-    # Text+Image) and replaced with text, so the panel/synth never need vision.
-    image_describe:
-      enabled: true
-      model: minimax-m3
-      max_chars: 12000
-      timeout_s: 60
     bineval:
       enabled: true
-      model: minimax-m3
+      model: deepseek-v4-flash:0731-cloud
         # CHANGED 2026-07-08: glm-5.2 is BOTH a researcher panel member
         # and the judge, so it was grading an answer it helped write and
         # adjudicate — not literal self-grading (kimi is the synth) but a
@@ -252,7 +231,25 @@ models:
   fusion-agents:
     strategy: smart
     provider: ollama-cloud
-    router: deepseek-v4-flash:0731-cloud
+    router: deepseek-v4-flash
     default: simple
-    simple: fast-kimi
+    simple: fast-deepseek
     fusion: fusion-coder
+
+  # BENCH-ONLY (this snapshot). fusion-coder with web grounding OFF.
+  # The solo conditions call the provider directly and receive no web context,
+  # so the shipped fusion-coder is partly answering from information its
+  # baselines never saw — "fusion beats every panel member" would then be a
+  # claim about Tavily, not about the panel. This clone measures what the
+  # panel/judge/synth MECHANISM alone contributes, on equal footing.
+  fusion-coder-noweb:
+    strategy: fusion
+    panel: [ kimi-k2.7-code, deepseek-v4-pro:0813-cloud, glm-5.2 ]
+    judge: deepseek-v4-flash
+    synth: glm-5.2
+    tool_mode: deliberate
+    synth_request_overrides:
+      reasoning_effort: "none"
+    fusion_planning_turn_only: true
+    web_search:
+      enabled: false

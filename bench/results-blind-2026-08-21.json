@@ -1,0 +1,850 @@
+[
+  {
+    "id": "T02",
+    "cat": "debugging",
+    "scores": [
+      {
+        "cond": "fusion-agents",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 7,
+            "completeness": 9,
+            "truthfulness": 4,
+            "note": "Incorrect race claim reduces truthfulness"
+          },
+          "minimax-m3": {
+            "accuracy": 6,
+            "completeness": 9,
+            "truthfulness": 5,
+            "note": "Falsely claims race on integer; 'logically unsafe' contradicts single-threaded reality."
+          }
+        },
+        "accuracy": 6.5,
+        "completeness": 9,
+        "truthfulness": 4.5,
+        "note": "gpt-oss:120b: Incorrect race claim reduces truthfulness | minimax-m3: Falsely claims race on integer; 'logically unsafe' contradicts single-threaded reality."
+      },
+      {
+        "cond": "solo-deepseek-pro",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 8,
+            "truthfulness": 9,
+            "note": "Missing explicit safe += comment"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 9,
+            "note": "Correctly identifies forEach bug, provides both fixes, no false race claims."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 8.5,
+        "truthfulness": 9,
+        "note": "gpt-oss:120b: Missing explicit safe += comment | minimax-m3: Correctly identifies forEach bug, provides both fixes, no false race claims."
+      },
+      {
+        "cond": "fusion",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 9,
+            "note": "Extra info fine, meets criteria"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 9,
+            "note": "All bugs identified, both fixes, accurate on single-threaded +=, bonus EMFILE note."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9,
+        "truthfulness": 9,
+        "note": "gpt-oss:120b: Extra info fine, meets criteria | minimax-m3: All bugs identified, both fixes, accurate on single-threaded +=, bonus EMFILE note."
+      },
+      {
+        "cond": "solo-glm",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 8,
+            "truthfulness": 9,
+            "note": "Good fix, lacks explicit safe += comment"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 8,
+            "truthfulness": 9,
+            "note": "Correctly identifies bug, both fixes provided, accurate on concurrency."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 8,
+        "truthfulness": 9,
+        "note": "gpt-oss:120b: Good fix, lacks explicit safe += comment | minimax-m3: Correctly identifies bug, both fixes provided, accurate on concurrency."
+      },
+      {
+        "cond": "fusion-noweb",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 8,
+            "truthfulness": 9,
+            "note": "Correct, but omits safe += mention"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 8,
+            "truthfulness": 9,
+            "note": "Correct identification, both fixes, no false claims about race."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 8,
+        "truthfulness": 9,
+        "note": "gpt-oss:120b: Correct, but omits safe += mention | minimax-m3: Correct identification, both fixes, no false claims about race."
+      },
+      {
+        "cond": "self-kimi",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 9,
+            "note": "Accurate, acknowledges atomic +=, provides good code"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 10,
+            "truthfulness": 9,
+            "note": "Comprehensive, explicitly notes single-threaded += is safe, multiple fix variants."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9.5,
+        "truthfulness": 9,
+        "note": "gpt-oss:120b: Accurate, acknowledges atomic +=, provides good code | minimax-m3: Comprehensive, explicitly notes single-threaded += is safe, multiple fix variants."
+      },
+      {
+        "cond": "solo-kimi",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 8,
+            "truthfulness": 9,
+            "note": "Correct, but no explicit safe += comment"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 9,
+            "note": "Correct on all points, notes single-threaded += safe, provides both fixes."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 8.5,
+        "truthfulness": 9,
+        "note": "gpt-oss:120b: Correct, but no explicit safe += comment | minimax-m3: Correct on all points, notes single-threaded += safe, provides both fixes."
+      }
+    ],
+    "times": {
+      "solo-glm": 4518,
+      "solo-kimi": 19662,
+      "solo-deepseek-pro": 10178,
+      "fusion": 30359,
+      "fusion-noweb": 15593,
+      "fusion-agents": 26393,
+      "self-kimi": 35419
+    },
+    "answers": {
+      "solo-glm": "The core bug is using `Array.prototype.forEach` with an `async` callback. `forEach` does not await the promises returned by the callback, so `console.log('total:', total)` runs immediately before any file has been read—hence `total` is `0`. Additionally, if a file read fails, the rejection is unhandled (no `await` or `.catch()`), which could crash the process.\n\n**Corrected code (sequential `for...of`):**\n\n```js\nconst fs = require('fs/promises');\n\nasync function main(files) {\n  let total = 0;\n  for (const f of files) {\n    const data = await fs.readFile(f, 'utf8');\n    total += data.length;\n  }\n  console.log('total:', total);\n}\n```\n\n**Alternatively, using `Promise.all` for parallel reads:**\n\n```js\nconst fs = require('fs/promises');\n\nasync function main(files) {\n  const lengths = await Promise.all(\n    files.map(f => fs.readFile(f, 'utf8').then(data => data.length))\n  );\n  const total = lengths.reduce((sum, len) => sum + len, 0);\n  console.log('total:', total);\n}\n```\n\nBoth versions properly wait for all asynchronous operations to complete before printing the total, and any rejection will propagate to the caller of `main()` (or be caught by an `await main(...)` block).",
+      "solo-kimi": "### Bugs in the code\n\n1. **`forEach` does not wait for async callbacks.**  \n   `files.forEach(async (f) => { ... })` creates async callbacks, but `forEach` ignores their returned promises. It returns immediately, so `main()` finishes before any file is read.\n\n2. **`console.log` runs before I/O completes.**  \n   Because the `forEach` callbacks are not awaited, `console.log('total:', total)` executes while `total` is still `0`.\n\n3. **`fs.readFile` errors are unhandled.**  \n   If any file read fails, the resulting rejected promise is never caught, causing an unhandled rejection.\n\n4. **Shared mutable `total` from concurrent callbacks is fragile.**  \n   Even though JavaScript won’t truly “race” on a number (it’s single-threaded), mutating a shared variable from many async callbacks is bad practice.\n\n---\n\n### Corrected code\n\n#### Option 1: Parallel (fastest for many small files)\n\n```js\nconst fs = require('fs/promises');\n\nasync function main(files) {\n  const lengths = await Promise.all(\n    files.map(async (f) => {\n      try {\n        const data = await fs.readFile(f, 'utf8');\n        return data.length;\n      } catch (err) {\n        console.error(`Error reading ${f}:`, err.message);\n        return 0;\n      }\n    })\n  );\n\n  const total = lengths.reduce((sum, len) => sum + len, 0);\n  console.log('total:', total);\n}\n\n// Example usage:\n// main(['file1.txt', 'file2.txt']).catch(console.error);\n```\n\n#### Option 2: Sequential (simpler, lighter on file descriptors)\n\n```js\nconst fs = require('fs/promises');\n\nasync function main(files) {\n  let total = 0;\n\n  for (const f of files) {\n    try {\n      const data = await fs.readFile(f, 'utf8');\n      total += data.length;\n    } catch (err) {\n      console.error(`Error reading ${f}:`, err.message);\n    }\n  }\n\n  console.log('total:', total);\n}\n```\n\n### Notes\n\n- Use `for...of` with `await` (Option 2) if you want easy sequential processing.\n- Use `Promise.all(...files.map(async ...))` (Option 1) if you want parallel reads while still awaiting the final result.\n- `data.length` counts characters. If you want bytes instead, remove the `'utf8'` encoding and use `data.length`, or use `Buffer.byteLength(data, 'utf8')`.",
+      "solo-deepseek-pro": "The main bug is that `files.forEach(async ...)` does **not** wait for the async callbacks to finish. `forEach` returns `undefined`, so the `console.log` runs immediately after starting the file reads, before any `total` updates happen.\n\nOther issues:\n- If a file read fails, the rejected promise is ignored by `forEach`, causing an unhandled rejection.\n- `data.length` counts UTF-16 code units, not bytes. If you want total bytes, read as a buffer or use `Buffer.byteLength`.\n\nCorrected code using `Promise.all` to preserve concurrency:\n\n```js\nconst fs = require('fs/promises');\n\nasync function main(files) {\n  let total = 0;\n\n  await Promise.all(\n    files.map(async (f) => {\n      const data = await fs.readFile(f, 'utf8');\n      total += data.length; // string length\n    })\n  );\n\n  console.log('total:', total);\n}\n```\n\nIf `total` should be the total number of bytes, use buffers instead:\n\n```js\nconst fs = require('fs/promises');\n\nasync function main(files) {\n  let total = 0;\n\n  await Promise.all(\n    files.map(async (f) => {\n      const data = await fs.readFile(f); // Buffer\n      total += data.length; // bytes\n    })\n  );\n\n  console.log('total:', total);\n}\n```\n\nA sequential alternative with `for...of` also works:\n\n```js\nasync function main(files) {\n  let total = 0;\n\n  for (const f of files) {\n    const data = await fs.readFile(f, 'utf8');\n    total += data.length;\n  }\n\n  console.log('total:', total);\n}\n```",
+      "fusion": "The primary bug is that `Array.prototype.forEach` does not await the promises returned by your `async` callback. The loop fires off all the `fs.readFile` calls and immediately moves to `console.log`, so `total` is printed while it is still `0`.\n\nAdditional issues with the original code:\n- **Unhandled promise rejections:** Since the async callbacks are never awaited or caught, a read failure (e.g. a missing file) becomes an unhandled rejection rather than being surfaced to `main`'s caller.\n- **Latent file-descriptor exhaustion:** A common fix is `await Promise.all(files.map(...))`, but opening every file at the same time can trigger `Error: EMFILE: too many open files` on large file lists. Sequential processing (or a concurrency-limited approach) avoids this.\n\n## Corrected code (sequential)\n\n```js\nconst fs = require('fs/promises');\n\nasync function main(files) {\n  let total = 0;\n\n  for (const f of files) {\n    const data = await fs.readFile(f, 'utf8');\n    total += data.length;\n  }\n\n  console.log('total:', total);\n}\n```\n\nThis waits for each read to complete before moving on, so the printed total is correct and file descriptors are not exhausted.\n\n## Alternative (parallel but concurrency-limited)\n\nIf you want speed without risking `EMFILE`, cap concurrency with a utility such as `tiny-async-pool`:\n\n```js\nconst fs = require('fs/promises');\nconst asyncPool = require('tiny-async-pool');\n\nasync function main(files) {\n  let total = 0;\n\n  for await (const data of asyncPool(50, files, (f) => fs.readFile(f, 'utf8'))) {\n    total += data.length;\n  }\n\n  console.log('total:', total);\n}\n```\n\nIf the array is small and you are not concerned about file-descriptor limits, a simple `Promise.all` version also works:\n\n```js\nconst fs = require('fs/promises');\n\nasync function main(files) {\n  const contents = await Promise.all(\n    files.map((f) => fs.readFile(f, 'utf8'))\n  );\n  const total = contents.reduce((sum, data) => sum + data.length, 0);\n\n  console.log('total:', total);\n}\n```\n\nNote: `data.length` counts UTF-16 code units of the decoded string, not bytes. That is fine for character counts, but use `Buffer.byteLength(data)` if you need byte counts.",
+      "fusion-noweb": "The bug is that `files.forEach` does not wait for the asynchronous callbacks to finish. The `async` function you pass to `forEach` returns a Promise, but `forEach` ignores that returned Promise and continues immediately. As a result, `console.log('total:', total)` runs before any file reads have completed, so it prints `0`.\n\nAnother issue is that because the returned Promises are ignored, if any `fs.readFile` call rejects, it will result in an unhandled rejection.\n\n### Corrected code (sequential)\n\n```js\nconst fs = require('fs/promises');\n\nasync function main(files) {\n  let total = 0;\n\n  for (const f of files) {\n    const data = await fs.readFile(f, 'utf8');\n    total += data.length;\n  }\n\n  console.log('total:', total);\n}\n```\n\n### Corrected code (parallel)\n\n```js\nconst fs = require('fs/promises');\n\nasync function main(files) {\n  const contents = await Promise.all(\n    files.map((f) => fs.readFile(f, 'utf8'))\n  );\n\n  const total = contents.reduce((sum, data) => sum + data.length, 0);\n\n  console.log('total:', total);\n}\n```\n\nThe parallel version reads all files concurrently and waits for all of them to finish before logging the total.",
+      "fusion-agents": "The primary bug is that the `forEach` callback is `async`, but the loop itself does **not** await the promises returned by those callbacks. As a result, `console.log('total:', total)` executes immediately before any `fs.readFile` completes, so `total` is still `0`. Additionally, there is no error handling, so a failed read would cause an unhandled promise rejection.\n\n### All identified bugs:\n1. **Async callbacks not awaited** – `forEach` does not wait for the promise returned by the async callback, so the final `console.log` runs before file reads finish.\n2. **Race condition on `total`** – Even if the promises were awaited, `total += data.length` is performed by multiple concurrent async operations, which can lead to incorrect results if interleaved (though in practice JS is single-threaded, but logically it’s still unsafe).\n3. **No error handling** – Any rejected promise from `fs.readFile` would cause an unhandled rejection.\n4. **No return value / waitable promise** – `main` is `async` but doesn’t return anything, so callers cannot know when the processing is done.\n5. **Potential undefined `files`** – If `files` is `undefined`, `.forEach` will throw.\n\n### Corrected Code\n\nUsing `Promise.all` to run reads in parallel and safely accumulate results:\n\n```js\nconst fs = require('fs/promises');\n\nasync function main(files) {\n  if (!Array.isArray(files)) {\n    throw new TypeError('Expected an array of file paths');\n  }\n\n  try {\n    // Read all files in parallel and wait for all promises\n    const dataArray = await Promise.all(\n      files.map((f) => fs.readFile(f, 'utf8'))\n    );\n\n    // Compute total length\n    const total = dataArray.reduce((sum, data) => sum + data.length, 0);\n    console.log('total:', total);\n    return total; // optionally return the total for callers\n  } catch (error) {\n    console.error('Error reading files:', error);\n    throw error; // re-throw if caller needs to handle it\n  }\n}\n\n// Example usage (ensure files array is provided)\nmain(['file1.txt', 'file2.txt']).catch(console.error);\n```\n\nIf you prefer sequential processing (e.g., to limit memory usage), use a `for...of` loop:\n\n```js\nconst fs = require('fs/promises');\n\nasync function main(files) {\n  if (!Array.isArray(files)) {\n    throw new TypeError('Expected an array of file paths');\n  }\n\n  let total = 0;\n  try {\n    for (const f of files) {\n      const data = await fs.readFile(f, 'utf8');\n      total += data.length;\n    }\n    console.log('total:', total);\n    return total;\n  } catch (error) {\n    console.error('Error reading files:', error);\n    throw error;\n  }\n}\n```\n\nBoth versions fix the bugs by:\n- Awaiting all file reads before logging.\n- Properly accumulating the total.\n- Adding error handling.\n- Validating the input array.",
+      "self-kimi": "Bugs in the original code:\n\n1. **`forEach` ignores promises from async callbacks.** `Array.prototype.forEach` does not await the `Promise` returned by an `async` callback; it fires all the reads and immediately moves on.\n2. **`console.log` runs before any file read completes.** Because `forEach` does not pause, the log statement executes while all reads are still pending, so `total` is still `0`.\n3. **`main` gives the caller no way to wait for the work.** The function starts I/O but returns before it finishes, so even the caller cannot await completion.\n4. **No error handling.** If any `fs.readFile` rejects, the resulting promise is never caught and becomes an unhandled rejection.\n5. **Mutating shared state from callbacks is an anti-pattern.** The original increments a shared `total` from inside concurrent callbacks. While JavaScript is single-threaded and `total += data.length` executes atomically here, it is still poor practice; better to compute each length independently and then sum.\n\n### Corrected code — parallel (`Promise.all`)\n\n```js\nconst fs = require('fs/promises');\n\nasync function main(files) {\n  const lengths = await Promise.all(\n    files.map(async (f) => {\n      const data = await fs.readFile(f, 'utf8');\n      return data.length;\n    })\n  );\n\n  const total = lengths.reduce((sum, len) => sum + len, 0);\n  console.log('total:', total);\n}\n\nmain(['file1.txt', 'file2.txt']).catch((err) => {\n  console.error(err);\n  process.exit(1);\n});\n```\n\n### Alternative — sequential (`for…of`)\n\n```js\nconst fs = require('fs/promises');\n\nasync function main(files) {\n  let total = 0;\n\n  for (const f of files) {\n    const data = await fs.readFile(f, 'utf8');\n    total += data.length;\n  }\n\n  console.log('total:', total);\n}\n\nmain(['file1.txt', 'file2.txt']).catch((err) => {\n  console.error(err);\n  process.exit(1);\n});\n```\n\n### Another error-handling style\n\nIf you prefer a `try/catch` around the call:\n\n```js\n(async () => {\n  try {\n    await main(['file1.txt', 'file2.txt']);\n  } catch (err) {\n    console.error('Failed to read files:', err);\n    process.exit(1);\n  }\n})();\n```\n\n### Key rule\n\n**Never use `forEach` with an `async` callback when you need to wait for the asynchronous work to finish.** Use one of these instead:\n\n- `await Promise.all(files.map(async (f) => …))` — parallel I/O\n- `for…of` with `await` inside — sequential I/O\n\n> **Note:** If you need to process a very large number of files, `Promise.all` can spike memory because all file contents are held at once. In that case prefer sequential `for…of` or a concurrency-limited helper such as `p-limit`."
+    }
+  },
+  {
+    "id": "T03",
+    "cat": "factual",
+    "scores": [
+      {
+        "cond": "solo-kimi",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 9,
+            "note": "Accurate, complete, no false flags."
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 9,
+            "note": "Accurate, well-organized; covers all criteria without fabrication."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9,
+        "truthfulness": 9,
+        "note": "gpt-oss:120b: Accurate, complete, no false flags. | minimax-m3: Accurate, well-organized; covers all criteria without fabrication."
+      },
+      {
+        "cond": "fusion",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 7,
+            "completeness": 8,
+            "truthfulness": 6,
+            "note": "Incorrect Windows file support claim."
+          },
+          "minimax-m3": {
+            "accuracy": 7,
+            "completeness": 7,
+            "truthfulness": 6,
+            "note": "ENOSYS claim is wrong (ERR_FEATURE_UNAVAILABLE_ON_PLATFORM); Windows recursive hedged."
+          }
+        },
+        "accuracy": 7,
+        "completeness": 7.5,
+        "truthfulness": 6,
+        "note": "gpt-oss:120b: Incorrect Windows file support claim. | minimax-m3: ENOSYS claim is wrong (ERR_FEATURE_UNAVAILABLE_ON_PLATFORM); Windows recursive hedged."
+      },
+      {
+        "cond": "self-kimi",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 9,
+            "note": "Comprehensive and correct."
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 10,
+            "truthfulness": 9,
+            "note": "Most thorough; covers AIX, kqueue, Node 20+ Linux recursive; all options correct."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9.5,
+        "truthfulness": 9,
+        "note": "gpt-oss:120b: Comprehensive and correct. | minimax-m3: Most thorough; covers AIX, kqueue, Node 20+ Linux recursive; all options correct."
+      },
+      {
+        "cond": "fusion-agents",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 6,
+            "completeness": 6,
+            "truthfulness": 5,
+            "note": "Wrong Windows file support, missing bigint option."
+          },
+          "minimax-m3": {
+            "accuracy": 4,
+            "completeness": 6,
+            "truthfulness": 3,
+            "note": "Fabricates Windows file-watching claim; omits bigint option; multiple wrong assertions."
+          }
+        },
+        "accuracy": 5,
+        "completeness": 6,
+        "truthfulness": 4,
+        "note": "gpt-oss:120b: Wrong Windows file support, missing bigint option. | minimax-m3: Fabricates Windows file-watching claim; omits bigint option; multiple wrong assertions."
+      },
+      {
+        "cond": "solo-glm",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 9,
+            "note": "Accurate, thorough, includes all required info."
+          },
+          "minimax-m3": {
+            "accuracy": 8,
+            "completeness": 7,
+            "truthfulness": 8,
+            "note": "Solid but misses Node 20+ Linux recursive support; no fabricated flags."
+          }
+        },
+        "accuracy": 8.5,
+        "completeness": 8,
+        "truthfulness": 8.5,
+        "note": "gpt-oss:120b: Accurate, thorough, includes all required info. | minimax-m3: Solid but misses Node 20+ Linux recursive support; no fabricated flags."
+      },
+      {
+        "cond": "fusion-noweb",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 9,
+            "note": "Accurate and complete."
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 8,
+            "truthfulness": 9,
+            "note": "Accurate throughout; covers all criteria; correct options listed."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 8.5,
+        "truthfulness": 9,
+        "note": "gpt-oss:120b: Accurate and complete. | minimax-m3: Accurate throughout; covers all criteria; correct options listed."
+      },
+      {
+        "cond": "solo-deepseek-pro",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 5,
+            "completeness": 7,
+            "truthfulness": 4,
+            "note": "Several false statements about Linux behavior."
+          },
+          "minimax-m3": {
+            "accuracy": 5,
+            "completeness": 7,
+            "truthfulness": 4,
+            "note": "Wrongly claims Linux directory watches don't report child events; significant error."
+          }
+        },
+        "accuracy": 5,
+        "completeness": 7,
+        "truthfulness": 4,
+        "note": "gpt-oss:120b: Several false statements about Linux behavior. | minimax-m3: Wrongly claims Linux directory watches don't report child events; significant error."
+      }
+    ],
+    "times": {
+      "solo-glm": 16959,
+      "solo-kimi": 80985,
+      "solo-deepseek-pro": 12429,
+      "fusion": 32716,
+      "fusion-noweb": 35872,
+      "fusion-agents": 13867,
+      "self-kimi": 123621
+    },
+    "answers": {
+      "solo-glm": "No, `fs.watch` does **not** guarantee change events on all platforms. It relies on underlying operating system file-watching APIs, which behave differently across environments and cannot guarantee consistent event delivery, filenames, or event types (`change` vs `rename`).\n\n### Platform-Specific Caveats\n\n**Linux (inotify)**\n*   **Network Filesystems:** `fs.watch` does not work reliably (or at all) on network filesystems like NFS or SMB. `inotify` relies on kernel-level tracking, which is bypassed by network mounts.\n*   **System Limits:** It is subject to system-level inotify limits (e.g., `fs.inotify.max_user_watches`). If the limit is exhausted, the watcher will silently fail or throw an error.\n*   **Virtual Filesystems:** Watching files in pseudo-filesystems like `/proc` or `/sys` will not yield events.\n\n**macOS (FSEvents)**\n*   **Inconsistent Event Types:** A single file modification might emit a `rename` event rather than a `change` event, or vice versa.\n*   **Directory Deletion:** If a watched directory is deleted, a `rename` event is emitted, and the watcher stops watching it.\n*   **Network Filesystems:** Similar to Linux, network drives often do not trigger FSEvents properly.\n\n**Windows (ReadDirectoryChangesW)**\n*   **Multiple Events:** Saving a file (especially via certain text editors that do atomic saves by writing to a temporary file and renaming) can emit multiple events (e.g., multiple `change` and `rename` events) for a single logical file save.\n*   **Network Filesystems:** Network shares may not notify the OS of changes, resulting in missing events.\n\n*(General Note: Across all platforms, the `filename` parameter provided in the callback is not strictly guaranteed to be present, though modern Node.js implementations generally provide it.)*\n\n### `recursive` Option Support\n\nThe `recursive` option is supported as follows:\n*   **macOS:** Supported. Pass `{ recursive: true }` to watch a directory and all of its subdirectories.\n*   **Windows:** Supported. Pass `{ recursive: true }`.\n*   **Linux:** **Not supported.** Passing `{ recursive: true }` will not result in recursive watching on Linux; you must manually watch each subdirectory or use a user-land library (like `chokidar`) that handles the recursive traversal.\n\n### Polling-Based Alternative in Core\n\nFor environments where OS-level event watching is unreliable (such as network drives or when needing consistent cross-platform behavior), Node.js provides `fs.watchFile`. \n\nInstead of relying on OS events, `fs.watchFile` periodically checks the file's stats (using `fs.stat` under the hood) and emits a `'change'` event when the file is modified.\n\nThe function signature is: `fs.watchFile(filename, options, listener)`\n\nThe exact options available in the `options` object are:\n*   `bigint` (Boolean, default `false`): If `true`, the `fs.Stat` objects provided to the listener callback will have their values represented as `BigInt` instead of standard numbers.\n*   `persistent` (Boolean, default `true`): Indicates whether the process should continue to run as long as the file is being watched.\n*   `interval` (Number, default `5007`): The polling interval in milliseconds. This dictates how often the file is checked for changes.",
+      "solo-kimi": "No. `fs.watch` is **not** guaranteed to report every change on every platform. It is a thin wrapper around native OS notification mechanisms and is best‑effort: changes can be missed, duplicated, coalesced, delayed, and the `filename` argument may be `null`.\n\n### Platform-specific caveats\n\n| Platform | Backend | Caveats |\n|---|---|---|\n| **Linux** | `inotify` | Watching a directory only watches its **immediate children**. The `recursive` option has no effect. The watch is tied to the **inode**, so renaming or moving the watched file does not break it; however, deleting the file and creating a new one with the same name may stop events because the inode has changed. Also subject to system `inotify` limits (`fs.inotify.max_user_watches`). |\n| **macOS** | `FSEvents` | `recursive` **is supported** for directories and watches subdirectories. Events may be coalesced, delayed, or duplicated, and the `filename` may be `null`. On rename, both the old and new names may appear. Per the docs, the path is resolved to an inode at start, so moving/renaming the file keeps the watch alive. |\n| **Windows** | `ReadDirectoryChangesW` | `recursive` **is supported** for directories. The watcher follows the **path**, not the inode. **No events** are emitted if the watched directory is moved, renamed, or deleted. Moving/renaming a watched file stops events; recreating a file with the same name is not automatically watched. |\n\n`recursive` summary: it works on **macOS and Windows** when watching a directory; on **Linux** it is unsupported and has no effect (only the specified directory is watched).\n\n### Polling-based alternative in core\n\nUse `fs.watchFile(filename[, options], listener)`. It polls with `fs.stat` and calls the listener as:\n\n```js\nfs.watchFile('file.txt', { interval: 1000 }, (curr, prev) => {\n  // curr and prev are fs.Stats objects\n});\n```\n\nThe documented options are:\n\n- `persistent` `<boolean>` — default `true`\n- `interval` `<integer>` — polling interval in ms, default `5007`\n- `bigint` `<boolean>` — default `false`\n\nStop it with `fs.unwatchFile(filename[, listener])`.",
+      "solo-deepseek-pro": "No. `fs.watch` does **not** guarantee change events on all platforms. The Node.js documentation states that the API is “not 100% consistent across platforms, and is unavailable in some situations.”\n\n### Platform-specific caveats\n\n- **`recursive` option**  \n  - Supported **only on macOS and Windows**.  \n  - On other platforms (e.g., Linux), passing `recursive: true` throws an exception.\n\n- **Windows**  \n  - No event is emitted if the watched directory itself is moved or renamed.  \n  - If a watched file is deleted, a `'rename'` event is emitted with `filename` set to `null`.\n\n- **macOS and Windows**  \n  - A `'rename'` event is emitted when a file is renamed inside the watched directory.\n\n- **Linux**  \n  - Watching a directory does **not** give events for files inside it; you must watch individual files instead.  \n  - The `filename` argument in the callback is **always `null`** on Linux.\n\n- **`filename` argument availability**  \n  - Not guaranteed on all platforms.  \n  - Linux: always `null`.  \n  - Windows: provided for both `'rename'` and `'change'` events.  \n  - macOS: provided for `'rename'` events but **not** for `'change'` events.\n\n- **Underlying mechanisms**  \n  - Linux: `inotify(7)`  \n  - macOS: `FSEvents`  \n  - Windows: `ReadDirectoryChangesW`\n\n### Polling-based alternative in core\n\nUse **`fs.watchFile`** (and **`fs.unwatchFile`** to stop watching).\n\n```js\nfs.watchFile(filename, options, listener)\n```\n\nRelevant options:\n\n- **`persistent`** – Whether the process should continue running as long as files are being watched. Default: `true`.\n- **`interval`** – Polling interval in milliseconds. Default: `5007`.\n- **`bigint`** – Whether the `Stats` objects in the listener should use `bigint` values. Default: `false`.\n\nThe listener receives `(curr, prev)` where both are `fs.Stats` objects.",
+      "fusion": "No, `fs.watch` does **not** guarantee change events on all platforms. It is a thin wrapper around OS-level file-watching APIs, and the operating systems do not agree on what file watching means. Specific caveats:\n\n### Platform-specific caveats\n\n- **Linux (`inotify`):** Reliable for individual files, but the kernel API only watches one directory at a time. `recursive` is not supported, and Node returns `ENOSYS` if you ask for recursion. On large trees you can also hit the `inotify` `max_user_watches` ceiling, which limits how many paths can be watched. ([fixdevs.com](https://fixdevs.com/blog/nodejs-fs-watch-not-working), [nodejs/node#36005](https://github.com/nodejs/node/issues/36005))\n\n- **macOS (`FSEvents`):** Supports recursive watching, but events come in **batches with debounce**. Depending on the save rate, you may get one event per save or one event covering several saves — there is no 1:1 mapping between writes and emitted events. ([fixdevs.com](https://fixdevs.com/blog/nodejs-fs-watch-not-working))\n\n- **Network shares / Docker volumes on macOS / similar:** Filesystems that don’t expose native change events won’t produce reliable `fs.watch` events at all. The only reliable approach there is polling, or a library such as `chokidar` that falls back to polling automatically. ([fixdevs.com](https://fixdevs.com/blog/nodejs-fs-watch-not-working))\n\n### `recursive` option support\n\n| Platform | `recursive` support |\n|----------|---------------------|\n| Linux (`inotify`) | Not supported — Node returns `ENOSYS`; you must watch each directory individually or use a third-party watcher |\n| macOS (`FSEvents`) | Supported, with batched/debounced events |\n| Windows | Supported (Windows uses `ReadDirectoryChangesW`), but this behavior is not detailed in the provided search context |\n\n### Polling-based alternative in core\n\nNode core provides **`fs.watchFile`** (with its counterpart `fs.unwatchFile`) as the polling-based alternative. It stats the file repeatedly and compares metadata instead of relying on OS events. It is slower and uses CPU regardless of activity, but works on filesystems where native events are unavailable or unreliable.\n\n**Options for `fs.watchFile`:**\n\n- `interval` — polling frequency in milliseconds (default `5007`).\n- `persistent` — whether the Node process continues running while the file is being watched (default `true`).\n- `bigint` — whether the `Stats` object should use `bigint` values (default `false`).\n\nFor anything beyond simple single-file watching, the ecosystem standard is `chokidar`, which normalizes events across platforms, supports recursive watching and globs everywhere via per-directory watches plus polling fallback, and adds options like `ignored`, `ignoreInitial`, `awaitWriteFinish`, and `persistent` ([fixdevs.com](https://fixdevs.com/blog/nodejs-fs-watch-not-working)).",
+      "fusion-noweb": "No, Node.js `fs.watch` does **not** guarantee change events on all platforms. The API relies on underlying operating system file notification mechanisms, and its behavior is explicitly documented as not 100% consistent across platforms.\n\n### Platform-Specific Caveats\n\n**Linux (`inotify`)**\n*   **Network Filesystems:** `inotify` generally does not work on network file systems (such as NFS or SMB/CIFS mounts). Changes made to files on these mounts will not trigger events.\n*   **System Limits:** It is subject to OS-level limits, specifically `fs.inotify.max_user_watches`. If an application attempts to watch more files than the system allows, `fs.watch` will emit an `'error'` event (often `ENOSPC`).\n\n**macOS (`FSEvents`)**\n*   **Watching Files:** `fs.watch` on an individual file does not work reliably on macOS. You must watch the containing directory and filter events for the target file.\n*   **Directory Renames:** Renaming a directory might only emit a single `'rename'` event for the directory itself, rather than emitting separate events for all the files and subdirectories contained within it.\n*   **Event Coalescing:** The OS may coalesce or delay events, meaning a single physical modification might result in unexpected event firing patterns.\n\n**Windows (`ReadDirectoryChangesW`)**\n*   **Directory Deletions:** If a watched directory is deleted or renamed, an `'error'` event will be emitted, and the watcher for that directory will be closed.\n*   **Network Drives:** Depending on the network drive protocol and how other OS processes flush file buffers, events might be missed.\n\n**General Caveats (All Platforms)**\n*   **Filename Argument:** The `filename` argument provided in the callback is not strictly guaranteed to be provided across all environments and configurations.\n*   **Event Duplication:** A single physical modification to a file might result in multiple `'change'` or `'rename'` events being emitted.\n\n### `recursive` Option Support\n\nThe `recursive` option allows you to watch a directory and all of its subdirectories. Its support is limited:\n*   **macOS:** Supported.\n*   **Windows:** Supported.\n*   **Linux:** **Not supported.** If you pass `{ recursive: true }` on Linux, Node.js will throw an `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` error (in modern Node versions).\n\n### Polling-Based Alternative in Core\n\nBecause `fs.watch` relies on OS-level file change notifications (which can be unreliable), Node.js provides a polling-based alternative in its core API: **`fs.watchFile`** (stopped via **`fs.unwatchFile`**).\n\nInstead of relying on OS events, `fs.watchFile` continuously polls the file's stats (`fs.stat`) at a given interval to detect changes.\n\nThe options object accepted by `fs.watchFile` includes exactly these flags:\n*   **`bigint`** (boolean, default: `false`): If `true`, the `fs.Stat` object uses `bigint` instead of `number` values.\n*   **`persistent`** (boolean, default: `true`): If `true`, the process will continue running as long as the file is being watched.\n*   **`interval`** (number, default: `5007`): The polling interval in milliseconds. \n\n*(Note: `fs.watchFile` only watches individual files, not directories. To poll a directory, you would typically need a third-party library like `chokidar` that wraps `fs.watchFile`/`fs.stat` for directory contents, or implement your own recursive polling logic).*",
+      "fusion-agents": "No, `fs.watch` does **not** guarantee change events on any platform. It is a thin wrapper around native OS APIs (inotify, FSEvents, ReadDirectoryChangesW). These APIs have known, platform-specific limitations, including event coalescing, dropped events under resource pressure, and inconsistent metadata. The Node.js documentation explicitly states: \"The `fs.watch` API is not 100% consistent across multiple platforms, and is unavailable in some situations.\"\n\nHere are the exact platform-specific caveats and behaviors.\n\n### 1. Platform-Specific Caveats\n\n**Linux (uses `inotify`)**\n- **`filename` is `null`**: When watching a directory, the `filename` argument in the listener callback is **always** `null`. When watching a file, it may be `null` depending on the kernel version.\n- **`recursive` option is not supported**: Setting `recursive: true` throws an error with code `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`.\n- **Inode-based watching**: The watch is bound to the underlying inode. If the watched file or directory is renamed or replaced (e.g., using `mv` or atomic writes), the watch will silently break or stop firing.\n- **No metadata events**: Changes to file permissions or ownership on the watched directory itself do not generate events; only changes to entries within the directory do.\n\n**macOS (`FSEvents`)**\n- **`recursive` is supported**: `recursive: true` works and will monitor subdirectories.\n- **Filename is usually provided**, but `FSEvents` may coalesce multiple rapid changes into a single `'change'` event. This is not a bug; it is by design for performance.\n- **File watching is supported**, but it relies on monitoring the parent directory internally.\n\n**Windows (`ReadDirectoryChangesW`)**\n- **Watching a file is NOT supported**: Attempting to watch a single file path throws an error. `fs.watch` on Windows **must** be pointed at a directory.\n- **`recursive` is supported**: `recursive: true` works.\n- **Filename is always provided** in the callback.\n\n### 2. The `recursive` Option Support Matrix\n\n| Platform | `recursive: true` support | Exact behavior |\n| :--- | :--- | :--- |\n| **Linux** | **No** | Throws `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` immediately. |\n| **macOS** | **Yes** | Watches all subdirectories recursively. |\n| **Windows** | **Yes** | Watches all subdirectories recursively. |\n\n*(Note: On older Node.js versions, Linux would silently ignore the flag; modern versions throw the error explicitly.)*\n\n### 3. The Polling-Based Alternative in Core\n\nThe core, built-in polling alternative is **`fs.watchFile`** (and its counterpart **`fs.unwatchFile`**).\n\n- **Method**: `fs.watchFile(filename[, options], listener)`\n- **Option names** (must be exactly these):\n  - `persistent` (boolean, default `true`) — If `true`, keeps the Node.js process alive while the watch is active.\n  - `interval` (number, default `5007` milliseconds) — The amount of time in milliseconds between each stat check.\n- **How it works**: It polls the file's metadata (`stat` / `lstat`) at the specified interval and invokes the listener when the metadata (e.g., `mtime`, `ctime`, size) changes. This is a reliable, if slow, alternative. It **cannot watch directories** (only files) and has no `recursive` option.\n\n**Important distinction**: `fs.watchFile` is a polling mechanism. `fs.watch` is a native event-based mechanism. Do not confuse it with `fs.watch`'s `encoding` option or any other flags. The options for `fs.watchFile` are limited to `persistent` and `interval`.",
+      "self-kimi": "No. `fs.watch` is a **best-effort** wrapper around OS-native file-notification APIs. It does **not** guarantee that every modification will fire an event, and the `eventType` and `filename` arguments are not reliably consistent across platforms.\n\n## General caveats\n\n- Events can be lost, coalesced, delayed, or duplicated.\n- `eventType` is either `'change'` or `'rename'`; `'rename'` is used broadly for creation, deletion, and renaming.\n- `filename` may be omitted, `null`, empty, or only a basename, and should not be treated as a reliable absolute path.\n- Network, shared, and virtual filesystems are generally unreliable.\n\n## Platform-specific caveats\n\n### Linux / Android — `inotify`\n- Subject to system-wide limits such as `fs.inotify.max_user_watches`; exhausting them throws `ENOSPC`.\n- When watching a directory, `filename` is the **basename relative to the watched directory**, not an absolute path.\n- A single write to a watched file commonly fires the listener **twice**.\n- If the watched file or directory is deleted, moved, or renamed, the watch is removed; creating a new file with the same name is **not** automatically watched.\n- Replacing a file by writing to a temp file and renaming it over the original may be reported as `rename`, or the original watch may be lost.\n- Network filesystems (NFS, SMB, etc.) are unreliable.\n\n### macOS — `FSEvents` for directories, `kqueue` for individual files\n- Events may be coalesced and delivered with a delay.\n- `filename` may be omitted or `null`.\n- Many editors save by writing a temp file and renaming it over the original, which often appears as a `rename` event.\n- A single-file `kqueue` watch keeps an open file descriptor; if the file is renamed or unlinked, the watcher may continue to report events for the original inode.\n- Single-file watches are sometimes observed to fire mainly when the file grows; content changes that do not change size may be missed.\n\n### Windows — `ReadDirectoryChangesW`\n- A `'change'` event can fire for metadata updates (for example, last-access-time updates) even when file contents are unchanged.\n- Under heavy churn, events can be dropped or merged.\n- Rename operations may produce separate events for both the old and new names.\n- If the watched directory is moved or deleted, no further events are emitted.\n- A single-file watch may re-trigger for the same change.\n\n### IBM AIX\n- `fs.watch` is not supported and will throw.\n\n## The `recursive` option\n\n`recursive` is a boolean that defaults to `false` and is meaningful only when watching a directory.\n\n- **macOS** and **Windows**: natively supported.\n- **Linux / Android**: before Node.js 20, `recursive: true` threw `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. **Node.js 20+** added support on Linux, implemented by watching subdirectories.\n\n`fs.watch` also accepts the standard options `persistent` (boolean, default `true`) and `encoding` (string, default `'utf8'`).\n\n## Polling-based alternative in core\n\nUse `fs.watchFile(filename[, options], listener)`, and stop it with `fs.unwatchFile(filename[, listener])`.\n\nIt polls with `fs.stat` and invokes `listener(curr, prev)` with the current and previous `fs.Stats` objects. This works where there is no native notification backend, but it is more expensive and only detects changes visible to `stat` (size, mtime, mode, etc.).\n\nRecognized option names:\n\n- `interval` — polling interval in milliseconds, default `5007`\n- `persistent` — keep the process alive while watching, default `true`\n- `bigint` — return `BigInt` values in the `Stats` objects, default `false`"
+    }
+  },
+  {
+    "id": "T04",
+    "cat": "reasoning",
+    "scores": [
+      {
+        "cond": "fusion-noweb",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Accurate 12×, clear timeout analysis, two solid fixes"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 10,
+            "truthfulness": 10,
+            "note": "Correct 12x amplification, thorough timeout interplay analysis, two solid fixes."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9.5,
+        "truthfulness": 10,
+        "note": "gpt-oss:120b: Accurate 12×, clear timeout analysis, two solid fixes | minimax-m3: Correct 12x amplification, thorough timeout interplay analysis, two solid fixes."
+      },
+      {
+        "cond": "fusion",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Correct amplification, good timeout explanation, viable fixes"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Correct 12x, good timeout analysis with headroom math, deadline + jitter/breaker fixes."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9,
+        "truthfulness": 10,
+        "note": "gpt-oss:120b: Correct amplification, good timeout explanation, viable fixes | minimax-m3: Correct 12x, good timeout analysis with headroom math, deadline + jitter/breaker fixes."
+      },
+      {
+        "cond": "solo-kimi",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Accurate, thorough, includes deadline propagation and idempotency"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 10,
+            "truthfulness": 10,
+            "note": "Correct 12x, excellent timeline showing overlapping calls, strong deadline+coalescing fixes."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9.5,
+        "truthfulness": 10,
+        "note": "gpt-oss:120b: Accurate, thorough, includes deadline propagation and idempotency | minimax-m3: Correct 12x, excellent timeline showing overlapping calls, strong deadline+coalescing fixes."
+      },
+      {
+        "cond": "self-kimi",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Correct, clear, fixes include deadline and retry removal"
+          },
+          "minimax-m3": {
+            "accuracy": 10,
+            "completeness": 10,
+            "truthfulness": 10,
+            "note": "Correct 12x with extra processing-time calc, excellent interplay and two detailed fixes."
+          }
+        },
+        "accuracy": 9.5,
+        "completeness": 9.5,
+        "truthfulness": 10,
+        "note": "gpt-oss:120b: Correct, clear, fixes include deadline and retry removal | minimax-m3: Correct 12x with extra processing-time calc, excellent interplay and two detailed fixes."
+      },
+      {
+        "cond": "solo-deepseek-pro",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Accurate, explains budget mismatch, fixes align timeouts and dedup"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 8,
+            "truthfulness": 10,
+            "note": "Correct 12x and interplay covered, fixes valid but briefer than others."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 8.5,
+        "truthfulness": 10,
+        "note": "gpt-oss:120b: Accurate, explains budget mismatch, fixes align timeouts and dedup | minimax-m3: Correct 12x and interplay covered, fixes valid but briefer than others."
+      },
+      {
+        "cond": "solo-glm",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Correct, details storm, fixes with budget and jitter"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Correct 12x, strong timeout analysis, staggered timeouts and retry-budget fixes."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9,
+        "truthfulness": 10,
+        "note": "gpt-oss:120b: Correct, details storm, fixes with budget and jitter | minimax-m3: Correct 12x, strong timeout analysis, staggered timeouts and retry-budget fixes."
+      },
+      {
+        "cond": "fusion-agents",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Accurate, explains overlap, fixes with deadline and staggering"
+          },
+          "minimax-m3": {
+            "accuracy": 10,
+            "completeness": 10,
+            "truthfulness": 10,
+            "note": "Correct 12x, detailed race-condition timeline, deadline+cancellation and stagger fixes."
+          }
+        },
+        "accuracy": 9.5,
+        "completeness": 9.5,
+        "truthfulness": 10,
+        "note": "gpt-oss:120b: Accurate, explains overlap, fixes with deadline and staggering | minimax-m3: Correct 12x, detailed race-condition timeline, deadline+cancellation and stagger fixes."
+      }
+    ],
+    "times": {
+      "solo-glm": 11649,
+      "solo-kimi": 71859,
+      "solo-deepseek-pro": 52342,
+      "fusion": 59870,
+      "fusion-noweb": 51626,
+      "fusion-agents": 90089,
+      "self-kimi": 100185
+    },
+    "answers": {
+      "solo-glm": "### 1. Worst-Case Retry Amplification at C\n\nIn a distributed system with uncoordinated retries, amplification is multiplicative. \n\n*   **A** retries 3 times, meaning it makes **4 total attempts** (1 initial + 3 retries) to B.\n*   **B** retries 2 times, meaning it makes **3 total attempts** (1 initial + 2 retries) to C.\n\nFor a single external request to A, the worst-case scenario is that every single attempt times out, triggering a retry. In this case, A makes 4 calls to B, and each of those calls prompts B to make 3 calls to C. \n\n**Total amplification:** 4 (A's attempts) × 3 (B's attempts) = **12 requests to C**. \nA single user click has just generated a 1200% load increase on the innermost service.\n\n### 2. Why Timeout Interplay Makes It Worse\n\nThe situation is exacerbated by two timeout interplay dynamics: **un-staggered timeouts** and **orphaned requests**.\n\n*   **Un-staggered Timeouts (The \"Tight Margin\" Problem):** \n    All hops have a 500ms timeout, but C's p99 is 400ms. This leaves only 100ms of headroom for network latency, garbage collection, or thread queuing. If C takes 450ms (a normal occurrence in the p99+ range), B might wait 500ms and time out, triggering a retry. However, because A's timeout is *also* 500ms, A times out at the exact same moment B does. A will never benefit from B's retries; instead, A will time out, drop the connection, and fire a *brand new* request to B. This destroys any chance of B's exponential backoff helping the system recover, while simultaneously doubling the load on C.\n*   **Orphaned Requests (The \"Zombie\" Problem):**\n    When B times out on C after 500ms, B moves on and fires a retry. However, if B doesn't explicitly cancel the first request (which is common in basic HTTP setups), C continues processing it. Now C is processing both the orphaned first request *and* the new retry request. Because C is now handling concurrent requests, its latency degrades even further, increasing the likelihood that the next request will also time out. This creates a cascading retry storm where C is drowning in overlapping requests.\n\n### 3. Concrete Fixes\n\n**Fix 1: Implement a Staggered Timeout Budget**\nTimeouts must be hierarchical. The downstream service must have enough time to complete its retries *before* the upstream service gives up.\n*   Set C's timeout to **500ms**.\n*   Give B enough time to make 3 attempts to C with backoff (e.g., 500ms wait + 100ms backoff + 500ms wait + 100ms backoff + 500ms wait). Set B's timeout to roughly **2.5 seconds**.\n*   Give A enough time to make its 4 attempts. Set A's timeout to roughly **15 seconds**.\nThis ensures B has ample time to retry C and recover from a transient 450ms latency spike without A prematurely giving up and spawning a whole new chain of 12 requests.\n\n**Fix 2: Use a Retry Budget with Jitter (or Circuit Breaking)**\nInstead of blind retry policies, implement protective measures to stop the retry storm before it starts.\n*   **Retry Budget:** Limit B so that retries cannot exceed, say, 10% of its total traffic to C. If C is failing and B hits the 10% retry limit, B stops retrying and fails fast.\n*   **Jitter:** A's exponential backoff should include a large random jitter (e.g., +/- 50% of the backoff time). This prevents multiple concurrent requests to A from timing out and retrying at the exact same synchronized millisecond, smoothing out the load spikes on C.\n*   **Circuit Breaker:** If B detects that C's error rate or latency spikes (e.g., 5 consecutive timeouts), B trips a circuit breaker and immediately fails requests to A, rather than allowing the 12x amplification to occur.",
+      "solo-kimi": "### Worst-case retry amplification at C\n\nAssuming “retries *N* times” means the **initial attempt plus N retries**:\n\n- **A** makes up to `1 + 3 = 4` attempts to B.\n- For **each** A attempt, **B** makes up to `1 + 2 = 3` attempts to C.\n- **C** has no retries.\n\nSo one external request to A can generate up to:\n\n```\n4 × 3 = 12 requests at C\n```\n\nThat is a **12× retry amplification** in the worst case.  \n*(If your code treats “3 retries” as 3 total attempts, it would be 3 × 3 = 9×; the principle is the same.)*\n\n---\n\n### Why the timeout interplay makes it worse\n\nTwo key things collide:\n\n1. **A’s timeout is shorter than B’s retry budget.**  \n   A gives each downstream call only **500 ms**. But B’s full retry window can take up to `3 × ~400–500 ms ≈ 1.2–1.5 s`. So A will time out and start a new attempt long before B has finished retrying C.\n\n2. **No deadline/cancellation is propagated.**  \n   When A times out, it walks away and retries, but B does **not** know the upstream caller has given up. B keeps issuing its own retries to C.\n\nBecause C’s **p99 latency is 400 ms**, a single C call already uses most of B’s 500 ms timeout budget. Any small tail-latency spike, GC pause, or transient error easily pushes C past 500 ms, causing B to retry. Meanwhile A also retries because its 500 ms window is already up.\n\nThe result is **overlapping, duplicate calls** at C:\n\n```\nt=0      A1→B1→C1\nt≈500    A1 times out; B1 starts retry C2\nt≈500-600 A2 starts → B2→C3  (B1's C2 still running)\nt≈...    A3, A4 start while previous B retries are still in flight\n```\n\nInstead of 12 sequential calls, C can receive a **burst of concurrent calls** for the same original request — a classic retry storm.\n\n---\n\n### Two concrete fixes\n\n#### 1. Propagate deadlines and cancellation end-to-end\nPass a single, decreasing deadline from A through B to C (e.g. gRPC deadline, `Context.withTimeout`, or an HTTP `X-Deadline-Ms` header).\n\n- Before B issues another C call, check the remaining time. If there is not enough budget for a meaningful attempt, **fail fast** instead of launching a doomed call.\n- When A’s request is cancelled/times out, propagate the cancellation so B aborts its in-flight C calls.\n- Tune timeouts so the inner retry budget fits inside the outer one. For example, if A’s timeout must stay 500 ms, B should not do two long retries to C; either reduce B’s retries or give A a longer end-to-end deadline.\n\nThis stops B from doing wasted work for a request A has already abandoned.\n\n#### 2. Idempotency key + in-flight request coalescing\nGenerate a **stable idempotency key / request ID** at A for each external request and pass it down.\n\n- B keeps an **in-flight map** keyed by that ID. When A’s retry arrives while an earlier attempt is still pending, B **attaches to the existing attempt** instead of issuing a new C call. All callers receive the same result.\n- Optionally, C also checks the idempotency token so any duplicate calls that do arrive are deduplicated.\n\nThis collapses A’s retries into at most one active C request, eliminating the multiplicative fan-out.\n\n---\n\nTogether, these can reduce C’s worst-case load from **12×** down to roughly **1–3×** and prevent overlapping retry bursts.",
+      "solo-deepseek-pro": "Assuming “A retries 3 times” means **3 retries after the initial attempt**, and “B retries 2 times” means **2 retries after the initial attempt**:\n\n- A makes up to **4** calls to B.\n- B makes up to **3** calls to C per B call.\n- Worst-case C invocations for one external request to A:  \n  **4 × 3 = 12 C requests**\n\nIf your config means “total attempts” instead, the multiplication is **3 × 2 = 6**.\n\n## Why the timeout interplay makes it worse\n\nB’s worst-case duration is:\n\n**3 attempts × 500 ms timeout = 1.5 s**\n\nBut A’s timeout to B is only **500 ms**. So A can time out B while B is still retrying C. A then starts a new B call, even though the previous B call may still be running and still retrying C. This creates overlapping B calls and therefore overlapping C requests.\n\nAlso, C’s p99 is **400 ms**, only **100 ms** below the 500 ms timeout. Under retry load, C’s latency can easily exceed 500 ms, causing B to time out and retry C again. That adds more load to C, causing more timeouts, which causes more retries — a retry storm.\n\nSo the worst-case amplification is not just sequential multiplication; the timeout mismatch can cause concurrent duplicate work at C.\n\n## Two concrete fixes\n\n1. **Align timeout budgets across hops**  \n   Make A’s timeout greater than B’s worst-case retry budget. For example, if B can take up to 1.5 s, A’s timeout should be at least **2 s**. Alternatively, reduce B’s retries or C timeout so B’s total worst-case time fits inside A’s timeout. Use deadline propagation so B stops retrying when the overall deadline is exhausted.\n\n2. **Make retries idempotent and deduplicate**  \n   Attach idempotency keys or request IDs and deduplicate at C or B. That way duplicate C calls from retries do not create duplicate work or side effects. Add jitter to exponential backoff to avoid synchronized retry bursts.",
+      "fusion": "Assuming “retries 3 times” means 3 retries **after** the initial attempt, A makes **4 total attempts** to B, and B makes **3 total attempts** to C.\n\n## Worst-case retry amplification at C\n\nFor one external request to A:\n\n- A calls B up to **4 times** (1 initial + 3 retries)\n- Each B call can call C up to **3 times** (1 initial + 2 retries)\n\nSo the worst-case number of calls C receives is:\n\n\\[\n4 \\times 3 = 12\n\\]\n\nThat is a **12× amplification** of the original request at C.\n\n(If “retries 3 times” is interpreted as 3 total attempts rather than 3 retries after the first, the number would be 3 × 2 = 6.)\n\n## Why timeout interplay makes it worse\n\nThe timeouts are all **500 ms**, and C’s p99 latency is **400 ms**. That leaves only **100 ms of headroom**. Under any added load or latency spike, C’s response time can easily exceed 500 ms.\n\nWhen that happens:\n\n1. **B times out waiting for C** and retries C, even though C may still be processing the original request.  \n   → C now has duplicate work.\n\n2. **A times out waiting for B** at the same 500 ms boundary, because B is still busy retrying C.  \n   → A retries B, starting a whole new B sequence while the old B sequence may still be running.\n\n3. Because the timeouts are equal at each hop, A and B can time out **simultaneously**, causing synchronized retries. Without jitter, exponential backoff delays can also align, creating bursts.\n\nThe result is not just 12 sequential calls; multiple B sequences can overlap, causing **concurrent** C requests and a retry storm. C, already slow, receives even more load, which can push latency further above 500 ms and trigger more timeouts — a vicious cycle.\n\n## Two concrete fixes\n\n### 1. Propagate deadlines and use timeout budgets\n\nGive A an overall request deadline, and propagate the remaining time downstream. For example:\n\n- A sets a total deadline of **2 s**.\n- B receives the remaining deadline and limits its own retries so it stops before A’s deadline expires.\n- B’s timeout to C should be shorter than A’s timeout to B, e.g. B → C timeout = **300 ms**, A → B timeout = **800 ms**.\n\nThis prevents B from continuing to retry C after A has already given up, and it stops lower layers from consuming time that upper layers no longer have.\n\n### 2. Add jitter and circuit breakers\n\n- **Jitter** the exponential backoff delays at both A and B. This desynchronizes retry bursts and avoids thundering-herd effects.\n- Use a **circuit breaker** at B (or A) that stops calling C when C’s timeout/error rate exceeds a threshold. If C is already overloaded, retrying it only makes things worse; the circuit breaker opens and fails fast instead.\n\nAdditionally, tune timeouts with more headroom — e.g. set B → C timeout to C’s p99.9 plus margin, not just p99 — and consider idempotency keys so retries don’t duplicate side effects.",
+      "fusion-noweb": "### Worst-case retry amplification at C\n\nAssuming \"retries 3 times\" means 1 initial attempt plus 3 retries (the standard interpretation):\n\n* **A** makes **4 attempts** to B (1 initial + 3 retries).\n* For each of those attempts, **B** makes **3 calls** to C (1 initial + 2 retries).\n* **C** has no retries and processes every call.\n\n**Worst-case amplification:**  \n**4 × 3 = 12 calls to C** from a single external request to A.\n\n---\n\n### Why the timeout interplay makes it worse\n\nThe 500 ms timeouts are the same at every hop, but they interact badly.\n\n1. **A's 500 ms timeout is shorter than B's full retry sequence.**  \n   B can spend up to 3 × 500 ms = 1500 ms retrying C. So A often times out and starts a fresh attempt while the previous B is still retrying C.\n\n2. **B's 500 ms timeout is very close to C's p99 latency of 400 ms.**  \n   Anything in the tail above p99 can easily exceed 500 ms. That means B starts retrying requests that may still be in flight and could have succeeded shortly.\n\n3. **Synchronized timeouts.**  \n   Since A, B, and C all use 500 ms, they can time out almost simultaneously. A retries B at the same moment B retries C, producing overlapping retry storms.\n\n4. **Zombie requests.**  \n   When A gives up on B, B may still be processing or retrying C. C keeps doing work that upstream callers have already abandoned.\n\n5. **Exponential backoff at A does not solve this.**  \n   Backoff spaces A's attempts over time, but each new attempt still spawns a fresh B retry loop. It reduces concurrency somewhat, but C still receives up to 12 calls.\n\nThe result is a positive feedback loop: C slows down, timeouts fire more often, retries multiply, C gets more overloaded, and latency gets worse.\n\n---\n\n### Two concrete fixes\n\n#### 1. Propagate an end-to-end deadline with cancellation\nUse a single timeout budget for the whole chain, passed downstream via headers or request context.\n\n* A sets a total deadline, e.g. 2 seconds.\n* B receives the remaining budget and sets its per-call timeout to C as a fraction of that budget.\n* B stops retrying once the remaining budget is too small for another attempt.\n* If A abandons an attempt, a cancellation signal propagates to B and C so they stop doing abandoned work.\n\nThis prevents A from walking away while B continues hammering C.\n\n#### 2. Retry at only one layer and make lower layers fail-fast\nBecause A already retries the whole downstream path, B should not independently retry C.\n\n* Disable B's retries, or allow only one retry with a tight timeout.\n* Set B's timeout to C well below A's per-attempt timeout, e.g. 100–200 ms.\n* Set A's per-attempt timeout large enough to cover a single non-retried B→C call, e.g. 600–700 ms.\n\nOptionally, use idempotency keys so duplicate attempts at C can be deduplicated.\n\nA complementary approach is to use an inverted timeout hierarchy: if A allows 500 ms, set B's timeout to ~400 ms and C's to ~300 ms, ensuring downstream timeouts occur before upstream timeouts. This avoids synchronized timeout cascades.",
+      "fusion-agents": "### Worst-Case Retry Amplification at C\n\nFor a single external request to **A**, the absolute worst-case number of calls that hit **C** is:\n\n- **A** performs **1 initial attempt + 3 retries = 4 total attempts**.\n- For **each** A attempt, **B** performs **1 initial attempt + 2 retries = 3 total attempts** to C.\n- Therefore, **C receives 4 × 3 = 12 calls**.\n\nThis is a **12× amplification** on the downstream service C for just one external request.\n\n---\n\n### Why Timeout Interplay Makes It Worse (Overlapping Storms)\n\nThe critical issue is the **asymmetric relationship between A's timeout and B's total retry duration**.\n\n- **B's worst-case handling time** for a single request from A: If C is slow and times out, B will spend **3 attempts × 500 ms = 1500 ms** (1.5 seconds) trying to reach C before returning an error to A.\n- **A's timeout** is only **500 ms**.\n\nThis creates a race condition:\n\n1. A sends request #1 to B. A starts its 500 ms timer.\n2. B receives request #1 and starts its own 3 attempts to C. C is slow (taking >500 ms each time).\n3. At **t = 500 ms**, **A's timer fires**, even though B is still busy with its first attempt (B is only 1/3 done, just hit its own first C timeout).\n4. A abandons request #1 and, per its exponential backoff, schedules retry #2 (let’s say at t = 600 ms if backoff is 100 ms, or t = 1000 ms if backoff is 500 ms).\n5. **Crucially, B is still processing request #1 from A.** A's retry #2 hits B **while B's previous attempt is still running**.\n6. B starts a *second, parallel* wave of 3 attempts to C for A's retry #2.\n\n**Result**: Instead of 12 sequential calls to C, A's early timeout causes **overlapping waves**. If B is multithreaded, all 12 requests to C can be **in flight simultaneously** within a ~1.5-second window. If B is single-threaded, the requests queue up, but A keeps piling new ones onto B’s queue. Either way, **C experiences a massive concurrency spike** (up to 12x) rather than a gentle linear ramp, rapidly exhausting C's connection pool, thread pool, or database connections, potentially taking C down entirely.\n\nThe **exponential backoff** at A does *not* help here because A's backoff (e.g., 100ms, 200ms) is far shorter than B's 1.5s internal retry span. Even with backoff, A will still fire multiple requests while B is still stuck on the first one.\n\n---\n\n### Two Concrete Fixes\n\n#### Fix 1: Global Deadline Propagation + Cancellation (Stop the Cascade)\n\nIntroduce a **global deadline budget** for the entire request chain (e.g., using a `X-Request-Deadline` header or a gRPC `Deadline`).\n\n- **A** calculates a total budget (e.g., **1.5 seconds**).\n- When A calls B, it passes the *remaining* time (e.g., 1.5s).\n- When B calls C, it passes the remaining time (e.g., 1.2s).\n- **Key rule**: A hop **must not** start a new retry if the remaining time is less than its own timeout (or if the deadline has already passed). Moreover, if a hop times out *its own* downstream call, it must **cancel** the in-flight downstream request (e.g., `AbortSignal` or `HttpContext.CancellationToken`).\n\n**Why it fixes the storm**:\n- A will no longer initiate a retry if the deadline is too close, and B will not retry C if the deadline has passed.\n- If B is still stuck on C at t=1.5s, A can forcefully cancel the request to B, which propagates a cancellation to C.\n- The worst case becomes: 12 requests **only if** each hop stays within the deadline, but **never overlapping**. If C is slow, the chain fails fast before generating all 12 calls, capping C's load.\n\n---\n\n#### Fix 2: Timeout Staggering (or Remove Retry on Timeout)\n\nEnsure that **A's timeout is strictly greater than B's total worst-case retry time**, so A *always* waits for B to fully finish before triggering a new attempt.\n\n- Calculate B's worst-case time: `B's attempts × B's timeout` = `3 × 500 ms = 1500 ms`.\n- Set **A's timeout to 1500 ms + buffer** (e.g., **1.6 seconds**).\n\n**Why it works**:\n- A will now wait for B's complete 1.5s cycle (all 3 attempts to C) before timing out and retrying.\n- A retry #2 will **never** arrive at B until B has already returned an error to A1. This forces the 12 calls to C to be **strictly serialized** across time (4 waves of 3 attempts each), drastically reducing the concurrency spike at C.\n\n**Alternative refinement**: Since C's p99 is 400ms and the timeout is 500ms, C is barely keeping up. A timeout on C is a strong signal of resource saturation. **Disabling retries on timeout** (treating timeouts as fatal errors rather than transient) at both A and B is the most effective fix: if C cannot respond within 500ms, it is likely overloaded, and retrying will only make it worse. Fail fast and shed load, allowing C to recover.\n\n---\n\n### Summary\n\n- **Worst-case amplification**: 12 calls to C.\n- **Timeout interplay**: A's 500ms timeout is less than B's 1500ms retry period, causing A to retry *while B is still processing*, creating an overlapping concurrency storm at C.\n- **Fix 1**: Global deadline + cancellation to stop retries when the budget runs out.\n- **Fix 2**: Set A's timeout greater than B's worst-case total time, or **disable retries on timeout** to avoid retrying a saturated service.",
+      "self-kimi": "### Worst-case retry amplification at C\n\nReading “retries” as *additional attempts after the first one*:\n\n- **A** makes `1 + 3 = 4` calls into the downstream chain.\n- For **each** of those A→B attempts, **B** makes `1 + 2 = 3` calls to **C**.\n- So one external request to A can generate up to:\n\n```\n4 × 3 = 12 calls to C\n```\n\nThat is a **12× worst-case request-count amplification** at C.  \n*(If someone reads “3 retries” as “3 total attempts,” the number becomes `3 × 3 = 9`, but the more common interpretation is initial + retries = 12.)*\n\nIt is worse than just 12 packets: each of those calls can be a **full 500 ms timeout call**, so one bad external request can burn up to:\n\n```\n12 attempts × 500 ms ≈ 6 seconds of C processing time\n```\n\nwith several of those calls in flight at the same time.\n\n---\n\n### Why the timeout interplay makes it much worse\n\nThe real damage comes from three interacting effects:\n\n1. **A’s deadline is shorter than B’s retry budget.**  \n   B can spend up to `3 × 500 ms = 1.5 s` retrying C, but A gives up after **500 ms** and starts a whole new downstream cascade. So A retries *while B is still retrying*.\n\n2. **Without propagated deadlines/cancellation, retries become zombie work.**  \n   When A times out and re-issues the request, the previous B instance may still be firing retries at C. A’s new request goes to a fresh B (or connection) that starts its own 3-call retry loop. C now has overlapping waves of retries from multiple A attempts, multiplying load **concurrently**, not just sequentially.\n\n3. **C’s p99 latency of 400 ms is only 100 ms below the timeout.**  \n   Under normal tail conditions, C calls are already close to the 500 ms limit. Under the added load from retries, C’s latency easily crosses 500 ms, so B starts retrying. Those retries add more load, pushing C further over the timeout, causing more retries — a classic **retry storm** positive feedback loop. The 500 ms timeouts therefore don’t protect C; they amplify wasted work, because every layer can abandon and re-issue requests faster than the layer below can finish them.\n\n---\n\n### Two concrete fixes\n\n#### 1. Propagate an end-to-end deadline and cancel downstream work\nA should attach a single deadline/context to the request, and B must check it before every call to C.\n\n- B’s per-call timeout to C should be derived from the **remaining** deadline, not a fixed 500 ms.\n- B should only call/retry C if there is enough budget left. A useful rule:\n  ```\n  only retry C if remaining_deadline > C_p99 + margin\n  e.g., remaining > 400 ms + 50 ms = 450 ms\n  ```\n  This stops B from launching a doomed C call in the last few hundred milliseconds.\n- If A gives up, B must cancel any in-flight C requests so they stop consuming C’s resources.\n\nThis eliminates the orphaned/zombie-retries problem.\n\n#### 2. Eliminate nested retries — make retries live at one layer, or make them cheap and bounded\nPick one of these approaches depending on your architecture:\n\n- **Option A: Consolidate retries to a single layer.**  \n  Remove B’s retries to C and rely on A’s end-to-end retries. Set B→C timeout lower than A’s deadline, e.g. **450 ms**, so B fails fast and A handles recovery. This bounds C load to **4 calls per external request** instead of 12.\n\n- **Option B: If both layers must retry, deduplicate and budget the retries.**  \n  Generate a stable **idempotency/request ID** at A and pass it through B to C. C caches in-flight/results keyed by that ID, so duplicate retry attempts return the cached response instead of re-executing — capping real work to **1 execution** per logical request.  \n  Add a **retry budget** at B (e.g., only 5–10% of B→C traffic may be retries) and/or a **circuit breaker** so B stops hammering C when latency/error rises.\n\nTogether, these changes turn the 12× amplification storm into a small, bounded, cancellable set of retries."
+    }
+  },
+  {
+    "id": "T01",
+    "cat": "coding",
+    "scores": [
+      {
+        "cond": "self-kimi",
+        "raters": 1,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Correct behavior, type-safe, full features."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9,
+        "truthfulness": 10,
+        "note": "gpt-oss:120b: Correct behavior, type-safe, full features."
+      },
+      {
+        "cond": "fusion-agents",
+        "raters": 1,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Accurate implementation, meets all requirements."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9,
+        "truthfulness": 10,
+        "note": "gpt-oss:120b: Accurate implementation, meets all requirements."
+      },
+      {
+        "cond": "solo-deepseek-pro",
+        "raters": 1,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Works correctly, type-safe, includes cancel."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9,
+        "truthfulness": 10,
+        "note": "gpt-oss:120b: Works correctly, type-safe, includes cancel."
+      },
+      {
+        "cond": "fusion-noweb",
+        "raters": 1,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 3,
+            "completeness": 7,
+            "truthfulness": 10,
+            "note": "Leading mode broken; timer cleared each call."
+          }
+        },
+        "accuracy": 3,
+        "completeness": 7,
+        "truthfulness": 10,
+        "note": "gpt-oss:120b: Leading mode broken; timer cleared each call."
+      },
+      {
+        "cond": "solo-glm",
+        "raters": 1,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 8,
+            "completeness": 8,
+            "truthfulness": 10,
+            "note": "Correct logic, minor this typing issue."
+          }
+        },
+        "accuracy": 8,
+        "completeness": 8,
+        "truthfulness": 10,
+        "note": "gpt-oss:120b: Correct logic, minor this typing issue."
+      },
+      {
+        "cond": "solo-kimi",
+        "raters": 1,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Accurate, fully meets spec, type-safe."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9,
+        "truthfulness": 10,
+        "note": "gpt-oss:120b: Accurate, fully meets spec, type-safe."
+      },
+      {
+        "cond": "fusion",
+        "raters": 1,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 8,
+            "completeness": 8,
+            "truthfulness": 10,
+            "note": "Correct, but this typing not preserved precisely."
+          }
+        },
+        "accuracy": 8,
+        "completeness": 8,
+        "truthfulness": 10,
+        "note": "gpt-oss:120b: Correct, but this typing not preserved precisely."
+      }
+    ],
+    "times": {
+      "solo-glm": 11835,
+      "solo-kimi": 29943,
+      "solo-deepseek-pro": 36194,
+      "fusion": 37885,
+      "fusion-noweb": 44833,
+      "fusion-agents": 9669,
+      "self-kimi": 96900
+    },
+    "answers": {
+      "solo-glm": "```typescript\nfunction debounce<T extends (...args: any[]) => void>(\n  fn: T,\n  ms: number,\n  opts?: { leading?: boolean }\n): T & { cancel(): void } {\n  const leading = opts?.leading ?? false;\n\n  let timer: ReturnType<typeof setTimeout> | null = null;\n  let pendingArgs: Parameters<T> | null = null;\n  let pendingThis: unknown = undefined;\n\n  const debounced = function (this: unknown, ...args: Parameters<T>): void {\n    pendingArgs = args;\n    pendingThis = this;\n\n    if (leading && timer === null) {\n      // Leading edge: fire immediately on the first call within the window.\n      const capturedArgs = args;\n      const capturedThis = this;\n      pendingArgs = null;\n      pendingThis = undefined;\n      fn.apply(capturedThis, capturedArgs);\n\n      // Open the suppression window; when it closes, allow the next leading call.\n      timer = setTimeout(() => {\n        timer = null;\n        pendingArgs = null;\n        pendingThis = undefined;\n      }, ms);\n      return;\n    }\n\n    if (leading && timer !== null) {\n      // Within the leading-suppression window: drop the call.\n      return;\n    }\n\n    // Trailing-edge (default): reset the window on every call.\n    if (timer !== null) {\n      clearTimeout(timer);\n    }\n    timer = setTimeout(() => {\n      timer = null;\n      if (pendingArgs !== null) {\n        const argsCopy = pendingArgs;\n        const thisCopy = pendingThis;\n        pendingArgs = null;\n        pendingThis = undefined;\n        fn.apply(thisCopy, argsCopy);\n      }\n    }, ms);\n  } as T & { cancel(): void };\n\n  debounced.cancel = function (): void {\n    if (timer !== null) {\n      clearTimeout(timer);\n      timer = null;\n    }\n    pendingArgs = null;\n    pendingThis = undefined;\n  };\n\n  return debounced;\n}\n\nexport { debounce };\n```\n\nKey points of the implementation:\n\n- **Trailing-edge (default)**: Every call resets the timer; the function fires once `ms` after the last call with the latest `this` and arguments.\n- **Leading edge (`{ leading: true }`)**: The first call (when no window is open) fires immediately. A window of length `ms` opens during which all subsequent calls are dropped. When the window closes, the next call again fires immediately. There is no trailing fire in leading mode, matching the spec (\"subsequent calls within the window are suppressed\").\n- **`.cancel()`**: Clears any pending timer and resets the pending arguments/`this`. In leading mode, this also closes the suppression window, so the next call will fire immediately again.\n- **`this` / argument preservation**: Arguments are captured via `Parameters<T>`, and `this` is forwarded through `fn.apply(capturedThis, capturedArgs)`. The returned object is cast to `T & { cancel(): void }` so callers see the original signature of `fn` plus `.cancel`.\n- **No external dependencies**: Uses only `setTimeout`/`clearTimeout`.",
+      "solo-kimi": "```ts\nfunction debounce<T extends (...args: any[]) => void>(\n  fn: T,\n  ms: number,\n  opts: { leading?: boolean } = {}\n): T & { cancel(): void } {\n  type This = ThisParameterType<T>;\n\n  let timer: ReturnType<typeof setTimeout> | null = null;\n  let pendingThis: This | undefined;\n  let pendingArgs: Parameters<T> | undefined;\n  const { leading = false } = opts;\n\n  const invoke = (thisArg: This, args: Parameters<T>) => {\n    fn.apply(thisArg, args);\n  };\n\n  const debounced = function (this: This, ...args: Parameters<T>) {\n    if (timer !== null) {\n      // Trailing mode: restart the timer with the latest `this` and args.\n      if (!leading) {\n        pendingThis = this;\n        pendingArgs = args;\n        clearTimeout(timer);\n        timer = setTimeout(() => {\n          timer = null;\n          invoke(pendingThis!, pendingArgs!);\n          pendingThis = pendingArgs = undefined;\n        }, ms);\n      }\n      // Leading mode: calls inside the window are ignored.\n      return;\n    }\n\n    if (leading) {\n      // Fire immediately on the leading edge.\n      invoke(this, args);\n    } else {\n      // Trailing mode: remember the call for later.\n      pendingThis = this;\n      pendingArgs = args;\n    }\n\n    timer = setTimeout(() => {\n      timer = null;\n      if (!leading && pendingArgs) {\n        invoke(pendingThis!, pendingArgs);\n        pendingThis = pendingArgs = undefined;\n      }\n    }, ms);\n  } as T & { cancel(): void };\n\n  debounced.cancel = () => {\n    if (timer !== null) clearTimeout(timer);\n    timer = null;\n    pendingThis = pendingArgs = undefined;\n  };\n\n  return debounced;\n}\n```\n\nThis implementation:\n\n- Preserves `this` context and argument types via `ThisParameterType<T>` and `Parameters<T>`.\n- Defaults to trailing-edge invocation.\n- With `leading: true`, fires the first call immediately and suppresses calls until the cooldown window elapses.\n- `.cancel()` clears any pending trailing invocation and resets internal state.\n- Uses only built-in `setTimeout`/`clearTimeout`, with no external dependencies.",
+      "solo-deepseek-pro": "```typescript\nfunction debounce<T extends (...args: any[]) => void>(\n  fn: T,\n  ms: number,\n  opts?: { leading?: boolean }\n): T & { cancel(): void } {\n  const leading = opts?.leading ?? false;\n  let timeoutId: ReturnType<typeof setTimeout> | undefined;\n  let lastArgs: Parameters<T> | undefined;\n  let lastThis: unknown;\n\n  function invoke() {\n    const args = lastArgs;\n    const thisArg = lastThis;\n    lastArgs = undefined;\n    lastThis = undefined;\n    if (args !== undefined) {\n      fn.apply(thisArg as ThisParameterType<T>, args);\n    }\n  }\n\n  const debounced = function (\n    this: ThisParameterType<T>,\n    ...args: Parameters<T>\n  ): void {\n    if (leading) {\n      if (timeoutId === undefined) {\n        // First call in the window: fire immediately.\n        timeoutId = setTimeout(() => {\n          timeoutId = undefined;\n          lastArgs = undefined;\n          lastThis = undefined;\n        }, ms);\n        fn.apply(this, args);\n      }\n      // Subsequent calls within the window are suppressed.\n      return;\n    }\n\n    // Trailing edge (default)\n    lastArgs = args;\n    lastThis = this;\n\n    if (timeoutId !== undefined) {\n      clearTimeout(timeoutId);\n    }\n\n    timeoutId = setTimeout(() => {\n      timeoutId = undefined;\n      invoke();\n    }, ms);\n  };\n\n  debounced.cancel = function cancel() {\n    if (timeoutId !== undefined) {\n      clearTimeout(timeoutId);\n      timeoutId = undefined;\n    }\n    lastArgs = undefined;\n    lastThis = undefined;\n  };\n\n  return debounced as T & { cancel(): void };\n}\n```",
+      "fusion": "```typescript\nexport function debounce<T extends (...args: any[]) => void>(\n  fn: T,\n  ms: number,\n  opts?: { leading?: boolean }\n): T & { cancel(): void } {\n  const leading: boolean = opts?.leading ?? false;\n\n  let timer: ReturnType<typeof setTimeout> | null = null;\n  let lastArgs: any[] | null = null;\n  let lastThis: unknown = undefined;\n  // Tracks whether we are inside a leading-edge cooldown window.\n  let leadingInvoked = false;\n\n  const debounced = function (this: unknown, ...args: any[]): void {\n    // Capture the latest invocation context + args (used for trailing edge).\n    lastArgs = args;\n    lastThis = this;\n\n    if (leading) {\n      // First call in an idle window: fire immediately on the leading edge.\n      if (!leadingInvoked) {\n        leadingInvoked = true;\n        fn.apply(this, args);\n\n        // Start the cooldown window; subsequent calls are suppressed\n        // and do NOT schedule a trailing invocation.\n        timer = setTimeout(() => {\n          timer = null;\n          leadingInvoked = false;\n        }, ms);\n      }\n      // Else: suppressed within the window — do nothing.\n      return;\n    }\n\n    // Trailing-edge (default): reset the timer on every call so that only the\n    // last invocation's arguments fire once the window elapses.\n    if (timer !== null) {\n      clearTimeout(timer);\n    }\n\n    timer = setTimeout(() => {\n      timer = null;\n      if (lastArgs !== null) {\n        const capturedArgs = lastArgs;\n        const capturedThis = lastThis;\n        lastArgs = null;\n        lastThis = undefined;\n        fn.apply(capturedThis, capturedArgs);\n      }\n    }, ms);\n  } as T & { cancel(): void };\n\n  debounced.cancel = function (): void {\n    if (timer !== null) {\n      clearTimeout(timer);\n      timer = null;\n    }\n    leadingInvoked = false;\n    lastArgs = null;\n    lastThis = undefined;\n  };\n\n  return debounced;\n}\n```\n\n### Behavior summary\n\n- **Trailing-edge (default, `leading` falsy):** Each call resets the timer; only the final call's `this` + args fire once `ms` elapses since the last call.\n- **Leading-edge (`leading: true`):** The first call after an idle period fires synchronously via `fn.apply(this, args)`; subsequent calls within the `ms` window are suppressed entirely (no trailing fire). Once the window expires, the next call again fires on the leading edge.\n- **`.cancel()`:** Clears any pending `setTimeout` and resets internal state (`lastArgs`, `lastThis`, `leadingInvoked`), so a subsequent call behaves as a fresh first call.\n- **`this` and arg types:** `this: unknown` + spread `...args` combined with the cast to `T & { cancel(): void }` preserves the original function's call signature; calls go through `fn.apply(this, args)`, so the receiver is forwarded correctly.\n- **No external deps:** Uses only `setTimeout` / `clearTimeout` (`ReturnType<typeof setTimeout>` keeps it compatible across DOM and Node typings).\n\n### Usage example\n\n```typescript\nconst log = debounce((msg: string) => console.log(msg), 200);\nlog(\"a\"); log(\"b\"); log(\"c\"); // only \"c\" prints after 200ms\n\nconst immediate = debounce((msg: string) => console.log(msg), 200, { leading: true });\nimmediate(\"x\"); // prints \"x\" right now\nimmediate(\"y\"); immediate(\"z\"); // suppressed\n// ~200ms later the window closes; the next call would fire immediately again.\n\nlog.cancel();       // drops pending trailing call\nimmediate.cancel(); // ends cooldown early\n```",
+      "fusion-noweb": "```typescript\nfunction debounce<T extends (...args: any[]) => void>(\n  fn: T,\n  ms: number,\n  opts?: { leading?: boolean }\n): T & { cancel(): void } {\n  let timer: ReturnType<typeof setTimeout> | null = null;\n  const leading = opts?.leading ?? false;\n\n  function debounced(\n    this: ThisParameterType<T>,\n    ...args: Parameters<T>\n  ): void {\n    if (timer !== null) {\n      clearTimeout(timer);\n    }\n\n    if (leading) {\n      const isFirst = timer === null;\n\n      timer = setTimeout(() => {\n        timer = null;\n      }, ms);\n\n      if (isFirst) {\n        fn.apply(this, args);\n      }\n    } else {\n      timer = setTimeout(() => {\n        timer = null;\n        fn.apply(this, args);\n      }, ms);\n    }\n  }\n\n  debounced.cancel = () => {\n    if (timer !== null) {\n      clearTimeout(timer);\n      timer = null;\n    }\n  };\n\n  return debounced as T & { cancel(): void };\n}\n```",
+      "fusion-agents": "```typescript\nfunction debounce<T extends (...args: any[]) => void>(\n  fn: T,\n  ms: number,\n  opts?: { leading?: boolean }\n): T & { cancel(): void } {\n  const leading = opts?.leading ?? false;\n  let timer: ReturnType<typeof setTimeout> | null = null;\n  let lastArgs: Parameters<T> | null = null;\n  let lastThis: ThisParameterType<T> | null = null;\n\n  const debounced = function(this: ThisParameterType<T>, ...args: Parameters<T>) {\n    if (leading) {\n      // Leading edge: call immediately on the first invocation, then ignore until timer expires\n      if (timer === null) {\n        fn.apply(this, args);\n        timer = setTimeout(() => { timer = null; }, ms);\n      }\n    } else {\n      // Trailing edge (default): remember the latest call and schedule it after the window\n      lastArgs = args;\n      lastThis = this;\n      if (timer !== null) clearTimeout(timer);\n      timer = setTimeout(() => {\n        fn.apply(lastThis!, lastArgs!);\n        timer = null;\n      }, ms);\n    }\n  };\n\n  // Cancel any pending invocation and reset internal state\n  debounced.cancel = () => {\n    if (timer !== null) clearTimeout(timer);\n    timer = null;\n    lastArgs = null;\n    lastThis = null;\n  };\n\n  return debounced as T & { cancel(): void };\n}\n```",
+      "self-kimi": "```ts\nfunction debounce<T extends (...args: any[]) => void>(\n  fn: T,\n  ms: number,\n  opts?: { leading?: boolean }\n): T & { cancel(): void } {\n  let timeoutId: ReturnType<typeof setTimeout> | undefined;\n  let lastThis: ThisParameterType<T>;\n  let lastArgs: Parameters<T>;\n  const leading = opts?.leading ?? false;\n\n  const invoke = () => {\n    fn.apply(lastThis, lastArgs);\n  };\n\n  const debounced = function (\n    this: ThisParameterType<T>,\n    ...args: Parameters<T>\n  ): void {\n    lastThis = this;\n    lastArgs = args;\n\n    if (leading) {\n      // First call in a quiet period fires immediately; subsequent calls\n      // inside the cooldown window are ignored (the timer is NOT reset).\n      if (timeoutId === undefined) {\n        invoke();\n        timeoutId = setTimeout(() => {\n          timeoutId = undefined;\n        }, ms);\n      }\n    } else {\n      // Trailing edge: each new call restarts the wait, and the invocation\n      // uses the most recent `this` and arguments.\n      if (timeoutId !== undefined) {\n        clearTimeout(timeoutId);\n      }\n      timeoutId = setTimeout(() => {\n        timeoutId = undefined;\n        invoke();\n      }, ms);\n    }\n  } as T & { cancel(): void };\n\n  debounced.cancel = () => {\n    if (timeoutId !== undefined) {\n      clearTimeout(timeoutId);\n      timeoutId = undefined;\n    }\n  };\n\n  return debounced;\n}\n```\n\n### Behavior\n\n- **Trailing by default** — after the last call, `fn` runs once with the latest `this` and arguments after `ms` milliseconds of inactivity.\n- **`{ leading: true }`** — the first call in a quiet period runs immediately; further calls within the next `ms` are suppressed without extending the cooldown.\n- **`cancel()`** — clears any pending timeout. In trailing mode this cancels the scheduled invocation; in leading mode it ends the cooldown early so the next call fires immediately again.\n- **Type-safe** — preserves `this` via `ThisParameterType<T>` and arguments via `Parameters<T>`, and uses only built-in `setTimeout`/`clearTimeout` (no external dependencies)."
+    }
+  },
+  {
+    "id": "T05",
+    "cat": "report",
+    "scores": [
+      {
+        "cond": "fusion",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Very thorough, accurate, all criteria met"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 10,
+            "truthfulness": 9,
+            "note": "Covers all criteria accurately with comment ping, X-Accel-Buffering, Last-Event-ID, RFC 8441."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9.5,
+        "truthfulness": 9.5,
+        "note": "gpt-oss:120b: Very thorough, accurate, all criteria met | minimax-m3: Covers all criteria accurately with comment ping, X-Accel-Buffering, Last-Event-ID, RFC 8441."
+      },
+      {
+        "cond": "fusion-agents",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 8,
+            "completeness": 8,
+            "truthfulness": 10,
+            "note": "Comprehensive and correct, minor missing keepalive detail"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 10,
+            "truthfulness": 9,
+            "note": "Accurate with subtle correct note that bufferedAmount governs client-sent frames only."
+          }
+        },
+        "accuracy": 8.5,
+        "completeness": 9,
+        "truthfulness": 9.5,
+        "note": "gpt-oss:120b: Comprehensive and correct, minor missing keepalive detail | minimax-m3: Accurate with subtle correct note that bufferedAmount governs client-sent frames only."
+      },
+      {
+        "cond": "solo-glm",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 6,
+            "completeness": 7,
+            "truthfulness": 4,
+            "note": "False claim about SSE auth headers reduces truthfulness"
+          },
+          "minimax-m3": {
+            "accuracy": 5,
+            "completeness": 8,
+            "truthfulness": 4,
+            "note": "Factually wrong: claims EventSource can attach Authorization headers natively."
+          }
+        },
+        "accuracy": 5.5,
+        "completeness": 7.5,
+        "truthfulness": 4,
+        "note": "gpt-oss:120b: False claim about SSE auth headers reduces truthfulness | minimax-m3: Factually wrong: claims EventSource can attach Authorization headers natively."
+      },
+      {
+        "cond": "solo-kimi",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Accurate and complete, meets all expected points"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 10,
+            "truthfulness": 9,
+            "note": "Thorough and correct; covers framing, auth limitations, RFC 8441 caveats."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9.5,
+        "truthfulness": 9.5,
+        "note": "gpt-oss:120b: Accurate and complete, meets all expected points | minimax-m3: Thorough and correct; covers framing, auth limitations, RFC 8441 caveats."
+      },
+      {
+        "cond": "self-kimi",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 6,
+            "completeness": 8,
+            "truthfulness": 3,
+            "note": "Incorrect about SSE custom headers, hurts truthfulness"
+          },
+          "minimax-m3": {
+            "accuracy": 10,
+            "completeness": 10,
+            "truthfulness": 9,
+            "note": "Precise spec details on retry field, drain semantics, and newline escaping."
+          }
+        },
+        "accuracy": 8,
+        "completeness": 9,
+        "truthfulness": 6,
+        "note": "gpt-oss:120b: Incorrect about SSE custom headers, hurts truthfulness | minimax-m3: Precise spec details on retry field, drain semantics, and newline escaping."
+      },
+      {
+        "cond": "fusion-noweb",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 6,
+            "completeness": 8,
+            "truthfulness": 3,
+            "note": "Same auth header error as S5, truthfulness low"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 10,
+            "truthfulness": 9,
+            "note": "Accurate and complete; correctly notes bufferedAmount less relevant for receive-only."
+          }
+        },
+        "accuracy": 7.5,
+        "completeness": 9,
+        "truthfulness": 6,
+        "note": "gpt-oss:120b: Same auth header error as S5, truthfulness low | minimax-m3: Accurate and complete; correctly notes bufferedAmount less relevant for receive-only."
+      },
+      {
+        "cond": "solo-deepseek-pro",
+        "raters": 2,
+        "byScorer": {
+          "gpt-oss:120b": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 10,
+            "note": "Accurate, complete, meets criteria well"
+          },
+          "minimax-m3": {
+            "accuracy": 9,
+            "completeness": 9,
+            "truthfulness": 9,
+            "note": "Solid coverage of all required points with correct auth limitation notes."
+          }
+        },
+        "accuracy": 9,
+        "completeness": 9,
+        "truthfulness": 9.5,
+        "note": "gpt-oss:120b: Accurate, complete, meets criteria well | minimax-m3: Solid coverage of all required points with correct auth limitation notes."
+      }
+    ],
+    "times": {
+      "solo-glm": 56695,
+      "solo-kimi": 44542,
+      "solo-deepseek-pro": 17383,
+      "fusion": 38465,
+      "fusion-noweb": 37250,
+      "fusion-agents": 40846,
+      "self-kimi": 86884
+    },
+    "answers": {
+      "solo-glm": "Here is a concrete comparison of SSE and WebSockets for streaming LLM tokens to a browser:\n\n*   **Proxy/Buffering:** SSE streams over standard HTTP and is highly susceptible to intermediate proxy buffering (e.g., Nginx requires `proxy_buffering off;` or `X-Accel-Buffering: no` to stream tokens immediately). WebSockets use a dedicated frame-based protocol, sidestepping standard HTTP buffering, though strict corporate proxies/firewalls may block the initial HTTP `Upgrade` handshake.\n*   **Reconnection:** SSE features native browser reconnection; the client automatically reconnects and sends a `Last-Event-ID` header, allowing the server to seamlessly resume LLM generation from the exact dropped token. WebSockets have zero built-in reconnection semantics, requiring custom client logic to reconnect and application-level state synchronization to resume the stream.\n*   **HTTP/2 Behavior:** SSE over HTTP/2 multiplexes excellently, allowing many concurrent SSE streams over a single TCP connection without HTTP/1.1 head-of-line blocking. WebSockets over HTTP/2 (RFC 8441) lack widespread support in browsers and reverse proxies, meaning WebSockets almost always fall back to HTTP/1.1.\n*   **Auth:** SSE uses standard HTTP request semantics, allowing you to attach `Authorization` headers or `Cookie`s natively, making it trivial to integrate with existing REST auth middleware. WebSockets only allow custom headers during the initial Upgrade request; subsequent frames carry no headers, often forcing developers to pass tokens via insecure/query-logged URL parameters or implement app-level auth via the first WebSocket message.\n*   **Backpressure:** SSE relies strictly on TCP flow control (or HTTP/2 stream window limits). WebSockets expose `WebSocket.bufferedAmount` in the browser API to help clients detect network congestion. For both protocols, the server must explicitly pause LLM generation if the network write blocks; otherwise, unbounded queueing will cause out-of-memory (OOM) crashes.\n*   **Directionality & Control:** SSE is strictly server-to-client, perfectly matching LLM output, but requires a secondary REST call (e.g., POST/DELETE) to support a user \"stop generating\" button. WebSockets are bidirectional, allowing the server to stream tokens and the client to send a \"cancel\" command over the exact same connection.\n*   **Payload Framing:** SSE strictly enforces a text-based format (`data: <payload>\\n\\n`), requiring LLM tokens (often packaged as JSON) to be stringified with specific line-break rules. WebSockets support both binary and text frames, allowing direct transmission of raw JSON or compact binary byte arrays without SSE's formatting overhead.",
+      "solo-kimi": "- **Protocol basics & framing** — SSE is a one-way HTTP text stream (`Content-Type: text/event-stream`), where each LLM token is usually a `data: <token>\\n\\n` message. WebSockets upgrade to a full-duplex framed connection; you can stream one token per text or binary frame.\n\n- **Proxy / buffering pitfalls** — SSE is often buffered by default by reverse proxies (e.g. Nginx `proxy_buffering`, Cloudflare, some WAFs), causing tokens to arrive in bursts. You must send `Cache-Control: no-cache, no-transform`, disable output buffering (Nginx `X-Accel-Buffering: no`), and rely on chunked/HTTP/2 streaming. WebSockets avoid HTTP body buffering once upgraded, but the `Upgrade` handshake can be blocked or broken by proxies, SSL-inspecting firewalls, or WAFs that don’t understand `wss://`.\n\n- **Reconnection / resume** — SSE’s `EventSource` reconnects automatically, respects server-sent `retry:`, and sends `Last-Event-ID` on reconnect if you set `id:` per event. For LLMs you should assign an `id` per complete token/batch and store the generated prefix server-side so a reconnect can resume cleanly; otherwise the client gets duplicates or a restart. WebSockets have no built-in reconnect or resume: you must detect `onclose`, reopen, re-auth, and send a resume message with the last received sequence number.\n\n- **Backpressure** — SSE only has TCP/HTTP-level backpressure; the browser `EventSource` consumer cannot pause the stream programmatically, so the server mainly detects a blocked write socket or uses app-level throttling. WebSockets push data to the browser; `bufferedAmount` only measures outbound backpressure, and there is no standard inbound backpressure API, so most apps implement a client-to-server `pause`/`resume` message if token generation outpaces rendering.\n\n- **HTTP/2 behavior** — SSE works as a normal HTTP/2 response stream, benefiting from multiplexing, HPACK header compression, and no head-of-line blocking with other API calls; the server just needs to flush small `DATA` frames promptly. WebSockets can run over HTTP/2 via RFC 8441 extended `CONNECT`, but production support is uneven; many stacks still fall back to an HTTP/1.1 `Upgrade` handshake on a separate connection.\n\n- **Auth** — SSE can use ordinary HTTP auth, but the browser `EventSource` constructor does not support custom headers or `POST`. For bearer tokens, use `fetch()` with a `ReadableStream` SSE parser, rely on cookies, or put the token in the URL query (risk of logs/referrer leaks). WebSockets also cannot set custom headers from the browser API; cookies are sent automatically, and common patterns are sending the token in the first WebSocket message, using `Sec-WebSocket-Protocol`, or putting it in the query string.\n\n- **Browser API & message boundaries** — `EventSource` parses `data`, `event`, and `id` fields and fires named events, but is one-way only; `fetch()` + stream parsing is needed for `POST`/custom headers. WebSockets provide explicit text/binary frame boundaries, support subprotocols, and allow the client to send feedback (e.g. “stop generation”), but require a custom message protocol on top.\n\n- **Network / firewall traversal** — SSE uses plain HTTPS/443 and is usually allowed by corporate proxies and firewalls as long as streaming is enabled. `wss://` also uses 443 but the `Upgrade` step or long-lived framed connection can be blocked by proxies, requiring an SSE/long-polling fallback.\n\n- **Operational considerations** — SSE runs on standard HTTP infrastructure, horizontal load balancing, and health checks; you mainly need to disable response buffering and ensure idle timeouts exceed generation time. WebSockets require load balancers/proxies that support long-lived WebSocket upgrades or HTTP/2 `CONNECT`, plus application-level heartbeats to prevent idle disconnects.",
+      "solo-deepseek-pro": "- **Proxy buffering**: SSE over HTTP/1.1 is often buffered by nginx/CDNs unless you send `X-Accel-Buffering: no`, `Content-Type: text/event-stream`, and flush headers; otherwise tokens may be delayed. WebSockets bypass HTTP content buffering after the upgrade, but proxies must support the `Upgrade` header.\n- **Reconnection**: SSE has built-in auto-reconnect and sends `Last-Event-ID` to resume from the last received event if the server supports replay. WebSockets have no automatic reconnection; the client must detect close and reconnect, and the server must provide a resume token (e.g., last sequence number) to avoid missing tokens.\n- **Backpressure**: SSE has no application-level backpressure—the server writes to the response stream, and a slow client only causes TCP flow control to block the socket, with no signal to the EventSource. WebSockets expose `bufferedAmount` on the client for outgoing data, and server libraries can check socket buffer size to pause generation, but this is not standardized.\n- **HTTP/2**: SSE over HTTP/2 works but can suffer from intermediaries that don’t handle long-lived streams well; HTTP/2 flow control may apply transport-level backpressure, but EventSource still has no API for it. WebSockets over HTTP/2 (RFC 8441) is not widely supported in browsers, so most connections use HTTP/1.1 upgrade, losing multiplexing benefits.\n- **Auth**: EventSource cannot set custom headers (only cookies), so tokens often go in the URL query string; using `fetch` with a `ReadableStream` allows `Authorization` headers. The browser WebSocket API also cannot set custom headers, so auth typically uses cookies, URL query params, or a token in the first message after connection.\n- **Directionality**: SSE is one-way (server→client), which matches LLM token streaming but requires a separate request for client→server control. WebSockets are bidirectional, allowing the client to send stop/cancel signals or adjust parameters over the same connection.\n- **Complexity**: SSE is simpler—plain HTTP, no upgrade, works with existing load balancers and CDNs if configured correctly. WebSockets require a stateful connection, more complex server handling, and may not pass through some older proxies.",
+      "fusion": "* **Use case fit:** SSE is the 90% case for LLM applications where the server streams tokens and the browser only receives; WebSocket is overkill unless the client also continuously sends data back (e.g., bidirectional chat controls). ([https://tianpan.co/blog/2026-04-19-sse-websockets-grpc-streaming-llm-applications](https://tianpan.co/blog/2026-04-19-sse-websockets-grpc-streaming-llm-applications))\n* **Proxy/buffering pitfalls (SSE):** SSE is highly vulnerable to proxies (Nginx/Cloudflare) that buffer streams until the connection closes, turning token streaming into batch delivery. You must explicitly disable this by sending the `X-Accel-Buffering: no` header or setting `proxy_buffering off` in Nginx. ([https://tianpan.co/blog/2026-04-19-sse-websockets-grpc-streaming-llm-applications](https://tianpan.co/blog/2026-04-19-sse-websockets-grpc-streaming-llm-applications))\n* **Proxy/buffering pitfalls (WS):** WebSockets bypass standard HTTP response buffering entirely once the initial HTTP handshake upgrades to a persistent tunnel. However, the upgrade itself may occasionally be blocked by misconfigured or strict corporate proxies.\n* **Reconnection semantics:** SSE’s native browser `EventSource` API auto-reconnects and uses the `Last-Event-ID` header to resume token streams. WebSockets have no built-in reconnection; you must write custom retry/backoff logic and manually track state to resume.\n* **Backpressure:** SSE lacks robust native application-level backpressure, relying primarily on underlying TCP/HTTP flow control. WebSockets expose `bufferedAmount` to help detect a slow consumer, though true browser-level backpressure typically requires custom ACK logic in both protocols.\n* **HTTP/2 behavior:** SSE thrives on HTTP/2 multiplexing, eliminating the HTTP/1.1 six-connections-per-domain limit across multiple tabs. WebSockets typically rely on an HTTP/1.1 upgrade mechanism and do not natively leverage HTTP/2 multiplexing. ([https://laramateo.com/blog/sse-vs-websocket-vs-webtransport-how-to-choose-in-2026](https://laramateo.com/blog/sse-vs-websocket-vs-webtransport-how-to-choose-in-2026))\n* **Auth (SSE):** The standard browser `EventSource` API does not allow setting custom HTTP headers (like `Authorization`), forcing you to use cookies or URL query parameters for tokens. *Note: You can bypass this limitation by implementing SSE via `fetch` and `ReadableStream`, but that requires custom code.*\n* **Auth (WS):** The browser WebSocket API also does not allow setting custom HTTP headers during the handshake. Auth is typically handled via cookies, subprotocols, or passing a token in the first message.\n* **Heartbeats:** SSE requires explicit heartbeat messages (e.g., empty comment lines like `: ping`) to prevent proxies from closing idle connections. WebSockets have built-in protocol-level ping/pong frames for keep-alive. ([https://tianpan.co/blog/2026-04-19-sse-websockets-grpc-streaming-llm-applications](https://tianpan.co/blog/2026-04-19-sse-websockets-grpc-streaming-llm-applications))\n* **Server state:** SSE enables stateless servers and integrates seamlessly with serverless functions and edge runtimes. WebSockets require stateful session management and persistent connections, which complicates scaling. ([https://tianpan.co/blog/2026-04-19-sse-websockets-grpc-streaming-llm-applications](https://tianpan.co/blog/2026-04-19-sse-websockets-grpc-streaming-llm-applications))",
+      "fusion-noweb": "Here is a concrete comparison of SSE and WebSockets for streaming LLM tokens to a browser:\n\n*   **Proxy/Buffering Pitfalls (SSE):** Intermediate proxies and CDNs often buffer SSE because it mimics standard HTTP chunked responses. Mitigating this strictly requires setting `Content-Type: text/event-stream`, `Cache-Control: no-cache`, disabling compression, and sending explicit `X-Accel-Buffering: no` (or equivalent) headers while flushing after each token.\n*   **Proxy/Buffering Pitfalls (WebSockets):** WebSockets perform an HTTP Upgrade handshake and then transition to raw TCP frames, bypassing HTTP-level response buffering entirely. However, the initial handshake can be blocked by proxies that lack or disable `Upgrade: websocket` support.\n*   **Reconnection Semantics (SSE):** The browser's `EventSource` API features built-in auto-reconnection. Upon retry, it automatically sends the `Last-Event-ID` HTTP header, allowing the LLM server to resume token streaming exactly where it left off (provided the server tracks event IDs).\n*   **Reconnection Semantics (WebSockets):** WebSockets lack native reconnection or state-recovery semantics. The client must manually detect dropped connections, implement retry logic, and request missed tokens using custom application-level sequence numbers or offsets.\n*   **Backpressure (SSE):** Browser SSE is unidirectional and exposes no application-level flow-control signals. If the JS client cannot process tokens fast enough, it relies entirely on underlying TCP flow control, which will eventually drop the connection if browser receive buffers overflow.\n*   **Backpressure (WebSockets):** The bidirectional channel allows the client to send explicit \"pause/resume\" or acknowledgment messages, making application-level flow control much easier to implement than in SSE. (The browser's `bufferedAmount` property is also available to track outgoing data, though this is less relevant when purely receiving LLM tokens).\n*   **HTTP/2 Behavior (SSE):** SSE fully utilizes HTTP/2 multiplexing, allowing multiple concurrent LLM streams from a single browser to share one TCP connection without hitting the HTTP/1.1 limit of 6 connections per domain. Note that some servers may limit concurrent streams or disable streaming optimizations.\n*   **HTTP/2 Behavior (WebSockets):** Standard WebSockets operate via HTTP/1.1 Upgrade. While HTTP/2 WebSockets (RFC 8441 extended CONNECT) exist, poor browser and reverse-proxy support means WebSockets typically force a separate HTTP/1.1 connection, losing HTTP/2 multiplexing benefits.\n*   **Auth (SSE):** The browser's `EventSource` API *cannot* set custom headers (e.g., `Authorization`). You must rely on automatically sent cookies or put a bearer token in the URL query string (which risks leaking into server/proxy logs and browser history).\n*   **Auth (WebSockets & Protocol Fit):** The browser WebSocket API similarly cannot set arbitrary headers, forcing the use of cookies, query parameters, or subprotocol hacks for auth (though the server can at least reject the handshake with a 401 before upgrading). Additionally, WebSockets require a heavier frame protocol and manual ping/pong keep-alives to prevent NATs/proxies from dropping idle connections, whereas SSE is a lightweight unidirectional stream that naturally matches one-way LLM token generation.",
+      "fusion-agents": "- **Fit**: SSE is one-way server→client and is the right default for LLM token streaming (~90% case); WebSocket is only worth the overhead if the client also sends continuous mid-stream messages. [1] [2]\n- **SSE proxy/buffering pitfall**: Nginx/Cloudflare buffer responses until they see `Content-Length` or the connection closes; SSE sends neither, so tokens arrive in one end-of-generation dump. Fix with `proxy_buffering off` and the `X-Accel-Buffering: no` response header. [2] [1]\n- **WebSocket proxy behavior**: The HTTP `Upgrade` handshake bypasses HTTP response buffering, but proxies must allow `Upgrade`/`Connection` headers; misconfigured intermediaries can still block the handshake.\n- **Reconnection — SSE**: `EventSource` auto-reconnects and can resume losslessly via `Last-Event-ID` when the server emits `id:` fields; this is built in.\n- **Reconnection — WebSocket**: No native reconnect; you must implement retry, backoff, and state restoration yourself, including re-sending any in-flight client messages.\n- **Backpressure — SSE**: One-way over TCP/HTTP; the client has no application-level channel to signal slow consumption and can only abort/close. (HTTP/2 transport flow control may apply underneath, but it is not exposed to the browser app.)\n- **Backpressure — WebSocket**: The client can send explicit pause/resume control messages; note the browser `bufferedAmount` API only governs client-sent frames, not server→client token delivery.\n- **HTTP/2 — SSE**: On HTTP/1.1 browsers cap ~6 connections per domain and each SSE stream eats a slot (painful across tabs); on HTTP/2 everything multiplexes over one connection and the limit disappears. [1]\n- **HTTP/2 — WebSocket**: WebSockets typically run over the HTTP/1.1 `Upgrade` handshake and do not get HTTP/2 multiplexing in common browser deployments (WebSocket-over-HTTP/2 via RFC 8441 exists but has limited browser support).\n- **Auth and scaling**: `EventSource` cannot set custom headers (e.g., `Authorization`), so SSE auth uses cookies or URL tokens; the browser WebSocket API also cannot set custom headers, so auth uses subprotocol or URL/cookie. SSE is stateless and works with serverless/edge; WebSockets require persistent stateful sessions and are harder to scale. [2]",
+      "self-kimi": "- **Directionality & LLM fit.** SSE is a unidirectional server→client HTTP stream (`Content-Type: text/event-stream`); the browser can only close it, so a “stop generating” action usually needs a separate HTTP request. WebSocket is full-duplex, so the browser can send stop/feedback/regenerate messages in-band on the same socket.\n\n- **Proxy/buffering pitfalls.** SSE is a long-lived HTTP response, so Nginx/CDNs/proxies can batch the body and destroy token-by-token latency. Fix it with `X-Accel-Buffering: no`, `Cache-Control: no-cache`, `proxy_buffering off; proxy_cache off;`, disabling gzip/compression for that route, and flushing each chunk. Also, LLM tokens containing literal newlines must be split into multiple `data:` lines or escaped as `\\n`, otherwise `EventSource` parsing breaks. WebSocket frames bypass HTTP response buffering after the `Upgrade`, but corporate proxies/firewalls may block or terminate `wss://`; use `wss://`, keepalives, and correct `Upgrade`/`Connection` headers.\n\n- **Prompt delivery & request shape.** Native `EventSource` is GET-only and cannot send a body, so large LLM prompts must be sent beforehand, stored server-side, or streamed via a fetch-based SSE polyfill. WebSocket lets the client send the prompt as a message after connecting, naturally supporting long prompts and mid-stream commands.\n\n- **Reconnection & resume.** `EventSource` reconnects automatically on disconnect (the reconnect delay is implementation-defined and server-controllable via the `retry:` field, not strictly exponential per the spec) and resends `Last-Event-ID` if events were tagged with `id:`, letting the server resume mid-token. WebSocket has no built-in reconnect; the app must handle `onclose`/`onerror`, reopen with its own backoff, and pass an application-level resume cursor.\n\n- **Backpressure.** Both rely on TCP/H2 flow control and lack native inbound acknowledgments. SSE provides no client-side pause API; the server should await/flush writes and observe when `res.write()` returns false or emits `drain` to avoid running ahead of a slow client. WebSocket exposes `bufferedAmount` and, because it is duplex, can receive in-band pause/resume or ack messages.\n\n- **HTTP/2 behavior.** SSE rides on the existing HTTP/2 connection as one multiplexed stream, sharing TLS/TCP and avoiding the HTTP/1.1 ~6 connections-per-origin limit. Browser WebSocket handshakes are normally HTTP/1.1 Upgrades on a separate TLS connection; RFC 8441 “WebSocket over HTTP/2” exists but is not broadly deployed.\n\n- **Auth.** Native `EventSource` cannot set custom headers or a body; use cookies (`withCredentials` for CORS), a token in the URL query (beware referrers/server logs/history), or a fetch-based SSE polyfill to attach `Authorization: Bearer` (which may trigger a CORS preflight). Browser `WebSocket` also cannot set arbitrary headers; cookies are sent automatically, tokens typically go in the query string or `Sec-WebSocket-Protocol`, and the server rejects the handshake with 401/403.\n\n- **Error visibility & fallback.** SSE gives HTTP status codes and headers at setup time and auto-reconnects on transient errors. WebSocket failures surface only as close codes (e.g., 1006 abnormal, 1008 policy violation) after the handshake with no HTTP body, making it harder to distinguish auth failures from network drops. For production LLM UIs, offer an SSE fallback in case WebSocket is blocked."
+    }
+  }
+]

@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **IMAGE DESCRIBE pre-stage for fusion models** (`image_describe: { enabled, model, max_chars, timeout_s }`). When the request carries `image_url` blocks, each image is described once by a multimodal model and replaced in place with a text block, so panel/judge/synth run on pure text — no member needs vision capability and a vision request can never thin the panel below `min_panel_success`. Descriptions are instructed to transcribe visible text verbatim (UI labels, code, numbers) and capped by `max_chars`. All-or-nothing: any describer failure (error / timeout / non-OK / empty answer) keeps the original request and falls back to the legacy per-member vision gate unchanged. Off unless explicitly enabled; existing configs without the block parse and behave exactly as before.
+
 ## [0.1.36] - 2026-08-07
 
 ### Fixed

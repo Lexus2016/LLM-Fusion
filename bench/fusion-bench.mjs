@@ -5,37 +5,46 @@
  * self-fusion (same model ×3) approaches the mixed panel (OpenRouter's
  * synthesis>diversity hypothesis, R0).
  *
- * fusion-coder panel as of this run (4 models, replacing the earlier
- * glm+kimi+mistral 3-model panel — re-run from scratch, not resumed, since
- * the panel composition changed and old fusion/fusion-agents scores no
- * longer describe the current pipeline):
- *   solo-glm         : glm-5.2 direct                (judge + synth reference — NOT on panel)
+ * fusion-coder panel as of this run (3 models — `fusion.yaml:112`). Re-run from
+ * scratch, not resumed: the panel changed again since the 4-model run of
+ * 2026-07-08, so those fusion/fusion-agents scores no longer describe the
+ * current pipeline. Two conditions from that run are GONE, not dropped for
+ * cost: `gemini-3-flash-preview` and `qwen3-coder-next` were retired upstream
+ * on 2026-07-15 and now answer HTTP 410. Neither is on the panel any more.
+ *   solo-glm         : glm-5.2 direct                (panel member AND synth)
  *   solo-kimi        : kimi-k2.7-code direct         (panel member; self-fusion baseline)
- *   solo-deepseek-flash: deepseek-v4-flash direct    (panel member)
- *   solo-gemini-flash: gemini-3-flash-preview direct (panel member — NOTE: previously removed
- *                                                     from this panel for a "missing
- *                                                     thought_signature" 400 on foreign
- *                                                     tool-call history in agent loops; this
- *                                                     bench sends single-turn prompts with NO
- *                                                     tool history, so it CANNOT reproduce or
- *                                                     rule out that regression — only measures
- *                                                     plain-prompt answer quality)
- *   solo-qwen-coder  : qwen3-coder-next direct       (panel member)
+ *   solo-deepseek-pro: deepseek-v4-pro:0813-cloud direct (panel member as of 2026-08-21)
  *   fusion           : fusion-coder via the LOCAL PROXY (the real product path)
+ *   fusion-agents    : the smart router — what an agent actually experiences
  *   self-kimi        : kimi ×3 samples -> judge glm -> synth kimi, replicated in-script
  *                with the product's judge/synth prompt texts (config forbids
  *                duplicate panel members, so this cannot run through the proxy)
  *
- * Scoring: blind, by deepseek-v4-pro (member of NO condition), three axes
- * 0-10 (accuracy, completeness, truthfulness) against per-task criteria;
- * answers are shuffled and anonymized per task.
+ * The mission claim under test: fusion beats EVERY individual panel member.
+ * All three panel members are therefore solo conditions; every non-member is
+ * out of scope for that claim and is not paid for.
+ *
+ * Scoring: blind, by TWO independent scorers, three axes 0-10 (accuracy,
+ * completeness, truthfulness) against per-task criteria; answers are shuffled
+ * and anonymized per task, and both scorers see the identical shuffled block.
+ * The reported score per condition is the mean of the two; each scorer's raw
+ * numbers are kept in `byScorer` so disagreement stays auditable.
+ *
+ * Scorer choice is a correctness constraint, not a preference: deepseek-v4-pro
+ * was the sole scorer until 2026-08-21, when it JOINED the fusion-coder panel —
+ * it would now be grading its own answer. Every model inside the pipeline
+ * (kimi-k2.7-code, glm-5.2, deepseek-v4-pro, deepseek-v4-flash) is therefore
+ * disqualified. gpt-oss:120b and minimax-m3 are the two capable models on this
+ * provider that sit outside it entirely.
  *
  * Usage: node bench/fusion-bench.mjs [--tasks N] [--out bench/results.json]
  */
 import { readFileSync, writeFileSync } from "node:fs";
 
 const OLLAMA = "https://ollama.com/v1/chat/completions";
-const PROXY = "http://127.0.0.1:8080/v1/chat/completions";
+// `server.port` in fusion.yaml is 8081; the old hard-coded 8080 silently turned
+// both proxy conditions into connection errors. Env override for a non-default run.
+const PROXY = process.env.FUSION_PROXY_URL ?? "http://127.0.0.1:8081/v1/chat/completions";
 const KEY = process.env.OLLAMA_API_KEY;
 if (!KEY) { console.error("OLLAMA_API_KEY required"); process.exit(1); }
 
@@ -69,6 +78,15 @@ const tasks = allTasks.filter((t) => !doneIds.has(t.id));
  * Streaming keeps the bench on the product path AND removes the artifact.
  */
 async function chat(url, key, body, tries = 3) {
+  // The proxy pools upstream connectors behind a circuit breaker with a 60s
+  // cooldown (`connector_cooldown_s`, src/config.ts). One transient upstream 503
+  // therefore blackholes the proxy for a full minute — while the solo conditions,
+  // which call the provider directly, just retry and succeed. A 3s/6s backoff
+  // lands entirely inside that cooldown, so the proxy conditions would score 0
+  // for an outage the baselines never felt. Wait the breaker out instead.
+  const isProxy = url === PROXY;
+  const backoff = (attempt) => (isProxy ? [5000, 65000, 65000][attempt] ?? 65000 : 3000 * (attempt + 1));
+  if (isProxy) tries = 4;
   for (let a = 0; ; a++) {
     try {
       const res = await fetch(url, {
@@ -108,14 +126,35 @@ async function chat(url, key, body, tries = 3) {
       }
       const text = (content.trim().length > 0 ? content : reasoning)
         .replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-      return { text, finish };
+      // A reasoning model that spends its whole budget thinking returns
+      // finish=length with EMPTY content. The `content || reasoning` fallback
+      // above then hands the scorers a raw chain-of-thought dump and they grade
+      // it ~1/10 — which measures the token cap, not the model. Flag it so the
+      // caller can drop the answer instead of scoring the cap.
+      const reasoningOnly = finish === "length" && content.trim().length === 0 && reasoning.trim().length > 0;
+      return { text, finish, reasoningOnly };
     } catch (e) {
       if (e.fatal || a >= tries - 1) throw e;
-      await new Promise((r) => setTimeout(r, 3000 * (a + 1)));
+      await new Promise((r) => setTimeout(r, backoff(a)));
     }
   }
 }
-const solo = (model, prompt) => chat(OLLAMA, KEY, { model, max_tokens: 4096, messages: [{ role: "user", content: prompt }] });
+/**
+ * Generation budget for EVERY condition, solo and fused alike.
+ *
+ * 4096 (the previous value) is not a neutral choice once a reasoning model is
+ * on the panel: deepseek-v4-pro:0813-cloud spent the whole 4096 on `reasoning`
+ * and returned finish=length with EMPTY content, so the harness fell back to
+ * printing its raw chain-of-thought and both scorers correctly graded it ~0.5/10
+ * — measuring the cap, not the model. 16384 was not enough either: on T03 the
+ * same model burned all 16384 on reasoning (63928 chars, finish=length) and
+ * scored 1/0.5/1.5. A baseline the harness truncates would hand the "fusion
+ * beats every panel member" claim a win it did not earn, so the budget goes to
+ * 32768 for EVERY condition and `reasoningOnly` answers are dropped from
+ * scoring rather than graded as if the model had answered.
+ */
+const GEN_TOKENS = 32768;
+const solo = (model, prompt) => chat(OLLAMA, KEY, { model, max_tokens: GEN_TOKENS, messages: [{ role: "user", content: prompt }] });
 
 // --- self-fusion pipeline (product prompts, replicated) ---------------------
 const JUDGE_PROMPT =
@@ -147,7 +186,7 @@ async function selfFusion(prompt) {
     "expert provided unless it is wrong. If the judge flagged hallucination_flags, treat those items as suspect.\n\n" +
     `JUDGE ANALYSIS (JSON):\n${analysis}\n\nEXPERT ANSWERS:\n${experts}`;
   return chat(OLLAMA, KEY, {
-    model: "kimi-k2.7-code", max_tokens: 4096,
+    model: "kimi-k2.7-code", max_tokens: GEN_TOKENS,
     messages: [{ role: "system", content: synthCtx }, { role: "user", content: prompt }],
   });
 }
@@ -187,8 +226,34 @@ function extractJsonArray(s) {
   throw new Error(`unbalanced JSON array in scorer reply: ${s.slice(0, 120)}`);
 }
 
+/** Models outside every condition — see the scorer-independence note in the header. */
+const SCORERS = ["gpt-oss:120b", "minimax-m3"];
+
 async function score(task, answers /* {cond, text}[] */) {
-  const shuffled = [...answers].sort(() => Math.random() - 0.5);
+  /**
+   * Two kinds of non-answer are dropped from scoring rather than graded:
+   *
+   *  - `reasoningOnly` — the model spent its whole budget thinking and returned
+   *    empty content. Scoring it grades the token cap, not the model.
+   *  - `finish === "error"` / empty text — the upstream call failed after every
+   *    retry. Observed live: one HTTP 503 gave solo-deepseek-pro an empty answer
+   *    on T01 and the scorers rated it 5/30, dropping its average from ~26 to
+   *    18.75. That is an availability event being counted as answer quality —
+   *    and since solo-deepseek-pro is a PANEL MEMBER, it would have handed
+   *    "fusion beats every panel member" a win bought with someone else's outage.
+   *
+   * Dropping biases the affected condition upward, which is the safe direction:
+   * it makes the product's claim harder to prove, not easier. Availability is
+   * not lost — it is reported separately as the call-error count. Every drop
+   * is printed.
+   */
+  const isNonAnswer = (a) => a.reasoningOnly || a.finish === "error" || a.text.trim().length === 0;
+  const dropped = answers.filter(isNonAnswer);
+  if (dropped.length > 0) {
+    console.error(`  score: dropped ${dropped.map((d) => `${d.cond}(${d.reasoningOnly ? "reasoning-only" : d.finish})`).join(", ")} — not an answer, not scored`);
+  }
+  const scorable = answers.filter((a) => !isNonAnswer(a));
+  const shuffled = [...scorable].sort(() => Math.random() - 0.5);
   const labels = shuffled.map((a, i) => ({ label: `S${i + 1}`, ...a }));
   // Cap per-answer length before joining: an unusually verbose answer (seen up
   // to ~19k chars) blows up the joint scorer prompt across 7 conditions and the
@@ -214,7 +279,6 @@ async function score(task, answers /* {cond, text}[] */) {
     "No surrounding array, no code fences, no blank lines, no prose before or after.";
   // No response_format here: json_object mode forces ONE top-level JSON value for
   // the whole reply, which is incompatible with N independent per-line objects.
-  const ask = (messages) => chat(OLLAMA, KEY, { model: "deepseek-v4-pro", max_tokens: 4000, temperature: 0, messages });
   const messages = [
     { role: "system", content: rubric },
     { role: "user", content: `TASK:\n${task.prompt}\n\nEXPECTED CRITERIA:\n${task.criteria}\n\nANSWERS:\n${block}` },
@@ -264,47 +328,92 @@ async function score(task, answers /* {cond, text}[] */) {
     return out;
   }
 
-  const parsed = parseLines((await ask(messages)).text);
-  const missing = labels.filter((l) => !parsed.has(l.label));
-  if (missing.length > 0) {
-    // One retry, scoped to exactly the missing labels — labels that already
-    // parsed cleanly are not re-litigated.
-    const retryRaw = (await ask([
-      ...messages,
-      {
-        role: "user",
-        content: `Missing or unparseable lines for: ${missing.map((l) => l.label).join(", ")}. ` +
-          "Output ONLY the missing line(s), same one-JSON-object-per-line format, nothing else.",
-      },
-    ])).text;
-    for (const [k, v] of parseLines(retryRaw)) parsed.set(k, v);
+  /** One scorer's full pass over every label, with the scoped retry. */
+  async function runScorer(model) {
+    const ask = (msgs) => chat(OLLAMA, KEY, { model, max_tokens: 4000, temperature: 0, messages: msgs });
+    const parsed = parseLines((await ask(messages)).text);
+    const missing = labels.filter((l) => !parsed.has(l.label));
+    if (missing.length > 0) {
+      // One retry, scoped to exactly the missing labels — labels that already
+      // parsed cleanly are not re-litigated.
+      const retryRaw = (await ask([
+        ...messages,
+        {
+          role: "user",
+          content: `Missing or unparseable lines for: ${missing.map((l) => l.label).join(", ")}. ` +
+            "Output ONLY the missing line(s), same one-JSON-object-per-line format, nothing else.",
+        },
+      ])).text;
+      for (const [k, v] of parseLines(retryRaw)) parsed.set(k, v);
+    }
+    return parsed;
   }
 
-  // Labels that STILL didn't recover are dropped, not defaulted to a fake 0 —
+  // Both scorers see the IDENTICAL shuffled block, so their disagreement is
+  // about the answers and not about a different anonymisation draw.
+  const passes = await Promise.all(SCORERS.map(async (m) => {
+    try {
+      const parsed = await runScorer(m);
+      // A scorer that ANSWERS but whose reply recovers zero labels degrades the
+      // task to single-rater in silence — the throw path below never fires.
+      // Observed on T01: minimax-m3 returned, parsed to nothing, and only the
+      // `raters` field in the results JSON showed it.
+      if (parsed.size === 0) console.error(`  score: scorer ${m} returned nothing parseable — task falls back to the other rater`);
+      return { model: m, parsed };
+    } catch (e) {
+      // One dead scorer must not sink the task: the other still produces a
+      // usable (single-rater, and labelled as such) score.
+      console.error(`  score: scorer ${m} FAILED (${String(e).slice(0, 100)}) — task falls back to the other rater`);
+      return { model: m, parsed: new Map() };
+    }
+  }));
+
+  const AXES = ["accuracy", "completeness", "truthfulness"];
+  // Labels that no scorer recovered are dropped, not defaulted to a fake 0 —
   // a 0/0/0 "score" would silently corrupt the aggregate as if every model
-  // failed the task, when the truth is just "the scorer never told us" (R2).
-  const stillMissing = labels.filter((l) => !parsed.has(l.label));
+  // failed the task, when the truth is just "the scorers never told us" (R2).
+  const stillMissing = labels.filter((l) => !passes.some((p) => p.parsed.has(l.label)));
   if (stillMissing.length > 0) {
     console.error(`  score: unrecoverable for ${stillMissing.map((l) => l.cond).join(", ")} — omitted, not zeroed`);
   }
-  return labels.filter((l) => parsed.has(l.label)).map((l) => {
-    const s = parsed.get(l.label);
-    return { cond: l.cond, accuracy: s.accuracy ?? 0, completeness: s.completeness ?? 0, truthfulness: s.truthfulness ?? 0, note: s.note ?? "" };
-  });
+  return labels
+    .filter((l) => passes.some((p) => p.parsed.has(l.label)))
+    .map((l) => {
+      const raters = passes.filter((p) => p.parsed.has(l.label));
+      const out = { cond: l.cond, raters: raters.length, byScorer: {} };
+      for (const p of raters) {
+        const s = p.parsed.get(l.label);
+        out.byScorer[p.model] = {
+          accuracy: s.accuracy ?? 0, completeness: s.completeness ?? 0,
+          truthfulness: s.truthfulness ?? 0, note: s.note ?? "",
+        };
+      }
+      // Mean across whichever raters answered for this label.
+      for (const axis of AXES) {
+        out[axis] = raters.reduce((a, p) => a + (p.parsed.get(l.label)[axis] ?? 0), 0) / raters.length;
+      }
+      out.note = raters.map((p) => `${p.model}: ${p.parsed.get(l.label).note ?? ""}`).join(" | ");
+      return out;
+    });
 }
 
 // --- run ----------------------------------------------------------------------
 const CONDITIONS = [
+  // One solo condition per CURRENT panel member (fusion.yaml:112), using the
+  // exact model id the panel uses — a baseline against a different snapshot of
+  // the same family would not be the same model.
   ["solo-glm", (p) => solo("glm-5.2", p)],
   ["solo-kimi", (p) => solo("kimi-k2.7-code", p)],
-  ["solo-deepseek-flash", (p) => solo("deepseek-v4-flash", p)],
-  ["solo-gemini-flash", (p) => solo("gemini-3-flash-preview", p)],
-  ["solo-qwen-coder", (p) => solo("qwen3-coder-next", p)],
-  ["fusion", (p) => chat(PROXY, "local-no-auth", { model: "fusion-coder", max_tokens: 4096, messages: [{ role: "user", content: p }] })],
+  ["solo-deepseek-pro", (p) => solo("deepseek-v4-pro:0813-cloud", p)],
+  ["fusion", (p) => chat(PROXY, "local-no-auth", { model: "fusion-coder", max_tokens: GEN_TOKENS, messages: [{ role: "user", content: p }] })],
+  // Same pipeline, web grounding off. The solos get no web context either, so
+  // this is the like-for-like test of the panel/judge/synth mechanism; the gap
+  // between `fusion` and `fusion-noweb` is what Tavily contributes.
+  ["fusion-noweb", (p) => chat(PROXY, "local-no-auth", { model: "fusion-coder-noweb", max_tokens: GEN_TOKENS, messages: [{ role: "user", content: p }] })],
   // The delivery question: what an AGENT actually experiences — the smart
   // router may send a task to plain glm-5.2 (zero amplification by design).
   // Per-task comparison against `fusion` and `solo-glm` measures router recall.
-  ["fusion-agents", (p) => chat(PROXY, "local-no-auth", { model: "fusion-agents", max_tokens: 4096, messages: [{ role: "user", content: p }] })],
+  ["fusion-agents", (p) => chat(PROXY, "local-no-auth", { model: "fusion-agents", max_tokens: GEN_TOKENS, messages: [{ role: "user", content: p }] })],
   ["self-kimi", selfFusion],
 ];
 
@@ -334,9 +443,9 @@ for (const task of tasks) {
   for (const [cond, fn] of CONDITIONS) {
     try {
       const t0 = Date.now();
-      const { text, finish } = await fn(task.prompt);
-      answers.push({ cond, text, finish, ms: Date.now() - t0 });
-      console.error(`  ${cond}: ${text.length} chars, finish=${finish}, ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+      const { text, finish, reasoningOnly } = await fn(task.prompt);
+      answers.push({ cond, text, finish, reasoningOnly: reasoningOnly === true, ms: Date.now() - t0 });
+      console.error(`  ${cond}: ${text.length} chars, finish=${finish}${reasoningOnly ? " REASONING-ONLY" : ""}, ${((Date.now() - t0) / 1000).toFixed(0)}s`);
     } catch (e) {
       answers.push({ cond, text: "", finish: "error", ms: -1, error: String(e).slice(0, 120) });
       console.error(`  ${cond}: ERROR ${e}`);

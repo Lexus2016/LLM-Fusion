@@ -20,6 +20,7 @@ import { createAuthMiddleware } from "./auth";
 import { BadRequestError, FusionError, toAnthropicErrorResponse } from "./errors";
 import { stripThinkingTags, createThinkTagStreamFilter, firstNonEmpty, REASONING_BUFFER_MAX } from "./reasoning";
 import { stripHopByHopHeaders } from "./headers";
+import { isJsonObject } from "./json";
 
 /**
  * Anthropic Messages API compatibility layer.
@@ -500,10 +501,6 @@ export function openAiToAnthropicResponse(
   };
 }
 
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 /**
  * Parse a tool call's `arguments` string, or `null` when it is NOT a complete,
  * runnable object — i.e. truncated/unparseable JSON, or a scalar/array where an
@@ -511,8 +508,8 @@ function isJsonObject(value: unknown): value is Record<string, unknown> {
  * `{}`: `JSON.parse("")` throws, so treating a throw as truncation misreported
  * every no-arg tool call as "max_tokens".
  *
- * Duplicated on purpose: the sibling is `isParsableJson` in
- * src/strategies/fusion.ts; lifting it into a shared module is a separate pass.
+ * The object-shape predicate is shared (`src/json.ts`) so this surface and the
+ * OpenAI surface cannot disagree on what counts as a runnable call.
  */
 function parseToolArguments(args: string): Record<string, unknown> | null {
   if (args.length === 0) return {};

@@ -83,6 +83,30 @@ const WebSearchSchema = z
   })
   .optional();
 
+/**
+ * Optional vision pre-stage: when the request carries OpenAI `image_url`
+ * blocks, EACH image is described once by the multimodal `model` and replaced
+ * IN PLACE with a text block (`[IMAGE n]` + description). The rest of the
+ * fusion pipeline (panel, judge, synth) then runs on a pure-text request, so
+ * no panel member or synth needs vision capability and the vision gate never
+ * thins the panel. All-or-nothing: if any description fails, the request falls
+ * back to the legacy per-member vision gate unchanged. Shared between the
+ * top-level fusion model schema and the inline smart-fusion block (same shape
+ * as web_search).
+ */
+const ImageDescribeSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    // Multimodal model id (verify it exists and reports `vision` on /api/show).
+    model: z.string().min(1),
+    // Cap on each injected description (chars). Descriptions are head-kept —
+    // transcription detail lives at the start.
+    max_chars: z.number().int().positive().default(12000),
+    // Per-image describer call timeout (< the 182 s upstream ceiling).
+    timeout_s: z.number().int().positive().lt(182).default(60),
+  })
+  .strict();
+
 const FusionModelSchema = z
   .object({
     strategy: z.literal("fusion"),
@@ -102,6 +126,9 @@ const FusionModelSchema = z
     // the panel + judge already did the deliberation.
     synth_request_overrides: z.record(z.string(), z.unknown()).optional(),
     web_search: WebSearchSchema,
+    // Optional vision pre-stage: describe images via a multimodal model so the
+    // text-only pipeline never sees image blocks (see ImageDescribeSchema).
+    image_describe: ImageDescribeSchema.optional(),
     // Optional adversarial panel member: the name of a model ALREADY listed in
     // `panel` that should run with a red-team/contrarian prompt (find flaws, hidden
     // assumptions, edge cases) instead of just answering. Addresses the "fake
@@ -135,6 +162,7 @@ const FusionBlockSchema = z
     synth_request_overrides: z.record(z.string(), z.unknown()).optional(),
     promote_reasoning_to_content: z.boolean().optional(),
     web_search: WebSearchSchema,
+    image_describe: ImageDescribeSchema.optional(),
     bineval: BinevalSchema.optional(),
   })
   .strict();
@@ -507,6 +535,7 @@ export type FusionModelConfig = z.infer<typeof FusionModelSchema>;
 export type SmartModelConfig = z.infer<typeof SmartModelSchema>;
 export type OverrideConfig = z.infer<typeof OverrideSchema>;
 export type PricingConfig = z.infer<typeof PricingEntrySchema>;
+export type ImageDescribeConfig = z.infer<typeof ImageDescribeSchema>;
 export type SimpleBlockConfig = z.infer<typeof SimpleBlockSchema>;
 export type FusionBlockConfig = z.infer<typeof FusionBlockSchema>;
 export type SimpleModelReference = SimpleBlockConfig | string;

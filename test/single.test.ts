@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { z } from "zod";
 import { OllamaClient } from "../src/upstream/ollama";
 import { singleStrategy } from "../src/strategies/single";
-import { detectIncompleteToolTurn } from "../src/strategies/tool_turn_guard";
+import { detectIncompleteToolTurn, makeToolTurnGuardStream } from "../src/strategies/tool_turn_guard";
 import { parseConfig } from "../src/config";
 import { createLogger } from "../src/logging";
 import { CapabilityService } from "../src/capabilities";
@@ -388,6 +388,24 @@ describe("single strategy — tool-turn completeness guard", () => {
     expect(detectIncompleteToolTurn(len({ content: "", reasoning: "…enormous plan…" }))).toBe("empty");
     // honest length-cut PROSE is still worth delivering -> leave alone
     expect(detectIncompleteToolTurn(len({ content: "let me write a long explanation that got cut" }))).toBeNull();
+  });
+
+  it("detectIncompleteToolTurn: scalar and array tool arguments are not runnable", () => {
+    // `arguments` is a JSON OBJECT string by protocol. A bare JSON.parse also accepts
+    // `5`, `null`, `true` and `[1,2]` — and this surface used to, while the Anthropic
+    // surface (which always required an object) answered `stop_reason: "max_tokens"`
+    // with an empty `input` on the SAME upstream bytes. A Claude Code loop reads that
+    // as truncation and retries forever against a deterministic upstream.
+    const len = (args: string) => ({
+      choices: [
+        { finish_reason: "length", message: { role: "assistant", tool_calls: [{ id: "1", function: { name: "write", arguments: args } }] } },
+      ],
+    });
+    for (const args of ["5", "null", "true", '"a"', "[1,2]"]) {
+      expect(detectIncompleteToolTurn(len(args))).toBe("broken_tool_call");
+    }
+    // The object case is unchanged.
+    expect(detectIncompleteToolTurn(len('{"path":"a.html"}'))).toBeNull();
   });
 
   it("recovers a length-truncated STREAMING tool call (fragmented broken args) into a complete one", async () => {
@@ -1030,5 +1048,487 @@ describe("single strategy — tool-turn completeness guard", () => {
     const parsed = JSON.parse(await res.text());
     expect(parsed.choices[0].message.content).toContain("Let me write");
     expect(calls).toBe(1);
+  });
+
+  it("assembledCallsRunnable: a CUT stream never salvages scalar/array tool arguments (it recovers)", async () => {
+    // The mid-flight-cut SALVAGE path judges the ASSEMBLED arguments. A bare
+    // JSON.parse accepts `5`, `null` and `[1,2]` as "runnable", so the guard would
+    // hand the client a complete-looking call whose input no tool can execute —
+    // and, unlike the length-cut path, there is no terminal chunk left to tell the
+    // client the turn was truncated. Only a JSON OBJECT is runnable input.
+    const runCut = async (args: string) => {
+      let calls = 0;
+      const client = new OllamaClient({
+        baseUrl: "https://mock.test",
+        apiKey: "k",
+        fetchFn: mockFetch([
+          {
+            match: (u) => u.endsWith("/v1/chat/completions"),
+            respond: (_u, init) => {
+              calls += 1;
+              if (String(init?.body ?? "").includes("Emit the tool call NOW")) {
+                return sseResponse([
+                  { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_r", type: "function", function: { name: "write", arguments: '{"path":"a.html","content":"recovered"}' } }] } }] },
+                  { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+                ]);
+              }
+              // A WHOLE call (name + these arguments) is buffered, then the upstream
+              // dies with no finish_reason chunk — the salvage decision point.
+              return sseThenError(
+                [{ choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_x", type: "function", function: { name: "write", arguments: args } }] } }] }],
+                "terminated",
+              );
+            },
+          },
+        ]),
+      });
+      const res = await singleStrategy.execute(
+        ctxWith(client, { model: "fast-glm", stream: true, tools: TOOLS, messages: [{ role: "user", content: "x" }] }),
+      );
+      // Drain FIRST: the recovery request is issued lazily while the stream is
+      // read, so `calls` is only final once the body is consumed.
+      const text = await res.text();
+      return { calls, text };
+    };
+
+    for (const args of ["5", "null", "[1,2]"]) {
+      const { calls, text } = await runCut(args);
+      expect(calls).toBe(2); // original + recovery: the scalar/array call was NOT salvaged
+      expect(text).toContain('"content\\":\\"recovered\\"');
+      expect(text).not.toContain(`"arguments":${JSON.stringify(args)}`);
+    }
+    // Control: a real JSON OBJECT survives the cut and IS salvaged, no retry.
+    const ok = await runCut('{"a":1}');
+    expect(ok.calls).toBe(1);
+    expect(ok.text).toContain('"arguments":"{\\"a\\":1}"');
+    expect(ok.text).toContain("[DONE]");
+  });
+
+  it("assembledCallsEmittable: a CLEAN tool_calls finish recovers scalar/array arguments but emits empty ones", async () => {
+    // The clean-finish check is deliberately LOOSER than the salvage one (empty
+    // arguments are a legitimate no-arg tool), but it must still refuse a
+    // non-empty argument string that is not a JSON object: `null` / `[1,2]` under
+    // finish_reason:"tool_calls" are invisible to detectIncompleteToolTurn (which
+    // only inspects broken args for "length"), so this predicate is the only thing
+    // standing between the client and an unexecutable call.
+    const runClean = async (args: string) => {
+      let calls = 0;
+      const client = new OllamaClient({
+        baseUrl: "https://mock.test",
+        apiKey: "k",
+        fetchFn: mockFetch([
+          {
+            match: (u) => u.endsWith("/v1/chat/completions"),
+            respond: (_u, init) => {
+              calls += 1;
+              if (String(init?.body ?? "").includes("Emit the tool call NOW")) {
+                return sseResponse([
+                  { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_r", type: "function", function: { name: "write", arguments: '{"path":"a.html","content":"recovered"}' } }] } }] },
+                  { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+                ]);
+              }
+              // A CLEAN terminal finish carrying the assembled call.
+              return sseResponse([
+                { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "write", arguments: args } }] } }] },
+                { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+              ]);
+            },
+          },
+        ]),
+      });
+      const res = await singleStrategy.execute(
+        ctxWith(client, { model: "fast-glm", stream: true, tools: TOOLS, messages: [{ role: "user", content: "x" }] }),
+      );
+      // Drain FIRST: the recovery request is issued lazily while the stream is
+      // read, so `calls` is only final once the body is consumed.
+      const text = await res.text();
+      return { calls, text };
+    };
+
+    for (const args of ["null", "[1,2]"]) {
+      const { calls, text } = await runClean(args);
+      expect(calls).toBe(2); // the turn went to recovery instead of being emitted as-is
+      expect(text).toContain('"content\\":\\"recovered\\"');
+      expect(text).not.toContain(`"arguments":${JSON.stringify(args)}`);
+    }
+    // Control: a JSON object is emitted untouched.
+    const obj = await runClean("{}");
+    expect(obj.calls).toBe(1);
+    expect(obj.text).toContain('"arguments":"{}"');
+    // Control: a no-arg tool on a clean finish sends `arguments: ""` — emittable by
+    // design. Tightening this predicate to reject empty args would send every
+    // no-arg call to a pointless billed retry.
+    const noArg = await runClean("");
+    expect(noArg.calls).toBe(1);
+    expect(noArg.text).toContain('"arguments":""');
+    expect(noArg.text).toContain('"finish_reason":"tool_calls"');
+  });
+
+  it("fail-open terminal honesty: a DROPPED broken call rewrites ONLY a tool_calls terminal to \"length\" (stop/narrate terminals survive, space-less `data:` framing included)", async () => {
+    // Fail-open path: the streaming recovery never reached the client (the retry
+    // stream carries no data chunks at all), so the guard delivers the ORIGINAL
+    // held terminal. When the buffered call was DROPPED as unrunnable the turn
+    // then contains nothing to execute, and a surviving `finish_reason:"tool_calls"`
+    // announces a call the client cannot find — it must be rewritten to the cut it
+    // actually was. The other three cases pin how NARROW that rewrite is: it fires
+    // only on `tool_calls` (2: a dropped call under `stop` keeps `stop` — inventing
+    // a token cap that was never hit would be a second lie), never without a
+    // dropped call (3), and it must survive a `data:{...}` frame with no space
+    // after the colon (4), which is what `terminalLine` holds verbatim whenever the
+    // terminal chunk carried no tool_call fragments of its own.
+    //
+    // NOT covered, because the state does not exist: a fail-open with an EMITTABLE
+    // buffered call (`dropped === false` while `assembledCalls !== undefined`).
+    // `incomplete` can only be non-null with calls present when
+    // detectIncompleteToolTurn hits its `fin === "length" && toolCallArgsBroken`
+    // branch — and "args broken" is the exact negation of "emittable", so the two
+    // cannot hold at once (every other finish_reason returns null there and falls
+    // through to the `!assembledCallsEmittable` fallback, which sets `dropped`).
+    const rawSse = (lines: string[]): Response =>
+      new Response(lines.join("") + "data: [DONE]\n\n", {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    const runFailOpen = async (original: unknown[], frame?: (chunks: unknown[]) => Response) => {
+      let calls = 0;
+      const client = new OllamaClient({
+        baseUrl: "https://mock.test",
+        apiKey: "k",
+        fetchFn: mockFetch([
+          {
+            match: (u) => u.endsWith("/v1/chat/completions"),
+            respond: (_u, init) => {
+              calls += 1;
+              // The recovery retry answers with an EMPTY stream ([DONE] only): zero
+              // data chunks forwarded -> streamRetryToolTurn returns false -> fail open.
+              if (String(init?.body ?? "").includes("Emit the tool call NOW")) return sseResponse([]);
+              return (frame ?? sseResponse)(original);
+            },
+          },
+        ]),
+      });
+      const res = await singleStrategy.execute(
+        ctxWith(client, { model: "fast-glm", stream: true, tools: TOOLS, messages: [{ role: "user", content: "make guide.html" }] }),
+      );
+      const text = await res.text();
+      return { calls, text };
+    };
+
+    // 1) Broken (unrunnable) buffered call under a `tool_calls` finish + failed recovery.
+    const broken = await runFailOpen([
+      { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_b", type: "function", function: { name: "write", arguments: '{"path":"guide.html","content":"<html><h1>trunc' } }] } }] },
+      { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+    ]);
+    expect(broken.calls).toBe(2); // original + the (useless) recovery retry
+    expect(broken.text).toContain('"finish_reason":"length"'); // rewritten: the turn was cut, not acted on
+    expect(broken.text).not.toContain('"finish_reason":"tool_calls"'); // never announce a call that is not in the payload
+    expect(broken.text).not.toContain("tool_calls"); // the unrunnable call was dropped, not emitted
+    expect(broken.text).not.toContain("trunc"); // ...and its buffered fragment never reached the client
+    expect(broken.text).toContain("[DONE]");
+
+    // 2) Control — narrate-and-stop: no buffered call at all (assembledCalls ===
+    // undefined), so nothing was dropped and the ORIGINAL finish_reason must survive.
+    const narrate = await runFailOpen([
+      { choices: [{ delta: { role: "assistant", content: "Let me write the complete HTML file now." } }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ]);
+    expect(narrate.calls).toBe(2); // recovery was attempted here too, and also failed
+    expect(narrate.text).toContain("Let me write the complete HTML file now."); // prose delivered live
+    expect(narrate.text).toContain('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'); // terminal untouched
+    expect(narrate.text).not.toContain('"finish_reason":"length"'); // the rewrite must not fire here
+    expect(narrate.text).toContain("[DONE]");
+
+    // 3) A DROPPED broken call under a `stop` finish (prose + a truncated call:
+    // detectIncompleteToolTurn returns null for stop-with-calls, so the
+    // `!assembledCallsEmittable` fallback classifies it). The call is still dropped,
+    // but `stop` already describes the turn honestly — rewriting it to "length"
+    // would fabricate a token cap that was never hit.
+    const stopDrop = await runFailOpen([
+      { choices: [{ delta: { role: "assistant", content: "Let me write the complete HTML file now." } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_s", type: "function", function: { name: "write", arguments: '{"path":"guide.html","content":"<html><h1>trunc' } }] } }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ]);
+    expect(stopDrop.calls).toBe(2); // recovery attempted (broken_tool_call) and failed
+    expect(stopDrop.text).toContain('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'); // untouched
+    expect(stopDrop.text).not.toContain('"finish_reason":"length"'); // no invented token cap
+    expect(stopDrop.text).not.toContain("tool_calls"); // the broken call was still dropped
+    expect(stopDrop.text).not.toContain("trunc");
+
+    // 4) Same dropped-call rewrite, but the upstream frames its chunks as
+    // `data:{...}` with NO space. That line is held VERBATIM as the terminal (the
+    // chunk carries no tool_call fragments, so nothing re-serializes it), so a
+    // prefix check stricter than handleLine's own would silently skip the rewrite.
+    const noSpace = await runFailOpen(
+      [
+        { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_n", type: "function", function: { name: "write", arguments: '{"path":"guide.html","content":"<html><h1>trunc' } }] } }] },
+        { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+      ],
+      (chunks) => rawSse(chunks.map((c) => `data:${JSON.stringify(c)}\n\n`)),
+    );
+    expect(noSpace.calls).toBe(2);
+    expect(noSpace.text).toContain('"finish_reason":"length"'); // rewritten despite the space-less frame
+    expect(noSpace.text).not.toContain('"finish_reason":"tool_calls"');
+    expect(noSpace.text).not.toContain("tool_calls");
+    expect(noSpace.text).toContain("[DONE]");
+  });
+});
+
+describe("tool-turn guard — upstream backpressure", () => {
+  it("stops pulling upstream once the client stops reading", async () => {
+    // The guard used to drain the whole upstream inside ReadableStream.start(), which
+    // runs to completion whether or not anyone reads and whose enqueue() never blocks.
+    // A client that stalls (slow terminal, paused agent) therefore parked an entire
+    // generation in the stream queue: ~195 B per SSE line, so a 32k-token answer is
+    // ~6 MiB of wire and several times that in heap — per stalled connection, times
+    // upstream.max_concurrency.
+    const N = 5000;
+    let pulled = 0;
+    const enc = new TextEncoder();
+    const upstream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulled >= N) {
+          controller.close();
+          return;
+        }
+        pulled++;
+        const chunk = { choices: [{ delta: { content: "x".repeat(180) } }] };
+        controller.enqueue(enc.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+      },
+    });
+
+    const client = new OllamaClient({ baseUrl: "https://mock.test", apiKey: "k", fetchFn: mockFetch([]) });
+    const request: ChatCompletionRequest = { model: "fast-glm", messages: [{ role: "user", content: "hi" }], stream: true };
+    const guarded = makeToolTurnGuardStream(ctxWith(client, request), undefined, "glm-5.2", { ...request }, upstream);
+
+    const reader = guarded.getReader();
+    await reader.read();
+    await reader.read();
+    // Give any eager drain loop every chance to run to completion.
+    for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 0));
+
+    // A handful of chunks in flight, not the whole generation.
+    expect(pulled).toBeLessThan(20);
+    expect(pulled).toBeGreaterThan(0);
+
+    await reader.cancel();
+  });
+
+  it("releases the upstream generation and fires NO recovery when the client cancels while pull() is parked", async () => {
+    // Same parked state as above, but now the client walks away. Two things must
+    // happen: the upstream reader is cancelled (otherwise a cloud generation keeps
+    // burning tokens with nobody at the other end), and NO recovery request is
+    // issued — a departed client is not a broken turn.
+    let recoveries = 0;
+    let upstreamCancelled = false;
+    const enc = new TextEncoder();
+    // Keepalive comments are forwarded verbatim (they are not `data:` chunks), so
+    // they fill the queue and park pull() while leaving `content` empty — i.e. the
+    // guard would still judge a recovery "safe" here if it wrongly ran one.
+    const upstream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(enc.encode(": keepalive\n\n"));
+      },
+      cancel() {
+        upstreamCancelled = true;
+      },
+    });
+
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: () => {
+            recoveries += 1;
+            return sseResponse([{ choices: [{ delta: {}, finish_reason: "tool_calls" }] }]);
+          },
+        },
+      ]),
+    });
+    const request: ChatCompletionRequest = { model: "fast-glm", messages: [{ role: "user", content: "hi" }], stream: true };
+    const guarded = makeToolTurnGuardStream(ctxWith(client, request), undefined, "glm-5.2", { ...request }, upstream);
+
+    const reader = guarded.getReader();
+    await reader.read();
+    await reader.read();
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0)); // let pull() park on the full queue
+    await reader.cancel();
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0)); // and let anything it scheduled run
+
+    expect(upstreamCancelled).toBe(true); // the generation is released, not left running
+    expect(recoveries).toBe(0);
+  });
+});
+
+describe("tool-turn guard — client disconnect mid-pull", () => {
+  /** The guard's only upstream route is its recovery retry — counted, never expected here. */
+  const recoveryCountingClient = () => {
+    let recoveries = 0;
+    const client = new OllamaClient({
+      baseUrl: "https://mock.test",
+      apiKey: "k",
+      fetchFn: mockFetch([
+        {
+          match: (u) => u.endsWith("/v1/chat/completions"),
+          respond: () => {
+            recoveries += 1;
+            return sseResponse([
+              { choices: [{ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_r", type: "function", function: { name: "write", arguments: "{}" } }] } }] },
+              { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+            ]);
+          },
+        },
+      ]),
+    });
+    return { client, recoveries: () => recoveries };
+  };
+
+  /**
+   * A hand-driven upstream: it delivers only when the test says so. highWaterMark 0
+   * means its `pull` fires exactly when the guard issues `reader.read()` on an empty
+   * queue — i.e. `state.pulls` is the proof that pull() is parked inside that read
+   * (without it a push/cancel pair can race past a loop that never started).
+   */
+  const drivenUpstream = () => {
+    const enc = new TextEncoder();
+    const state = { cancelled: false, pulls: 0, push: (_line: string): void => {} };
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        start(controller) {
+          state.push = (line) => {
+            try {
+              controller.enqueue(enc.encode(line));
+            } catch {
+              /* already cancelled — a late upstream chunk has nowhere to go */
+            }
+          };
+        },
+        pull() {
+          state.pulls += 1;
+        },
+        cancel() {
+          state.cancelled = true;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    return { stream, state };
+  };
+
+  const settle = async (): Promise<void> => {
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+  };
+
+  const request: ChatCompletionRequest = { model: "fast-glm", messages: [{ role: "user", content: "hi" }], stream: true };
+
+  it("cancel while a read is IN FLIGHT ends the turn silently (no recovery, no unhandled rejection)", async () => {
+    // reader.cancel() resolves the pull loop's pending reader.read() with
+    // {done: true}, so the loop breaks and lands in the normal-finish path looking
+    // exactly like an upstream that finished. Without the `ended` latch, the guard
+    // would reconcile the turn for a client that is already gone: a full upstream
+    // recovery generation nobody will read, then a throw on controller.enqueue.
+    const { client, recoveries } = recoveryCountingClient();
+    const { stream, state } = drivenUpstream();
+    const guarded = makeToolTurnGuardStream(ctxWith(client, request), undefined, "glm-5.2", { ...request }, stream);
+
+    const rejections: unknown[] = [];
+    const onRejection = (err: unknown): void => {
+      rejections.push(err);
+    };
+    process.on("unhandledRejection", onRejection);
+    try {
+      const reader = guarded.getReader();
+      const pending = reader.read();
+      await settle();
+      expect(state.pulls).toBe(1); // pull() is parked inside await reader.read()
+      // A truncated tool-call fragment: BUFFERED, never forwarded, so `content`
+      // stays empty and the guard still considers recovery safe — exactly the
+      // state in which a wrongly-resumed finish path bills a whole generation.
+      // (one "\n": the trailing blank separator line is forwarded verbatim by
+      // handleLine, and delivering it would resolve the client's read early —
+      // holding it back keeps pull() demonstrably parked inside reader.read().)
+      state.push('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","type":"function","function":{"name":"write","arguments":"{\\"path\\":\\"a"}}]}}]}\n');
+      await settle();
+      expect(state.pulls).toBe(2); // fragment consumed, parked on the NEXT read
+      await reader.cancel(); // the client leaves while that read is in flight
+      state.push('data: {"choices":[{"delta":{"content":"too late"}}]}\n'); // upstream chunk after the departure
+      await settle();
+
+      expect(await pending).toEqual({ done: true, value: undefined });
+      expect(state.cancelled).toBe(true);
+      expect(recoveries()).toBe(0); // a departed client is never worth a billed retry
+      expect(rejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+  });
+
+  it("a cancel landing between the upstream read and handleLine does not bill a recovery", async () => {
+    // The narrow window: the consumer dies WHILE await reader.read() is in flight,
+    // so the loop resumes holding a real chunk for a controller that is already
+    // gone. Handing that line to handleLine first throws inside enqueue, and the
+    // catch reads that throw as an upstream cut — billing a recovery for a client
+    // that already left. The client-gone check therefore sits at the TOP of the
+    // loop, ahead of handleLine.
+    const { client, recoveries } = recoveryCountingClient();
+    const { stream, state } = drivenUpstream();
+    const guarded = makeToolTurnGuardStream(ctxWith(client, request), undefined, "glm-5.2", { ...request }, stream);
+
+    const reader = guarded.getReader();
+    const pending = reader.read();
+    await settle();
+    expect(state.pulls).toBe(1); // pull() is parked inside await reader.read()
+    // Same tick, no await in between: the enqueue fulfils that pending read (its
+    // continuation is only queued as a microtask) and the cancel runs the guard's
+    // cancel hook synchronously, BEFORE the loop resumes with the chunk in hand.
+    state.push(": keepalive\n\n"); // a comment line — handleLine would forward it verbatim
+    const cancelled = reader.cancel();
+    await cancelled;
+    await settle();
+
+    expect(await pending).toEqual({ done: true, value: undefined });
+    expect(state.cancelled).toBe(true);
+    expect(recoveries()).toBe(0);
+  });
+
+  it("stops reading upstream and fires NO recovery when a downstream sink errors mid-stream", async () => {
+    // The client-side death that is not an explicit cancel: the guard's bytes are
+    // piped onward and the destination blows up mid-turn. pipeTo cancels the
+    // source, so the guard sees the same departure as an explicit cancel — it must
+    // stop pulling the upstream and must not treat the departure as a broken turn.
+    // (Per the streams spec a consumer can only ever CLOSE the guard's stream, so
+    // the sibling `desiredSize === null` check covers the errored-controller case
+    // rather than this one.)
+    const { client, recoveries } = recoveryCountingClient();
+    const { stream, state } = drivenUpstream();
+    const guarded = makeToolTurnGuardStream(ctxWith(client, request), undefined, "glm-5.2", { ...request }, stream);
+
+    const piped = guarded.pipeTo(
+      new WritableStream<Uint8Array>({
+        write() {
+          throw new Error("client socket gone");
+        },
+      }),
+    );
+    let pipeErr: unknown = null;
+    piped.catch((err) => {
+      pipeErr = err;
+    });
+
+    await settle();
+    expect(state.pulls).toBe(1); // pull() is parked inside await reader.read()
+    // ONE line, so the guard's single enqueue goes straight to the pipe's pending
+    // read (desiredSize untouched) and the loop parks on the NEXT upstream read
+    // rather than on backpressure — the state where a departure is misread.
+    state.push(": keepalive\n"); // first byte reaches the sink -> the sink throws
+    await settle();
+    state.push('data: {"choices":[{"delta":{"content":"still generating"}}]}\n\n'); // upstream keeps talking
+    await settle();
+
+    if (!(pipeErr instanceof Error)) throw new Error("expected the pipe to reject");
+    expect(pipeErr.message).toBe("client socket gone");
+    expect(state.cancelled).toBe(true); // the guard released the upstream
+    expect(recoveries()).toBe(0);
   });
 });

@@ -9,10 +9,19 @@ import { readFileSync } from "node:fs";
 const file = process.argv[2] ?? "bench/results-full.json";
 const results = JSON.parse(readFileSync(file, "utf8"));
 // Criteria-fix overlay: re-scored tasks replace their base scores (see rescore.mjs).
-try {
-  const overlay = JSON.parse(readFileSync("bench/rescore-overlay.json", "utf8"));
-  for (const r of results) if (overlay[r.id]) r.scores = overlay[r.id];
-} catch { /* no overlay */ }
+// OPT-IN ONLY (--overlay). The overlay is keyed by bare task id (T04/T05/T09) with
+// no run identity, so applying it by default silently overwrites those tasks in ANY
+// later results file with scores from the 2026-07 run — a different panel, different
+// conditions (it still carries `solo-gptoss`, which no longer exists) and a different
+// scorer. Three of fifteen tasks would carry last month's verdict without a word.
+if (process.argv.includes("--overlay")) {
+  try {
+    const overlay = JSON.parse(readFileSync("bench/rescore-overlay.json", "utf8"));
+    let applied = 0;
+    for (const r of results) if (overlay[r.id]) { r.scores = overlay[r.id]; applied += 1; }
+    console.log(`[overlay] applied to ${applied} task(s) — only valid for the 2026-07 run`);
+  } catch { console.log("[overlay] requested but bench/rescore-overlay.json is unreadable"); }
+}
 
 const scored = results.filter((r) => r.scores);
 if (scored.length === 0) { console.log("no scored tasks yet"); process.exit(0); }

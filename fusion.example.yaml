@@ -98,6 +98,22 @@ models:
     #     full panel; only the mechanical in-between steps run cheap.
     fusion_planning_turn_only: false
 
+    # Optional IMAGE DESCRIBE vision pre-stage. When the request carries
+    # image_url blocks, EACH image is described once by the multimodal `model`
+    # and replaced IN PLACE with a text block (`[IMAGE n]` + description), so
+    # panel/judge/synth run on pure text: no panel member or synth needs vision
+    # capability, and a vision request can never thin the panel below
+    # min_panel_success. All-or-nothing — if any description fails (describer
+    # error / timeout / non-OK / empty answer) the original request is kept and
+    # the legacy per-member vision gate applies unchanged. Descriptions are
+    # instructed to transcribe visible text verbatim; capped by max_chars.
+    # Verify the model id exists and reports `vision` on /api/show first.
+    # image_describe:
+    #   enabled: true
+    #   model: gemini-3-flash    # multimodal describer model
+    #   max_chars: 12000         # cap per injected description
+    #   timeout_s: 60            # per-image describer timeout (< 182)
+
     # Optional BinEval post-synth quality evaluation (non-streaming responses only).
     # Adds one extra evaluator call after the synth stage and returns per-dimension
     # scores in response headers: X-Fusion-Bineval-Score, X-Fusion-Bineval-Dimensions,

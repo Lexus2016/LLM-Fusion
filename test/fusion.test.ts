@@ -5,6 +5,7 @@ import type { TimerFactory } from "../src/strategies/fusion";
 import { OllamaClient } from "../src/upstream/ollama";
 import { CapabilityService } from "../src/capabilities";
 import { parseConfig } from "../src/config";
+import { createResilience } from "../src/concurrency";
 import { createLogger } from "../src/logging";
 import { jsonResponse, sseResponse, mockFetch } from "./helpers";
 import type { ChatCompletionRequest, FetchFn, StrategyContext, UpstreamClient } from "../src/types";
@@ -556,6 +557,108 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(up.recorded.filter((b) => b.model === "j").length).toBeGreaterThanOrEqual(2); // judge + fallback synth
   });
 
+  /**
+   * Breaker mid-recovery: `failureThreshold: 1` trips 'j' open on one recorded
+   * failure, then advancing the injected clock past `cooldownMs` promotes it to
+   * half-open with its single probe slot free. `fusion-bypass` is the synth-only
+   * (tool_mode: "bypass") shape: exactly ONE runSynth, no panel and no judge stage
+   * to spend the probe first, and `fallbackSynth` resolves to the judge model 'j'.
+   */
+  function halfOpenFallbackResilience(): { resilience: ReturnType<typeof createResilience>; advance: () => void } {
+    let now = 1_000_000;
+    const resilience = createResilience({
+      maxConcurrency: 4,
+      failureThreshold: 1,
+      cooldownMs: 30_000,
+      now: () => now,
+      sleep: async () => {},
+    });
+    resilience.breaker.recordFailure("j"); // threshold 1 -> open at now
+    return { resilience, advance: () => void (now += 30_000) };
+  }
+
+  it("spends and accounts for the fallback synth's half-open probe instead of wedging it (access-error handoff)", async () => {
+    // The access-error handoff must NOT ask `canAttempt` for the fallback model: that
+    // RESERVES the half-open probe slot, the recursive runSynth asks again at its own
+    // entry gate, sees probeInFlight and fast-fails — so NOTHING ever records an
+    // outcome for the reserved probe and 'j' stays half-open until restart, with every
+    // later request to it fast-failing. Same hazard documented at smart.ts.
+    const { resilience, advance } = halfOpenFallbackResilience();
+    advance(); // cooldown elapses -> half-open, probe slot free
+    expect(resilience.breaker.getState("j")).toBe("half-open");
+
+    const up = makeUpstream((body) => {
+      if (body.model === "s") return jsonResponse({ error: "model not found" }, 404);
+      return jsonResponse({ choices: [{ message: { content: "final-by-j" } }] });
+    });
+    const res = await fusionStrategy.execute({
+      ...ctx(up.client, req({ model: "fusion-bypass" }), "fusion-bypass"),
+      resilience,
+    });
+
+    expect(res.status).toBe(200);
+    const parsed = z
+      .object({ choices: z.array(z.object({ message: z.object({ content: z.string() }) })) })
+      .parse(await res.json());
+    expect(parsed.choices[0]?.message.content).toBe("final-by-j");
+    expect(up.modelsCalled()).toEqual(["s", "j"]); // gated synth, then the fallback probe
+    // The probe was really taken by the recursion and its success recorded: 'j' is
+    // closed and usable again, not stuck half-open with an orphaned reservation.
+    expect(resilience.breaker.getState("j")).toBe("closed");
+    expect(resilience.breaker.canAttempt("j")).toBe(true);
+  });
+
+  it("does not attempt the fallback synth while its breaker is open — the original access error reaches the client", async () => {
+    const { resilience } = halfOpenFallbackResilience(); // no advance -> still open
+    expect(resilience.breaker.getState("j")).toBe("open");
+    // The gate spy is what makes "not attempted" observable: the try/catch below the
+    // handoff would swallow the recursion's CircuitOpenError and produce the SAME 410,
+    // so dropping the breaker predicate is invisible from the response alone.
+    const gateAsks = vi.spyOn(resilience.breaker, "canAttempt");
+
+    const up = makeUpstream((body) => {
+      if (body.model === "s") return jsonResponse({ error: "this model was retired" }, 410);
+      return jsonResponse({ choices: [{ message: { content: "final-by-j" } }] });
+    });
+    const res = await fusionStrategy.execute({
+      ...ctx(up.client, req({ model: "fusion-bypass" }), "fusion-bypass"),
+      resilience,
+    });
+
+    // Routing around an access error never overrides an open breaker: the 410 the
+    // gated synth produced is what the client gets.
+    expect(res.status).toBe(410);
+    expect(up.modelsCalled()).toEqual(["s"]);
+    // Only the primary synth's gate was ever consulted — the handoff short-circuited
+    // before entering the fallback at all.
+    expect(gateAsks.mock.calls.map((c) => c[0])).toEqual(["s"]);
+    expect(resilience.breaker.getState("j")).toBe("open"); // untouched by the handoff
+    gateAsks.mockRestore();
+  });
+
+  it("surfaces the ORIGINAL access error when a concurrent request steals the fallback's half-open probe", async () => {
+    const { resilience, advance } = halfOpenFallbackResilience();
+    advance();
+    // A concurrent request takes the single probe slot in the window between the
+    // handoff's non-reserving state check and the recursion's `canAttempt` gate.
+    expect(resilience.breaker.canAttempt("j")).toBe(true);
+    expect(resilience.breaker.getState("j")).toBe("half-open"); // still not "open"
+
+    const up = makeUpstream((body) => {
+      if (body.model === "s") return jsonResponse({ error: "requires a subscription" }, 403);
+      return jsonResponse({ choices: [{ message: { content: "final-by-j" } }] });
+    });
+    const res = await fusionStrategy.execute({
+      ...ctx(up.client, req({ model: "fusion-bypass" }), "fusion-bypass"),
+      resilience,
+    });
+
+    // Losing the probe race is no worse than the error already in hand: the recursion's
+    // CircuitOpenError is swallowed and the 403 comes back, not a 5xx circuit error.
+    expect(res.status).toBe(403);
+    expect(up.modelsCalled()).toEqual(["s"]);
+  });
+
   it("proceeds below min_panel_success when the shortfall is permanently-gated members (403/410)", async () => {
     const cfg = parseConfig({
       upstream: { base_url: "https://mock.test", api_key_env: "X" },
@@ -1023,6 +1126,18 @@ describe("fusion strategy — vision gate", () => {
     ).rejects.toMatchObject({ httpStatus: 400 });
   });
 
+  it("reports the PANEL failure, not the synth one, when neither is vision-capable", async () => {
+    // applyVisionGate now discovers the panel and the synth CONCURRENTLY, so the
+    // two failures are known at the same instant and the ORDER of the throws is
+    // what picks the message. Panel first, as when the lookups ran in sequence:
+    // "your panel cannot see images" is the actionable diagnosis, while the synth
+    // wording sends the operator to fix a model that is not the first problem.
+    const up = makeUpstream(defaultChat(), () => jsonResponse({ capabilities: ["completion"], model_info: {} }));
+    await expect(
+      fusionStrategy.execute(ctx(up.client, imageReq("fusion-vision"), "fusion-vision")),
+    ).rejects.toThrow("none of its panel members are vision-capable");
+  });
+
   it("proceeds when panel members and synth are vision-capable", async () => {
     const visionShow: ShowHandler = (model) =>
       // vm1, vm2 and synth vs are vision-capable; judge j need not be.
@@ -1035,6 +1150,40 @@ describe("fusion strategy — vision gate", () => {
     expect(res.status).toBe(200);
     expect(up.modelsCalled()).toContain("vs"); // synth ran
     expect(up.modelsCalled()).toContain("vm1"); // vision panel ran
+  });
+
+  it("discovers panel + synth capabilities concurrently, not one round trip per member", async () => {
+    // applyVisionGate used to await discover() per panel member in a for-loop and then
+    // discover the synth — N+1 SERIAL upstream round trips on every image request
+    // (~430 ms measured for this 2-member panel + synth against a remote provider).
+    // The capability cache does not hide it: it is cleared on every config hot-reload,
+    // and degraded `source: "default"` results are never cached.
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const chat = defaultChat();
+    const fetchFn: FetchFn = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith("/api/show")) {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        try {
+          await new Promise((r) => setTimeout(r, 20));
+          return jsonResponse({ capabilities: ["vision", "completion"], model_info: {} });
+        } finally {
+          inFlight--;
+        }
+      }
+      if (url.endsWith("/v1/chat/completions") || url.endsWith("/api/chat")) {
+        return chat(RecordedBodySchema.parse(JSON.parse(String(init?.body))), init?.signal ?? undefined);
+      }
+      return jsonResponse({ error: `no route for ${url}` }, 404);
+    };
+    const client = new OllamaClient({ baseUrl: "https://mock.test", apiKey: "k", fetchFn });
+
+    const res = await fusionStrategy.execute(ctx(client, imageReq("fusion-vision"), "fusion-vision"));
+    expect(res.status).toBe(200);
+    // panel vm1, vm2 and synth vs all in flight together.
+    expect(maxInFlight).toBe(3);
   });
 
   it("synth-only (bypass) image request validates the SYNTH, not the panel (HIGH-3)", async () => {
@@ -1949,6 +2098,67 @@ describe("fusion strategy — synth completeness guard", () => {
     expect(text).not.toContain('"cT"'); // the truncated retry is not
   });
 
+  it("rejects a length-cut retry whose tool arguments are a scalar or an array", async () => {
+    // `JSON.parse` accepts "5", "null" and "[1,2]" — none of which is a tool call any
+    // client can run: `arguments` must decode to an OBJECT of named parameters. A bare
+    // parse check here would wave them through as a recovered answer, so the length-cut
+    // path asks isJsonObjectString, the same predicate the rest of the file uses.
+    const runRetryWith = async (args: string): Promise<{ text: string; judgeFallbackCalls: number }> => {
+      let judgeFallbackCalls = 0;
+      const up = makeUpstream((body) => {
+        const nudged = systemContents(body).some((c) => c.includes("stopped while still planning"));
+        if (body.model === "j") {
+          if (!nudged) return jsonResponse(judgeOk);
+          judgeFallbackCalls += 1;
+          return jsonResponse({
+            choices: [
+              {
+                message: {
+                  content: "",
+                  tool_calls: [{ id: "cF", type: "function", function: { name: "write_file", arguments: '{"path":"ok.txt"}' } }],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          });
+        }
+        if (body.model === "s") {
+          if (nudged) {
+            return jsonResponse({
+              choices: [
+                {
+                  message: {
+                    content: "",
+                    tool_calls: [{ id: "cT", type: "function", function: { name: "write_file", arguments: args } }],
+                  },
+                  finish_reason: "length",
+                },
+              ],
+            });
+          }
+          return jsonResponse({ choices: [{ message: { content: "" }, finish_reason: "stop" }] });
+        }
+        return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+      });
+      const res = await fusionStrategy.execute(ctx(up.client, req({ tools: TOOLS })));
+      return { text: await res.text(), judgeFallbackCalls };
+    };
+
+    // Valid JSON, not an object -> not runnable, so the fallback model gets its turn.
+    for (const args of ["5", "null", "[1,2]"]) {
+      const { text, judgeFallbackCalls } = await runRetryWith(args);
+      expect(judgeFallbackCalls).toBe(1);
+      expect(text).toContain('"cF"'); // the fallback's complete tool call is delivered
+      expect(text).not.toContain('"cT"'); // the unrunnable retry is not
+    }
+
+    // Control: a real argument object IS runnable, so the retry is adopted as-is and
+    // the fallback never runs — the rejection above is about the SHAPE, not the retry.
+    const control = await runRetryWith('{"a":1}');
+    expect(control.judgeFallbackCalls).toBe(0);
+    expect(control.text).toContain('"cT"');
+  });
+
   it("streaming: emits SSE keepalive comments while the recovery retry runs", async () => {
     // The recovery retry runs synchronously inside the stream's flush — during
     // it the client would otherwise see total silence and can time out. SSE
@@ -2353,6 +2563,63 @@ describe("fusion strategy — web grounding (gated on TAVILY_API_KEY + web_searc
 
 
 describe("fusion strategy — bounded judge input", () => {
+  /** The whole-render ceiling from src/strategies/fusion.ts, restated so a test can pin it. */
+  const JUDGE_REQUEST_MAX_CHARS = 120_000;
+  /** The ceiling's own omission marker — distinct from the per-message "chars omitted" one. */
+  const MIDDLE_OMISSION = /\n…\[(\d+) chars omitted from the middle of the conversation\]…\n/;
+  /** A high or low surrogate without its partner: the mojibake this render must never contain. */
+  const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+  /**
+   * The rendered request alone. The judge's user message wraps it in
+   * "ORIGINAL USER REQUEST:\n" … "\n\nEXPERT ANSWERS:\n" + the panel answers, and only
+   * the render is under the ceiling — asserting on the whole message would measure the
+   * wrapper too and could not pin JUDGE_REQUEST_MAX_CHARS exactly.
+   */
+  const judgeRender = (body: RecordedBody): string => {
+    const text = userContents(body).join("\n");
+    const prefix = "ORIGINAL USER REQUEST:\n";
+    const end = text.indexOf("\n\nEXPERT ANSWERS:\n");
+    expect(text.startsWith(prefix)).toBe(true);
+    expect(end).toBeGreaterThan(0);
+    return text.slice(prefix.length, end);
+  };
+
+  /**
+   * The render as renderRequestForJudge joins it, BEFORE the ceiling slices it: one
+   * `role: content` line per message. Exact only for fixtures made entirely of
+   * user/system messages with non-empty string content — which is all of them here.
+   */
+  const joinedRender = (messages: NonNullable<ChatCompletionRequest["messages"]>): string =>
+    messages.map((m) => `${m.role}: ${typeof m.content === "string" ? m.content : ""}`).join("\n");
+
+  /**
+   * A conversation that renders over the ceiling with BOTH slice boundaries landing
+   * INSIDE an astral character: "🙂" is two UTF-16 code units, so in a long run of them
+   * every other offset is mid-pair. Sized so the total content stays under
+   * PANEL_MAX_CHARS (200k) — capPerMessage must stay false, or the run is rewritten
+   * before the ceiling ever slices it.
+   */
+  const emojiConversation = (): NonNullable<ChatCompletionRequest["messages"]> => [
+    { role: "system", content: "You are a coding assistant." },
+    { role: "user", content: `EMOJI-HEAD${"🙂".repeat(60_000)}EMOJI-TAIL` },
+  ];
+
+  /**
+   * Fixture guard for the two surrogate tests: redo the ceiling's own arithmetic
+   * (budget minus the worst-case marker width, halved) and assert both boundaries sit
+   * mid-pair. Without this the fixture could drift to clean boundaries and the tests
+   * would pass while proving nothing.
+   */
+  const expectMidPairBoundaries = (joined: string): void => {
+    const marker = `\n…[${joined.length} chars omitted from the middle of the conversation]…\n`;
+    const half = Math.floor((JUDGE_REQUEST_MAX_CHARS - marker.length) / 2);
+    const high = joined.charCodeAt(half - 1);
+    const low = joined.charCodeAt(joined.length - half);
+    expect(high >= 0xd800 && high <= 0xdbff).toBe(true);
+    expect(low >= 0xdc00 && low <= 0xdfff).toBe(true);
+  };
+
   it("caps every message AND the whole render handed to the judge", async () => {
     // 40 huge user/system messages: 2M chars of raw context. The role filter alone
     // does not bound this — it only drops assistant/tool turns.
@@ -2376,8 +2643,9 @@ describe("fusion strategy — bounded judge input", () => {
     expect(judgeInput.length).toBeLessThan(150_000);
     // Per-message cap applied (head+tail with an omission marker).
     expect(judgeInput).toContain("chars omitted");
-    // Total cap applied — middle messages dropped, not merely shortened.
-    expect(judgeInput).toContain("message(s) omitted");
+    // Whole-render ceiling applied on top of the per-message cap — the middle of the
+    // joined render is excerpted (its own distinct marker, not the per-message one).
+    expect(judgeInput).toContain("chars omitted from the middle of the conversation");
     // What the judge actually adjudicates against survives: the system prompt head
     // and the latest instruction.
     expect(judgeInput).toContain("SYSTEM-HEAD");
@@ -2437,6 +2705,151 @@ describe("fusion strategy — bounded judge input", () => {
     expect(judgeInput).toContain("chars omitted");
     // Still under the total budget, which never depended on the per-message gate.
     expect(judgeInput.length).toBeLessThan(150_000);
+  });
+
+  it("EXCERPTS a single huge message instead of wiping the render out", async () => {
+    // Total content is under PANEL_MAX_CHARS (200k), so compressPanelMessages
+    // short-circuits and the panel sees this paste verbatim — but the rendered
+    // user/system text alone is over JUDGE_REQUEST_MAX_CHARS (120k), so the
+    // whole-render ceiling fires. It slices by CHARACTER, so both ends of the paste
+    // reach the judge. The failure this pins is the line-based version: it dropped
+    // any line longer than the half-budget, and with nothing left to keep it handed
+    // the judge a render consisting of the omission marker and nothing else.
+    const huge = `PASTE-HEAD${"h".repeat(130_000)}PASTE-TAIL`;
+    const messages: ChatCompletionRequest["messages"] = [
+      { role: "system", content: "You are a coding assistant." },
+      { role: "user", content: huge },
+    ];
+
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req({ messages })));
+    expect(res.status).toBe(200);
+
+    const render = judgeRender(up.recorded.find((b) => b.model === "j")!);
+    expect(render.length).toBeLessThanOrEqual(JUDGE_REQUEST_MAX_CHARS);
+    // Not a wipeout: nearly the whole budget is real text, not the ~60-char marker
+    // the line-based ceiling left behind.
+    expect(render.length).toBeGreaterThan(100_000);
+    expect(render).toContain("PASTE-HEAD");
+    expect(render).toContain("PASTE-TAIL");
+    expect(render).toMatch(MIDDLE_OMISSION);
+  });
+
+  it("keeps the first and last turns when the ceiling excerpts the middle", async () => {
+    // Three 45k user turns: 135k total, under the 200k panel threshold (so the panel
+    // sees all three in full) but over the 120k render ceiling. Character slicing
+    // keeps the head (the original task) and the tail (the instruction actually in
+    // play); a mid-conversation turn can fall inside the omitted span, but the render
+    // is never reduced to the marker alone — which is what the line-based ceiling did.
+    const turns = [
+      `TURN-A${"a".repeat(45_000)}`,
+      `TURN-B${"b".repeat(45_000)}`,
+      `TURN-C${"c".repeat(45_000)}`,
+    ];
+    const messages: ChatCompletionRequest["messages"] = turns.map((content) => ({ role: "user", content }));
+
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req({ messages })));
+    expect(res.status).toBe(200);
+
+    const render = judgeRender(up.recorded.find((b) => b.model === "j")!);
+    expect(render.length).toBeLessThanOrEqual(JUDGE_REQUEST_MAX_CHARS);
+    expect(render.length).toBeGreaterThan(100_000);
+    expect(render).toContain("TURN-A"); // head survives
+    expect(render).toContain("TURN-C"); // tail survives
+    expect(render).toMatch(MIDDLE_OMISSION);
+
+    // The render ceiling is the only bound in play here — the panel still has all
+    // three turns verbatim.
+    const panelInput = userContents(up.recorded.find((b) => b.model === "m1")!).join("\n");
+    for (const turn of turns) expect(panelInput).toContain(turn);
+  });
+
+  it("holds the render to JUDGE_REQUEST_MAX_CHARS with the marker's width included", async () => {
+    // The marker counts against the budget too. Sizing the two halves at exactly
+    // MAX/2 puts the RESULT at 120_000 + marker — over the one number this ceiling
+    // exists to honour. Reserving the worst-case marker width first is what makes
+    // "<= JUDGE_REQUEST_MAX_CHARS" true rather than nearly-true.
+    const messages: ChatCompletionRequest["messages"] = [
+      { role: "user", content: `A${"a".repeat(60_000)}` },
+      { role: "user", content: `B${"b".repeat(60_000)}` },
+      { role: "user", content: `C${"c".repeat(60_000)}` },
+    ];
+
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req({ messages })));
+    expect(res.status).toBe(200);
+
+    const render = judgeRender(up.recorded.find((b) => b.model === "j")!);
+    expect(render).toMatch(MIDDLE_OMISSION); // the ceiling did fire
+    expect(render.length).toBeLessThanOrEqual(JUDGE_REQUEST_MAX_CHARS);
+  });
+
+  it("reports the EXACT number of characters it omitted", async () => {
+    // head + N + tail must reconstruct the original render exactly: the judge is told
+    // how much of the question it is missing, and a wrong N is a silent lie about it.
+    // N is measured AFTER the surrogate nudges have moved both boundaries, so a count
+    // derived from the pre-nudge halves under-reports by the width of the nudge.
+    const messages = emojiConversation();
+    const joined = joinedRender(messages);
+    expectMidPairBoundaries(joined);
+
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req({ messages })));
+    expect(res.status).toBe(200);
+
+    const render = judgeRender(up.recorded.find((b) => b.model === "j")!);
+    const marker = MIDDLE_OMISSION.exec(render);
+    expect(marker).not.toBeNull();
+    const head = render.slice(0, marker!.index);
+    const tail = render.slice(marker!.index + marker![0].length);
+    expect(head.length + Number(marker![1]) + tail.length).toBe(joined.length);
+    expect(render.length).toBeLessThanOrEqual(JUDGE_REQUEST_MAX_CHARS);
+  });
+
+  it("never cuts through a UTF-16 surrogate pair", async () => {
+    // A lone surrogate survives JSON.stringify as an escaped orphan and decodes to
+    // U+FFFD on the far side, so an emoji sitting on the slice boundary would reach
+    // the judge as mojibake. The boundary is nudged inward one code unit instead.
+    const messages = emojiConversation();
+    expectMidPairBoundaries(joinedRender(messages));
+
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req({ messages })));
+    expect(res.status).toBe(200);
+
+    const render = judgeRender(up.recorded.find((b) => b.model === "j")!);
+    expect(render).toMatch(MIDDLE_OMISSION); // the ceiling did fire
+    expect(render).toContain("EMOJI-HEAD");
+    expect(render).toContain("EMOJI-TAIL");
+    // `isWellFormed()` is ES2024 and this project compiles against ES2022 libs.
+    expect(LONE_SURROGATE.test(render)).toBe(false);
+  });
+
+  it("caps the 120k–200k band the per-message gate leaves open", async () => {
+    // One 150k user message. The whole conversation is under PANEL_MAX_CHARS (200k),
+    // so capPerMessage is false and the panel gets the message verbatim — but the
+    // render is 150k, squarely in the band where the judge call (stream:false +
+    // response_format:json_object) 400s and runJudge degrades SILENTLY to raw panel
+    // answers. The ceiling is unconditional now, so the band is bounded.
+    const huge = `BAND-HEAD${"b".repeat(150_000)}BAND-TAIL`;
+    const messages: ChatCompletionRequest["messages"] = [{ role: "user", content: huge }];
+
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req({ messages })));
+    expect(res.status).toBe(200);
+
+    const render = judgeRender(up.recorded.find((b) => b.model === "j")!);
+    expect(render.length).toBeLessThanOrEqual(JUDGE_REQUEST_MAX_CHARS);
+    expect(render).toMatch(MIDDLE_OMISSION);
+    expect(render).toContain("BAND-HEAD");
+    expect(render).toContain("BAND-TAIL");
+
+    // Only the render ceiling changed: the per-message gate still reads the panel's
+    // threshold, so the panel has this message whole and unmarked.
+    const panelInput = userContents(up.recorded.find((b) => b.model === "m1")!).join("\n");
+    expect(panelInput).toContain(huge);
+    expect(panelInput).not.toContain("chars omitted");
   });
 
   it("leaves a short conversation verbatim (no marker, no loss)", async () => {

@@ -19,7 +19,8 @@ import {
   NativeStreamingNotImplementedError,
 } from "../errors";
 import { openAiBodyToNativeChat, requestHasImages } from "../vision";
-import { extractJsonObject } from "../json";
+import { describeRequestImages } from "../image_describe";
+import { extractJsonObject, isJsonObjectString } from "../json";
 import { runBineval, DEFAULT_DIMENSIONS, type BinaryEvaluationResult } from "../bineval";
 import { buildWebContext, webGroundingEnabled, type WebGroundingConfig } from "../web";
 import {
@@ -150,11 +151,29 @@ async function runFusion(
   const resilience =
     ctx.resilience ?? resilienceForUpstream(ctx.config.upstream);
   const defaults = ctx.config.defaults;
-  const hasImages = requestHasImages(request);
+  let hasImages = requestHasImages(request);
   const hasTools = Array.isArray(request.tools) && request.tools.length > 0;
-  const native = ctx.config.upstream.api_mode === "native" && hasImages;
+  let native = ctx.config.upstream.api_mode === "native" && hasImages;
   // Effective reasoning->content promotion: per-model override wins over the default.
   const promote = cfg.promote_reasoning_to_content ?? defaults.promote_reasoning_to_content;
+
+  // IMAGE DESCRIBE pre-stage (opt-in via `image_describe`): each image in the
+  // request is described once by a multimodal model and replaced IN PLACE with
+  // a text block, so panel/judge/synth run on pure text and no member needs
+  // vision capability. All-or-nothing: on any describer failure the original
+  // request is kept and the legacy per-member vision gate below applies
+  // unchanged (including its min_panel_success thinning semantics).
+  let effectiveCtx = ctx;
+  if (cfg.image_describe?.enabled && hasImages) {
+    const described = await describeRequestImages(ctx, resilience, cfg.image_describe, timer);
+    if (described !== null) {
+      effectiveCtx = { ...ctx, request: described };
+      hasImages = false;
+      native = false;
+      logger.info({ model: request.model }, "fusion: image_describe applied; pipeline runs text-only");
+    }
+  }
+  ctx = effectiveCtx;
 
   // Degradations that skip panel+judge entirely. Computed BEFORE the vision gate
   // so a synth-only image request is validated against the SYNTH alone — the panel
@@ -304,28 +323,46 @@ function withFusionDegradedHeader(response: Response, count: number): Response {
 // --- Vision gate -----------------------------------------------------------
 
 async function applyVisionGate(ctx: StrategyContext, cfg: FusionModelConfig): Promise<string[]> {
-  const visionPanel: string[] = [];
-  for (const member of cfg.panel) {
-    const { capability } = await ctx.capabilities.discover(member);
-    if (capability.vision) visionPanel.push(member);
-  }
+  // Every discover() in flight at once. These are independent lookups against
+  // different models, so serialising them charged one upstream round trip per panel
+  // member to EVERY image request (~430 ms measured for a 3-member panel + synth
+  // against a remote provider; ~925 ms for the 4-member example config). The
+  // capability cache does not absorb it: it is cleared on every config hot-reload
+  // (src/index.ts), and degraded `source: "default"` results are never cached at all.
+  // discover() also dedups concurrent lookups of the SAME model, which the serial
+  // loop could never benefit from — it only ever asked about distinct models.
+  const [panelCaps, synthCap] = await Promise.all([
+    Promise.all(
+      cfg.panel.map(async (member) => ({
+        member,
+        vision: (await ctx.capabilities.discover(member)).capability.vision,
+      })),
+    ),
+    ctx.capabilities.discover(cfg.synth).then((r) => r.capability),
+  ]);
+
+  // Panel checked before synth, as when these ran in sequence: the panel failure is
+  // the more actionable message when both are wrong.
+  const visionPanel = panelCaps.filter((p) => p.vision).map((p) => p.member);
   if (visionPanel.length === 0) {
     throw new CapabilityError(
       `fusion model '${ctx.request.model}' received image input but none of its panel members are vision-capable`,
     );
   }
-  await assertSynthVision(ctx, cfg);
+  if (!synthCap.vision) throw new CapabilityError(synthVisionError(ctx, cfg));
   return visionPanel;
+}
+
+/** One wording for the synth-vision refusal: `applyVisionGate` and `assertSynthVision`
+ *  both raise it, and `test/fusion.test.ts` asserts on the text. */
+function synthVisionError(ctx: StrategyContext, cfg: FusionModelConfig): string {
+  return `fusion model '${ctx.request.model}' received image input but its synth model '${cfg.synth}' is not vision-capable`;
 }
 
 /** Image input requires a vision-capable synth (the synth always runs, in every path). */
 async function assertSynthVision(ctx: StrategyContext, cfg: FusionModelConfig): Promise<void> {
   const { capability: synthCap } = await ctx.capabilities.discover(cfg.synth);
-  if (!synthCap.vision) {
-    throw new CapabilityError(
-      `fusion model '${ctx.request.model}' received image input but its synth model '${cfg.synth}' is not vision-capable`,
-    );
-  }
+  if (!synthCap.vision) throw new CapabilityError(synthVisionError(ctx, cfg));
 }
 
 // --- Panel stage -----------------------------------------------------------
@@ -1281,17 +1318,35 @@ async function runSynth(
   // fusion. Fall back to a working model (the judge, or a live panel member; see
   // `fallbackSynth` at the call sites) so the assembled panel answers still get
   // synthesized. One hop only: the retry carries `fallbackSynth: null`.
+  // `getState`, NOT `canAttempt`: the latter RESERVES the half-open probe slot as a
+  // side effect, and the recursive `runSynth` below asks again one frame later. The
+  // second ask sees `probeInFlight` and fast-fails, so NOTHING ever records an
+  // outcome for the probe this line reserved — the fallback model stays wedged
+  // half-open until restart, and every later request to it fast-fails. Same hazard
+  // documented at `smart.ts:249-252`; the recursion does the real, accounted
+  // reservation at the `canAttempt` gate on entry.
   if (
     isModelAccessError(result.status) &&
     opts.fallbackSynth &&
     opts.fallbackSynth !== synth &&
-    resilience.breaker.canAttempt(opts.fallbackSynth)
+    resilience.breaker.getState(opts.fallbackSynth) !== "open"
   ) {
     ctx.logger.warn(
       { stage: "synth", model: synth, status: result.status, fallback_model: opts.fallbackSynth },
       "fusion: synth model unavailable (access error); falling back to a working model",
     );
-    return runSynth(ctx, resilience, opts.fallbackSynth, analysis, panelAnswers, { ...opts, fallbackSynth: null });
+    try {
+      return await runSynth(ctx, resilience, opts.fallbackSynth, analysis, panelAnswers, { ...opts, fallbackSynth: null });
+    } catch (err) {
+      // A concurrent request can take the half-open probe between the `getState`
+      // above and the recursion's `canAttempt`. Losing that race is no worse than
+      // the access error already in hand — surface the original one, not this.
+      if (!(err instanceof CircuitOpenError)) throw err;
+      ctx.logger.warn(
+        { stage: "synth", model: synth, fallback_model: opts.fallbackSynth },
+        "fusion: synth fallback circuit opened before the retry; keeping the original access error",
+      );
+    }
   }
 
   if (result.kind === "stream") {
@@ -1439,22 +1494,8 @@ function completionHasBrokenToolArgs(data: unknown): boolean {
     const args = (tc as { function?: { arguments?: unknown } })?.function?.arguments;
     if (args === undefined || args === null) return true;
     if (typeof args !== "string") return false;
-    return args.length === 0 || isParsableJson(args);
+    return args.length === 0 || isJsonObjectString(args);
   });
-}
-
-/**
- * True when `text` parses as a JSON OBJECT — the only shape the OpenAI protocol
- * allows for `function.arguments`. Plain `JSON.parse` would also accept `123`
- * or `true`, letting a nonsense argument string pass as a runnable call.
- */
-function isParsableJson(text: string): boolean {
-  try {
-    const parsed: unknown = JSON.parse(text);
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -1477,12 +1518,9 @@ function lengthCutMidToolCall(data: unknown): boolean {
   return !toolCalls.every((tc) => {
     const args = (tc as { function?: { arguments?: unknown } })?.function?.arguments;
     if (typeof args !== "string") return false;
-    try {
-      JSON.parse(args);
-      return true;
-    } catch {
-      return false;
-    }
+    // Same predicate as everywhere else: a scalar or array is not runnable input,
+    // even though it parses. The last holdout of the bare-JSON.parse divergence.
+    return isJsonObjectString(args);
   });
 }
 
@@ -1893,7 +1931,7 @@ function makeSynthStreamCompletenessGuard(
           assembled.length > 0 &&
           !unreadableToolFragment &&
           assembled.every(
-            (c) => c.function.name && (c.function.arguments.length === 0 || isParsableJson(c.function.arguments)),
+            (c) => c.function.name && (c.function.arguments.length === 0 || isJsonObjectString(c.function.arguments)),
           );
         if (runnable) {
           emitAssembled();
@@ -1975,7 +2013,7 @@ function makeSynthStreamCompletenessGuard(
       // The fusion path logged no terminal state at all, so a truncated synth
       // tool call was invisible in production. Mirrors `single: tool-turn
       // terminal state`.
-      const brokenArgs = assembled.filter((c) => c.function.arguments.length > 0 && !isParsableJson(c.function.arguments));
+      const brokenArgs = assembled.filter((c) => c.function.arguments.length > 0 && !isJsonObjectString(c.function.arguments));
       if (toolCallsSeen) {
         ctx.logger.info(
           {
@@ -2344,9 +2382,11 @@ function renderPanelForJudge(panelAnswers: PanelAnswer[]): string {
 }
 
 /**
- * Total budget for the rendered request handed to the judge / bineval. The role
- * filter alone does not bound growth: a long agent session accumulates hundreds of
- * user turns, and one pasted file in a single `user` message is already unbounded.
+ * Ceiling for the rendered request handed to the judge / bineval, applied only once
+ * the conversation has crossed `PANEL_MAX_CHARS` and every message is 8 KB-capped
+ * like the panel's. The per-message cap alone does not bound growth there: a long
+ * agent session accumulates hundreds of user turns, and this render walks the
+ * ORIGINAL array, so it also sees the turns `compressPanelMessages` dropped.
  * The judge call is `stream:false` with `response_format: json_object`, so overflow
  * comes back as an upstream 400 and `runJudge` returns null — a SILENT degrade to
  * raw panel answers. Bounded input is cheaper than that failure mode.
@@ -2359,7 +2399,7 @@ const JUDGE_REQUEST_MAX_CHARS = 120_000;
  * assistant/tool history is what the panel already digested into its answers, so
  * re-sending it would just bloat the judge call (often the bulk of a large context).
  *
- * Bounded twice.
+ * Two INDEPENDENT bounds, because they answer different questions:
  *
  * 1. Per message via `capPanelMessageContent` (head+tail, so a single pasted file
  *    cannot dominate) — but ONLY when the whole conversation exceeds
@@ -2367,61 +2407,68 @@ const JUDGE_REQUEST_MAX_CHARS = 120_000;
  *    to start capping the panel's own messages. Gating on the same total over the
  *    same array is the point: below the threshold the panel members answer against
  *    verbatim text, so the judge must adjudicate against verbatim text too.
- *    Ungated, an ordinary request with one 10 KB pasted file (total far under
- *    200k) left the judge reading an 8 KB excerpt of a question the panel saw in
- *    full — a judge less informed than the thing it judges.
- * 2. Over the whole render, unconditionally — head and tail lines are kept and the
- *    middle is replaced with an omission marker, because the first system prompt
- *    and the latest instruction are the two things the judge actually adjudicates
- *    against. This is the judge's own budget, not the panel's: the judge call is
- *    `stream:false` + `json_object`, so overflow is a silent degrade (see
- *    `JUDGE_REQUEST_MAX_CHARS`). It stays in force in both branches.
+ * 2. Over the whole render, UNCONDITIONALLY. This one is not gated on the panel's
+ *    threshold, and deliberately so: `approxTotalChars` sums CONTENT, while the
+ *    render also pays a `role: ` prefix and a newline per message and spends a
+ *    fixed 19 chars on `[multimodal content]` for parts that count as 0. 15 000
+ *    one-character user turns total 15 000 by the panel's measure and render at
+ *    120 000. A bound conditional on an unrelated total is not a bound, and the
+ *    band it left open is exactly where `runJudge` 400s and silently degrades to
+ *    unadjudicated panel answers (see `JUDGE_REQUEST_MAX_CHARS`).
+ *
+ * The ceiling slices by CHARACTER, not by whole message. That is what makes an
+ * unconditional ceiling safe: dropping whole messages discarded any message longer
+ * than the half-budget rather than excerpting it, and when no message fit, the
+ * render collapsed to the omission marker alone — a judge adjudicating with no
+ * question at all. Character slicing always hands over `JUDGE_REQUEST_MAX_CHARS`
+ * of real text: the head (system prompts + original task) and the tail (the
+ * instruction actually in play).
+ *
+ * It is NOT a claim that the judge always sees at least as much as the panel.
+ * Below `PANEL_MAX_CHARS` and under the ceiling the two match verbatim; past
+ * either one they are bounded by different rules — the panel by a message window
+ * (first + `PANEL_RECENT_WINDOW`, each 8 KB-capped), this render by a character
+ * budget — so a mid-conversation turn the panel kept can fall in the omitted
+ * middle. Losing the middle of a question beats losing the judge entirely.
  */
 function renderRequestForJudge(request: ChatCompletionRequest): string {
   const messages: ChatMessage[] = Array.isArray(request.messages) ? request.messages : [];
   // Same predicate, same input array, same threshold as compressPanelMessages.
   const capPerMessage = approxTotalChars(messages) > PANEL_MAX_CHARS;
   const lines: string[] = [];
-  let total = 0;
   for (const m of messages) {
     const role = typeof m.role === "string" ? m.role : "user";
     if (role !== "user" && role !== "system") continue;
     const capped = capPerMessage ? capPanelMessageContent(m.content) : m.content;
     const text =
       typeof capped === "string" ? capped : Array.isArray(m.content) ? "[multimodal content]" : "";
-    if (text.length > 0) {
-      const line = `${role}: ${text}`;
-      lines.push(line);
-      total += line.length + 1;
-    }
+    if (text.length > 0) lines.push(`${role}: ${text}`);
   }
-  if (total <= JUDGE_REQUEST_MAX_CHARS) return lines.join("\n");
+  const joined = lines.join("\n");
+  if (joined.length <= JUDGE_REQUEST_MAX_CHARS) return joined;
 
   // Over budget: keep the head (system prompts + original task) and the tail (the
-  // instruction actually in play), drop the middle.
-  const half = Math.floor(JUDGE_REQUEST_MAX_CHARS / 2);
-  const head: string[] = [];
-  let headChars = 0;
-  let i = 0;
-  for (; i < lines.length; i++) {
-    const line = lines[i];
-    if (line === undefined) continue;
-    if (headChars + line.length > half) break;
-    head.push(line);
-    headChars += line.length + 1;
-  }
-  const tail: string[] = [];
-  let tailChars = 0;
-  let j = lines.length - 1;
-  for (; j >= i; j--) {
-    const line = lines[j];
-    if (line === undefined) continue;
-    if (tailChars + line.length > half) break;
-    tail.unshift(line);
-    tailChars += line.length + 1;
-  }
-  const omitted = j - i + 1;
-  return [...head, `…[${omitted} message(s) omitted]…`, ...tail].join("\n");
+  // instruction actually in play), excerpt the middle. Head and tail are character
+  // slices so an over-long message is cut, never dropped.
+  //
+  // The marker counts against the budget too — sizing the two halves at exactly
+  // MAX/2 puts the RESULT over the ceiling the constant names, which is the one
+  // number this function exists to honour. Reserve the worst-case marker width
+  // (`joined.length` bounds the digit count) before splitting.
+  const marker = (n: number) => `\n…[${n} chars omitted from the middle of the conversation]…\n`;
+  const half = Math.floor((JUDGE_REQUEST_MAX_CHARS - marker(joined.length).length) / 2);
+
+  // Never cut through a UTF-16 surrogate pair: a lone half survives JSON.stringify
+  // as an escaped orphan and decodes to U+FFFD on the far side, so an emoji or a
+  // CJK-extension glyph sitting on the boundary reaches the judge as mojibake.
+  // Nudging inward by one code unit costs a character and keeps the text well-formed.
+  const isHighSurrogate = (c: number) => c >= 0xd800 && c <= 0xdbff;
+  const isLowSurrogate = (c: number) => c >= 0xdc00 && c <= 0xdfff;
+  const headEnd = isHighSurrogate(joined.charCodeAt(half - 1)) ? half - 1 : half;
+  const rawTailStart = joined.length - half;
+  const tailStart = isLowSurrogate(joined.charCodeAt(rawTailStart)) ? rawTailStart + 1 : rawTailStart;
+
+  return `${joined.slice(0, headEnd)}${marker(tailStart - headEnd)}${joined.slice(tailStart)}`;
 }
 
 // --- Shared helpers --------------------------------------------------------

@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { isLoopbackBind, assertBindIsSafe } from "../src/index";
+import { isLoopbackBind, assertBindIsSafe, parseAllowOpen } from "../src/index";
 
 /**
  * Regression lock for the non-loopback fail-fast in `src/index.ts` (the
@@ -215,6 +215,15 @@ const REFUSED: Scenario[] = [
     name: "non-loopback, no auth, FUSION_ALLOW_OPEN='' (empty is NOT an opt-out)",
     configBind: "0.0.0.0",
     env: { FUSION_ALLOW_OPEN: "" },
+  },
+  {
+    // The one spelling an operator reaches for to turn the hatch OFF. Under the old
+    // `Boolean(process.env.FUSION_ALLOW_OPEN)` it turned it ON and published an
+    // unauthenticated proxy on 0.0.0.0. Spawned rather than unit-asserted because
+    // this is precisely the wiring — env var to guard — that a unit test cannot see.
+    name: "non-loopback, no auth, FUSION_ALLOW_OPEN=0 (a negative spelling must NOT open the proxy)",
+    configBind: "0.0.0.0",
+    env: { FUSION_ALLOW_OPEN: "0" },
   },
 ];
 
@@ -443,30 +452,37 @@ describe("assertBindIsSafe (unit)", () => {
   );
 
   /**
-   * DOCUMENTS CURRENT BEHAVIOUR, does not endorse it: `allowOpen` is computed in
-   * `main()` as `Boolean(process.env.FUSION_ALLOW_OPEN)`, and `Boolean("0")` is
-   * `true` — so FUSION_ALLOW_OPEN=0 (and =false, =off, =no) OPTS IN to the open
-   * proxy rather than out of it. Only an unset/empty value is not an opt-out
-   * (locked by the spawned `FUSION_ALLOW_OPEN=''` case above). Changing this is
-   * a separate product call; if it is made, update this test rather than
-   * deleting it.
+   * These assert the PRODUCTION parser, not JS `Boolean()` semantics. The previous
+   * version of this block computed `Boolean(value)` in the test body and asserted
+   * on that, so it stayed green no matter what `src/index.ts` did — it locked
+   * nothing. It also documented the defect it was locking: `Boolean("0") === true`
+   * meant `FUSION_ALLOW_OPEN=0`, the operator's attempt to CLOSE the hatch, opened
+   * an unauthenticated proxy on a routable interface.
    */
-  it.each(["1", "0", "false", "off", "no"])(
-    "TODO(product): FUSION_ALLOW_OPEN=%s currently counts as an opt-out (Boolean('0') === true)",
+  it.each(["1", "true", "TRUE", "yes", "on", " 1 "])(
+    "FUSION_ALLOW_OPEN=%s opts in to the open proxy",
     (value) => {
-      const allowOpen = Boolean(value);
-      expect(allowOpen).toBe(true);
+      expect(parseAllowOpen(value)).toBe(true);
       expect(() => {
-        assertBindIsSafe("0.0.0.0", false, allowOpen);
+        assertBindIsSafe("0.0.0.0", false, parseAllowOpen(value));
       }).not.toThrow();
     },
   );
 
-  it("an unset or empty FUSION_ALLOW_OPEN is NOT an opt-out", () => {
-    expect(Boolean(process.env.FUSION_ALLOW_OPEN_DEFINITELY_UNSET)).toBe(false);
-    expect(Boolean("")).toBe(false);
+  it.each(["0", "false", "off", "no", "", "  ", "maybe"])(
+    "FUSION_ALLOW_OPEN=%s does NOT open the proxy",
+    (value) => {
+      expect(parseAllowOpen(value)).toBe(false);
+      expect(() => {
+        assertBindIsSafe("0.0.0.0", false, parseAllowOpen(value));
+      }).toThrow("refusing to start");
+    },
+  );
+
+  it("an unset FUSION_ALLOW_OPEN is NOT an opt-out", () => {
+    expect(parseAllowOpen(undefined)).toBe(false);
     expect(() => {
-      assertBindIsSafe("0.0.0.0", false, Boolean(""));
+      assertBindIsSafe("0.0.0.0", false, parseAllowOpen(undefined));
     }).toThrow("refusing to start");
   });
 });

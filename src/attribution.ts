@@ -28,7 +28,8 @@ export type UpstreamStage =
   | "synth"
   | "single"
   | "router"
-  | "failover-member";
+  | "failover-member"
+  | "image_describe";
 
 /** Coarse failure class for grep / aggregation. */
 export type UpstreamFailureKind =

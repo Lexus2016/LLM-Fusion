@@ -95,7 +95,10 @@ const RecordedBodySchema = z
   .passthrough();
 type RecordedBody = z.infer<typeof RecordedBodySchema>;
 
-type ChatHandler = (body: RecordedBody) => Response | Promise<Response>;
+// `init` is handed through so a test can inspect the AbortSignal the client
+// actually passed to `fetch` — the only way to see whether a caller's signal
+// was wired into a call. Existing handlers simply ignore the second argument.
+type ChatHandler = (body: RecordedBody, init?: RequestInit) => Response | Promise<Response>;
 type ShowHandler = (model: string) => Response;
 
 interface Upstream {
@@ -117,7 +120,7 @@ function makeUpstream(chat: ChatHandler, show?: ShowHandler): Upstream {
     if (url.endsWith("/v1/chat/completions") || url.endsWith("/api/chat")) {
       const body = RecordedBodySchema.parse(JSON.parse(String(init?.body)));
       recorded.push(body);
-      return chat(body);
+      return chat(body, init);
     }
     return jsonResponse({ error: `no route for ${url}` }, 404);
   };
@@ -1143,5 +1146,218 @@ describe("smart fusion fallback vs client disconnect", () => {
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("fallback-answer");
     expect(simpleCalls()).toBe(1);
+  });
+});
+
+// --- A shared router call must outlive one caller's disconnect -------------
+//
+// classify() collapses concurrent identical classifications onto ONE shared
+// promise in the module-level `routerPending` map, so that call belongs to no
+// single request — the ctx that owns it is just whoever arrived first. Two
+// invariants follow, and this block pins both:
+//
+//   1. The call is bound to the stage timeout ALONE, never to `ctx.signal`.
+//      Wiring the owner's signal in meant their hang-up cancelled the
+//      classification every coalesced caller was waiting on, silently routing
+//      live requests to `cfg.default`.
+//   2. Because a client therefore cannot cancel it, anything reaching the catch
+//      in classifyUncached is genuine router ill-health and is recorded as such
+//      — no client-disconnect exemption, unlike every other breaker call site.
+//
+// The caller's own disconnect is honoured where it belongs: `throwIfAborted()`
+// on the classified route in `execute`, before any sub-strategy spends a call.
+describe("smart router coalescing vs client disconnect", () => {
+  beforeEach(() => __resetRouterCacheForTesting());
+
+  interface GatedRouter {
+    up: Upstream;
+    /** Resolves once the router call has reached the mock upstream. */
+    inFlight: Promise<void>;
+    /** The AbortSignal the client actually handed to the router `fetch`. */
+    signalSeen: () => AbortSignal;
+    /** Let the pending router call answer with `route`. */
+    answer: (route: "simple" | "fusion") => void;
+    /** Make the router call fail on its own — a real upstream error, not an abort. */
+    fail: (message: string) => void;
+  }
+
+  /**
+   * Upstream whose router call hangs until the test releases it, capturing the
+   * signal it was given and — like a real `fetch` — failing the call if that
+   * signal aborts. Every other model answers normally via `chatWith`.
+   */
+  function gatedRouterUpstream(): GatedRouter {
+    const rest = chatWith(routeSimple);
+    let entered!: () => void;
+    const inFlight = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let answerWith!: (res: Response) => void;
+    let failWith!: (err: Error) => void;
+    const gate = new Promise<Response>((resolve, reject) => {
+      answerWith = resolve;
+      failWith = reject;
+    });
+    let seen: AbortSignal | undefined;
+    const up = makeUpstream((body, init) => {
+      if (body.model !== "rt") return rest(body);
+      const signal = init?.signal ?? undefined;
+      seen = signal;
+      // A real fetch fails the moment its signal aborts. Honouring that here is
+      // what lets the tests below observe a caller's signal reaching (or, with
+      // the fix, NOT reaching) a call that other callers share.
+      signal?.addEventListener(
+        "abort",
+        () => failWith(new DOMException("This operation was aborted", "AbortError")),
+        { once: true },
+      );
+      entered();
+      return gate;
+    });
+    return {
+      up,
+      inFlight,
+      signalSeen: () => {
+        if (!seen) throw new Error("the router call never reached the mock upstream");
+        return seen;
+      },
+      answer: (route) => answerWith(route === "simple" ? routeSimple() : routeFusion()),
+      fail: (message) => failWith(new Error(message)),
+    };
+  }
+
+  /** Settle a request without throwing, so the assertion under test fails first. */
+  function outcomeOf(p: Promise<Response>): Promise<Response | unknown> {
+    return p.then(
+      (res) => res,
+      (err: unknown) => err,
+    );
+  }
+
+  /** The name of a rejection reason, for asserting on an abort without casting. */
+  function nameOf(err: unknown): string {
+    return err instanceof Error ? err.name : String(err);
+  }
+
+  it("caller A's disconnect neither rejects nor degrades caller B's coalesced classification", async () => {
+    const gone = new AbortController(); // caller A — hangs up mid-classification
+    const live = new AbortController(); // caller B — still connected
+    const router = gatedRouterUpstream();
+    const resilience = createResilience({ maxConcurrency: 4 });
+    // `default` is "fusion" here, so a B degraded to the default route would run
+    // the panel — the simple target answering is proof B got the ROUTED decision.
+    const base = (signal: AbortSignal): StrategyContext => ({
+      ...ctx(router.up.client, req("smart-default-fusion"), "smart-default-fusion"),
+      resilience,
+      signal,
+    });
+
+    // A arrives first and owns the shared `routerPending` entry (classify reaches
+    // routerPending.set synchronously), so B provably coalesces onto A's promise.
+    const a = outcomeOf(smartStrategy.execute(base(gone.signal)));
+    const b = smartStrategy.execute(base(live.signal));
+
+    await router.inFlight;
+    gone.abort();
+    router.answer("simple"); // the shared call was never cancelled, so it still answers
+
+    const res = await b; // must NOT reject on a stranger's disconnect
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("simple-answer"); // routed, not defaulted
+    const aErr = await a; // settle A first, so any call it made is already recorded
+
+    // ONE router call for two requests — proof the coalescing path was exercised.
+    // (If B had issued its own classification the test would prove nothing.)
+    expect(router.up.routerBodies()).toHaveLength(1);
+    // ...and A spent nothing after it: no panel, no second simple call.
+    expect(router.up.modelsCalled()).toEqual(["rt", "deepseek"]);
+    expect(nameOf(aErr)).toBe("AbortError"); // A stopped at the post-classify check
+  });
+
+  it("the shared router call is not cancelled by the owning caller's signal", async () => {
+    const gone = new AbortController();
+    const live = new AbortController();
+    const router = gatedRouterUpstream();
+    const resilience = createResilience({ maxConcurrency: 4 });
+    const base = (signal: AbortSignal): StrategyContext => ({
+      ...ctx(router.up.client, req("smart-default-fusion"), "smart-default-fusion"),
+      resilience,
+      signal,
+    });
+
+    const a = outcomeOf(smartStrategy.execute(base(gone.signal)));
+    const b = smartStrategy.execute(base(live.signal));
+    await router.inFlight;
+
+    const signal = router.signalSeen();
+    expect(signal.aborted).toBe(false);
+    gone.abort();
+    // THE assertion: the signal reaching chatCompletions derives from the stage
+    // abort alone, so the owner's disconnect cannot touch a call others share.
+    // (AbortSignal propagation is synchronous, so this needs no tick.)
+    expect(signal.aborted).toBe(false);
+
+    router.answer("simple");
+    expect((await b).status).toBe(200);
+    expect(nameOf(await a)).toBe("AbortError");
+
+    // The orphaned classification ran to completion and was cached, so it is not
+    // even wasted: a later identical request reuses it with NO second router call.
+    const third = await smartStrategy.execute(base(live.signal));
+    expect(third.status).toBe(200);
+    expect(await third.text()).toContain("simple-answer");
+    expect(router.up.routerBodies()).toHaveLength(1);
+  });
+
+  it("a caller that left is stopped right after classification, before any sub-strategy call", async () => {
+    const gone = new AbortController();
+    const router = gatedRouterUpstream();
+    const call = outcomeOf(
+      smartStrategy.execute({
+        ...ctx(router.up.client, req("smart-inline"), "smart-inline"),
+        resilience: createResilience({ maxConcurrency: 4 }),
+        signal: gone.signal,
+      }),
+    );
+
+    await router.inFlight;
+    gone.abort();
+    router.answer("fusion"); // the expensive route: panel + judge + synth
+
+    const err = await call;
+    // The classifier ran (its decision is cached for the next caller), but not one
+    // upstream token was spent answering a request nobody is left to read.
+    expect(router.up.modelsCalled()).toEqual(["rt"]);
+    expect(nameOf(err)).toBe("AbortError");
+  });
+
+  it("a genuine router failure still trips the breaker after the owning caller left", async () => {
+    // failureThreshold 1: one recordFailure("rt") flips the breaker open, so the
+    // state assertion is a second witness independent of the spy.
+    const resilience = createResilience({ maxConcurrency: 4, failureThreshold: 1 });
+    const failures = vi.spyOn(resilience.breaker, "recordFailure");
+    const gone = new AbortController();
+    const router = gatedRouterUpstream();
+
+    const call = outcomeOf(
+      smartStrategy.execute({
+        ...ctx(router.up.client, req("smart-inline"), "smart-inline"),
+        resilience,
+        signal: gone.signal,
+      }),
+    );
+
+    await router.inFlight;
+    gone.abort(); // the owner walks away...
+    router.fail("router upstream exploded"); // ...and the router then fails on its own
+
+    const err = await call;
+    // No client-disconnect exemption in classifyUncached: the call was never
+    // cancellable by a client, so this IS router ill-health and must be counted.
+    // An exemption here would let a burst of disconnects hide a dead router.
+    expect(failures.mock.calls.filter((c) => c[0] === "rt")).toHaveLength(1);
+    expect(resilience.breaker.getState("rt")).toBe("open");
+    expect(nameOf(err)).toBe("AbortError"); // and the departed caller still stops
+    expect(router.up.modelsCalled()).toEqual(["rt"]);
   });
 });
