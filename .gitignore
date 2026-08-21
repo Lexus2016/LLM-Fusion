@@ -8,3 +8,7 @@ docs/superpowers/specs/
 AUDIT*
 .serena/
 fusion.yaml.bak-*
+.playwright-mcp/
+bench/aborted/
+start.sh
+panel-model-form-a11y.png
