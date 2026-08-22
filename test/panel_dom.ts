@@ -26,17 +26,13 @@ function extract(re: RegExp, what: string): string {
 }
 
 /**
- * Opt-in failure hook for `mountPanel`: given the request's method and path,
- * return the error body to fail the request with, or `undefined`/`null` to let
- * it succeed normally. Lets a test exercise the `.catch → formError/toast` path
- * of a save/delete handler, which the default stub never triggers.
+ * Opt-in failure hook for `mountPanelWithFailure`: given the request's method
+ * and path, return the error body to fail the request with, or
+ * `undefined`/`null` to let it succeed normally. Lets a test exercise the
+ * `.catch → formError/toast` path of a save/delete handler, which the
+ * default stub never triggers.
  */
 export type FailRequest = (method: string, path: string) => { status?: number; body?: unknown } | undefined | null;
-
-export interface MountOpts {
-  /** When set, requests it flags fail instead of the default `{ok:true}`. */
-  failRequest?: FailRequest;
-}
 
 /**
  * Mount the SHIPPED panel markup + script into jsdom and stub the network.
@@ -45,7 +41,21 @@ export interface MountOpts {
  * a schema field the form forgets to round-trip must fail HERE, in a test, not
  * in fusion.yaml. Keep it black-box: drive the panel through DOM clicks only.
  */
-export async function mountPanel(cfg: unknown, opts?: MountOpts): Promise<Panel> {
+export async function mountPanel(cfg: unknown): Promise<Panel> {
+  return doMount(cfg);
+}
+
+/**
+ * Same as `mountPanel`, but a non-GET request `failRequest` flags fails
+ * instead of succeeding with `{ok:true}` — for testing a save/delete
+ * handler's error path. Kept as a separate export so `mountPanel`'s
+ * signature never changes.
+ */
+export async function mountPanelWithFailure(cfg: unknown, failRequest: FailRequest): Promise<Panel> {
+  return doMount(cfg, failRequest);
+}
+
+async function doMount(cfg: unknown, failRequest?: FailRequest): Promise<Panel> {
   // Only setInterval is faked: the 3s monitor poll would otherwise fire for the
   // whole test run. setTimeout stays REAL so `flush()` and the panel's own
   // reloadConfigSoon(400ms) behave normally.
@@ -60,7 +70,7 @@ export async function mountPanel(cfg: unknown, opts?: MountOpts): Promise<Panel>
     const method = (opt && opt.method) || "GET";
     if (method !== "GET") {
       sent.push({ method, path, body: opt && opt.body ? JSON.parse(opt.body) : undefined });
-      const failure = opts && opts.failRequest ? opts.failRequest(method, path) : null;
+      const failure = failRequest ? failRequest(method, path) : null;
       if (failure) {
         return Promise.resolve(
           fakeResponse(failure.body !== undefined ? failure.body : { error: "simulated failure" }, false, failure.status || 500),

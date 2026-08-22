@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, afterEach } from "vitest";
-import { mountPanel, openAccountForm, saveForm, setInput, clickTab, type Panel } from "./panel_dom";
+import { mountPanel, mountPanelWithFailure, openAccountForm, saveForm, setInput, clickTab, type Panel } from "./panel_dom";
 
 let panel: Panel | null = null;
 afterEach(() => {
@@ -75,12 +75,11 @@ describe("account form round-trip", () => {
 
 describe("account delete error handling", () => {
   it("toasts the server error when deleting an account is rejected", async () => {
-    panel = await mountPanel(CFG, {
-      failRequest: (method, path) =>
-        method === "PUT" && path.indexOf("admin/config/providers/") === 0
-          ? { body: { error: "a provider with base_url must keep an account" } }
-          : null,
-    });
+    panel = await mountPanelWithFailure(CFG, (method, path) =>
+      method === "PUT" && path.indexOf("admin/config/providers/") === 0
+        ? { body: { error: "a provider with base_url must keep an account" } }
+        : null,
+    );
     clickTab("providers");
     await panel.flush();
 
