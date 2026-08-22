@@ -872,7 +872,7 @@ export const PANEL_HTML = `<!doctype html>
       function(){ defaultsForm(df); }, false));
     var prCount=Object.keys(pr).length;
     box.appendChild(settingsCard("Model pricing",
-      prCount?(prCount+" model(s) priced · "+Object.keys(pr).slice(0,3).map(esc).join(", ")+(prCount>3?", …":"")):"no prices set — cost reporting shows 0",
+      prCount?(prCount+" model(s) priced · "+Object.keys(pr).slice(0,3).map(esc).join(", ")+(prCount>3?", …":"")):"no prices set — cost_usd stays null",
       function(){ pricingForm(pr); }, false));
     var ovCount=Object.keys(ov).length;
     box.appendChild(settingsCard("Capability overrides",
