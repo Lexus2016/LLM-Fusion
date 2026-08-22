@@ -670,7 +670,10 @@ export const PANEL_HTML = `<!doctype html>
           dyn.beThresh=fNum("Low-quality threshold","Overall score (0–1) below which the answer is flagged in the headers. Default 0.7.", be.threshold); bsub.appendChild(dyn.beThresh);
           dyn.beTimeout=fNum("Eval timeout (s)","Per-evaluation deadline. Blank = use the judge timeout.", be.timeout_s); bsub.appendChild(dyn.beTimeout);
           h.appendChild(bsub); bindReveal(dyn.bineval, bsub);
-          addPromote(h, ex); addOverrides(h, ex);
+          // NO addOverrides() here: FusionModelSchema is .strict() and has no
+          // request_overrides — the fusion strategy ignores it. The synth-only
+          // control below is the real one.
+          addPromote(h, ex);
           // Synth-only overrides (e.g. reasoning_effort → none): kept DISTINCT from
           // request_overrides, which the fusion strategy ignores. Without this control
           // a panel save would silently wipe synth_request_overrides (same round-trip

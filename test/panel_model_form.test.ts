@@ -7,6 +7,7 @@ import {
   setSelect,
   setInput,
   clickToggle,
+  hasField,
   type Panel,
 } from "./panel_dom";
 
@@ -90,5 +91,21 @@ describe("model form round-trip", () => {
     const body = lastPut(panel).body;
     expect(body).not.toHaveProperty("web_search");
     expect(body).toHaveProperty("judge", "minimax-m3");
+  });
+
+  it("does not render request_overrides on a fusion model", async () => {
+    panel = await mountPanel(CFG);
+    await openModelForm(panel, "fusion-coder");
+    // FusionModelSchema is .strict() and has no request_overrides — rendering it
+    // can only produce a 400. Fusion's real control is synth_request_overrides.
+    expect(hasField("Request overrides (optional)")).toBe(false);
+    expect(hasField("Synth request overrides (optional)")).toBe(true);
+  });
+
+  it("still renders request_overrides on a single model", async () => {
+    panel = await mountPanel(CFG);
+    await openModelForm(panel, "fusion-coder");
+    setSelect("Strategy", "single");
+    expect(hasField("Request overrides (optional)")).toBe(true);
   });
 });
