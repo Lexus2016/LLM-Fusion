@@ -191,4 +191,17 @@ describe("capability overrides settings", () => {
 
     expect(lastPut(panel).body).toEqual({ "minimax-m3": { vision: true, context: 200000 } });
   });
+
+  it("rejects a fractional context", async () => {
+    panel = await mountPanel(CFG);
+    await openSettingsCard(panel, "Capability overrides");
+    addRow("Overrides");
+    setCell("Overrides", 0, 0, "glm-5.2");
+    setCell("Overrides", 0, 1, "1000.5"); // context
+    saveForm();
+    await panel.flush();
+
+    expect(formError()).toContain("must be a whole number of tokens");
+    expect(panel.sent.filter((r) => r.method === "PUT")).toHaveLength(0);
+  });
 });
