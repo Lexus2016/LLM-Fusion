@@ -654,7 +654,7 @@ export const PANEL_HTML = `<!doctype html>
   }
   function deleteAccount(provId, accId){ var p=cfg.providers[provId]; var accounts=(p.accounts||[]).filter(function(a){ return a.id!==accId; });
     if(accounts.length===0){ toast("a provider must keep at least one account — delete the provider instead","err"); return; }
-    saveProvider(provId, Object.assign({},p,{accounts:accounts})); }
+    saveProvider(provId, Object.assign({},p,{accounts:accounts}), function(ok,err){ if(!ok) toast(err,"err"); }); }
   document.getElementById("add-provider").onclick=function(){ providerForm(null,null); };
 
   // ---- Models tab ----

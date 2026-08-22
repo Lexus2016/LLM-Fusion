@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, afterEach } from "vitest";
-import { mountPanel, openAccountForm, saveForm, setInput, type Panel } from "./panel_dom";
+import { mountPanel, openAccountForm, saveForm, setInput, clickTab, type Panel } from "./panel_dom";
 
 let panel: Panel | null = null;
 afterEach(() => {
@@ -70,5 +70,34 @@ describe("account form round-trip", () => {
     await panel.flush();
 
     expect(accountsFromLastPut(panel)[0]).not.toHaveProperty("request_timeout_s");
+  });
+});
+
+describe("account delete error handling", () => {
+  it("toasts the server error when deleting an account is rejected", async () => {
+    panel = await mountPanel(CFG, {
+      failRequest: (method, path) =>
+        method === "PUT" && path.indexOf("admin/config/providers/") === 0
+          ? { body: { error: "a provider with base_url must keep an account" } }
+          : null,
+    });
+    clickTab("providers");
+    await panel.flush();
+
+    const row = Array.from(document.querySelectorAll("#providers-editor .accrow")).find(
+      (r) => r.querySelector(".aname")?.textContent === "ollama-1",
+    );
+    if (!row) throw new Error("no account row 'ollama-1'");
+    const delBtn = Array.from(row.querySelectorAll("button")).find((b) => b.textContent === "Delete");
+    if (!delBtn) throw new Error("no Delete button on account row");
+    delBtn.click();
+
+    const confirmYes = document.getElementById("ovl-ok");
+    if (!confirmYes) throw new Error("no confirm-yes button");
+    confirmYes.click();
+    await panel.flush();
+
+    const errToasts = Array.from(document.querySelectorAll("#toasts .toast.err")).map((t) => t.textContent);
+    expect(errToasts).toContain("a provider with base_url must keep an account");
   });
 });
