@@ -564,21 +564,32 @@ export const PANEL_HTML = `<!doctype html>
     });
   }
   function accountForm(provId, existing){
-    var p=cfg.providers[provId]; var fId,fEnv,fBase,fMap,f403,fQuota;
+    var p=cfg.providers[provId]; var fId,fEnv,fBase,fTimeout,fMap,f403,fQuota;
     openForm(existing?("Edit account "+existing.id):("Add account to "+provId), function(body){
       fId=fText("Account id","Unique across ALL providers (e.g. ollama-1). Used in the monitor + controls.", existing?existing.id:"", true);
       if(existing){ fId.querySelector("input").disabled=true; }
       fEnv=fText("API key env var","Name of the environment variable holding this account's key — never the key itself (e.g. OLLAMA_API_KEY, OLLAMA_API_KEY_2).", existing?existing.api_key_env:"", true);
       fBase=fText("Base URL override (optional)","Leave blank to use the provider's base URL. Set only if this account uses a different endpoint.", existing?existing.base_url:"", true);
+      fTimeout=fNum("Request timeout override (s)","Per-request deadline for THIS account only. Blank = inherit the global upstream request timeout. Must stay below ~182s (the Ollama Cloud ceiling).", existing?existing.request_timeout_s:undefined);
       fMap=fKV("Model-id map (optional)","Map a logical model id (used in Models) to THIS provider's id — e.g. glm-5.2 → z-ai/glm-4.6. Needed when the provider names models differently than Ollama.", existing?existing.model_map:{});
       f403=fSelect("On HTTP 403","passthrough = treat as a client error (account stays healthy). down = mark the account down (some gateways use 403 for no-credits).", existing?existing.treat_403_as:"passthrough",[{label:"passthrough",value:"passthrough"},{label:"down",value:"down"}]);
       fQuota=fTags("Quota markers (optional)","Lowercase phrases in a 429 body that mean the account is OUT OF QUOTA (mark it down) rather than a brief rate-limit — e.g. insufficient, out of credit.", existing?existing.quota_markers:[]);
-      body.appendChild(fId); body.appendChild(fEnv); body.appendChild(fBase); body.appendChild(fMap); body.appendChild(f403); body.appendChild(fQuota);
+      body.appendChild(fId); body.appendChild(fEnv); body.appendChild(fBase); body.appendChild(fTimeout); body.appendChild(fMap); body.appendChild(f403); body.appendChild(fQuota);
     }, function(){
       var nid=fId._get(), env=fEnv._get(); if(!nid||!env){ formError("Account id and API key env var are required."); return; }
-      var acc={ id:nid, api_key_env:env }; var b=fBase._get(); if(b) acc.base_url=b;
-      var m=fMap._get(); if(Object.keys(m).length) acc.model_map=m; var q=fQuota._get(); if(q.length) acc.quota_markers=q;
-      var t=f403._get(); if(t!=="passthrough") acc.treat_403_as=t;
+      // MERGE-ON-SAVE (see modelForm): edit the account we LOADED so unrendered
+      // keys survive. extra_headers rides through with its values still masked
+      // as ••• — restoreExtraHeaders() on the server swaps the real ones back in.
+      var acc=existing?JSON.parse(JSON.stringify(existing)):{};
+      acc.id=nid; acc.api_key_env=env;
+      var b=fBase._get(); if(b) acc.base_url=b; else delete acc.base_url;
+      var rt=fTimeout._get();
+      if(rt===undefined) delete acc.request_timeout_s;
+      else if(isNaN(rt)){ formError("Request timeout override must be a number."); return; }
+      else acc.request_timeout_s=rt;
+      var m=fMap._get(); if(Object.keys(m).length) acc.model_map=m; else delete acc.model_map;
+      var q=fQuota._get(); if(q.length) acc.quota_markers=q; else delete acc.quota_markers;
+      var t=f403._get(); if(t!=="passthrough") acc.treat_403_as=t; else delete acc.treat_403_as;
       var accounts=(p.accounts||[]).slice(); var idx=accounts.map(function(a){return a.id;}).indexOf(nid);
       if(idx>=0) accounts[idx]=acc; else accounts.push(acc);
       var obj=Object.assign({},p,{accounts:accounts});
