@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, afterEach } from "vitest";
-import { mountPanel, openSettingsCard, saveForm, setCell, addRow, formError, type Panel } from "./panel_dom";
+import { mountPanel, openSettingsCard, saveForm, setCell, addRow, rows, formError, type Panel } from "./panel_dom";
 
 let panel: Panel | null = null;
 afterEach(() => {
@@ -59,5 +59,54 @@ describe("upstream settings", () => {
 
     expect(formError()).toContain("deepseek-v4-pro");
     expect(panel.sent.filter((r) => r.method === "PUT")).toHaveLength(0);
+  });
+
+  it("rejects a zero per-model budget", async () => {
+    panel = await mountPanel(CFG);
+    await openSettingsCard(panel, "Upstream");
+    setCell("Per-model concurrency (optional)", 0, 1, "0");
+    saveForm();
+    await panel.flush();
+
+    expect(formError()).toContain("deepseek-v4-pro");
+    expect(panel.sent.filter((r) => r.method === "PUT")).toHaveLength(0);
+  });
+
+  it("rejects a negative per-model budget", async () => {
+    panel = await mountPanel(CFG);
+    await openSettingsCard(panel, "Upstream");
+    setCell("Per-model concurrency (optional)", 0, 1, "-3");
+    saveForm();
+    await panel.flush();
+
+    expect(formError()).toContain("deepseek-v4-pro");
+    expect(panel.sent.filter((r) => r.method === "PUT")).toHaveLength(0);
+  });
+
+  it("rejects a fractional per-model budget", async () => {
+    panel = await mountPanel(CFG);
+    await openSettingsCard(panel, "Upstream");
+    setCell("Per-model concurrency (optional)", 0, 1, "2.5");
+    saveForm();
+    await panel.flush();
+
+    expect(formError()).toContain("deepseek-v4-pro");
+    expect(panel.sent.filter((r) => r.method === "PUT")).toHaveLength(0);
+  });
+
+  it("clearing the only row drops per_model_concurrency entirely", async () => {
+    panel = await mountPanel(CFG);
+    await openSettingsCard(panel, "Upstream");
+    const row0 = rows("Per-model concurrency (optional)")[0];
+    if (!row0) throw new Error("no row 0 in field 'Per-model concurrency (optional)'");
+    const removeBtn = row0.querySelector("button");
+    if (!removeBtn) throw new Error("no remove button on row 0");
+    removeBtn.click();
+    saveForm();
+    await panel.flush();
+
+    const put = lastPut(panel);
+    expect(put.path).toBe("admin/config/settings/upstream");
+    expect(put.body).not.toHaveProperty("per_model_concurrency");
   });
 });

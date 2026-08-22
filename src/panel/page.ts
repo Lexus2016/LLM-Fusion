@@ -834,7 +834,7 @@ export const PANEL_HTML = `<!doctype html>
       var pd=fPerDef._get(); if(pd===undefined) delete obj.per_model_concurrency_default; else if(isNaN(pd)){ formError("Per-model concurrency default must be a number."); return; } else obj.per_model_concurrency_default=pd;
       // fKV yields strings; the schema wants positive integers.
       var pmRaw=fPerModel._get(); var pm={}; var pmBad=null;
-      Object.keys(pmRaw).forEach(function(k){ var n=Number(pmRaw[k]); if(pmRaw[k]===""||!isFinite(n)) pmBad=k; else pm[k]=n; });
+      Object.keys(pmRaw).forEach(function(k){ var n=Number(pmRaw[k]); if(pmRaw[k]===""||!isFinite(n)||n<1||n!==Math.floor(n)) pmBad=k; else pm[k]=n; });
       if(pmBad){ formError("Per-model concurrency for '"+pmBad+"' must be a number."); return; }
       if(Object.keys(pm).length) obj.per_model_concurrency=pm; else delete obj.per_model_concurrency;
       saveSettings("upstream", obj, function(ok,err){ if(ok) closeForm(); else formError(err); });
