@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, afterEach } from "vitest";
-import { mountPanel, openSettingsCard, saveForm, setCell, addRow, rows, formError, type Panel } from "./panel_dom";
+import { mountPanel, openSettingsCard, saveForm, setCell, addRow, rows, formError, setRowSelect, type Panel } from "./panel_dom";
 
 let panel: Panel | null = null;
 afterEach(() => {
@@ -149,5 +149,46 @@ describe("pricing settings", () => {
 
     expect(formError()).toContain("Output price");
     expect(panel.sent.filter((r) => r.method === "PUT")).toHaveLength(0);
+  });
+});
+
+describe("capability overrides settings", () => {
+  it("creates a tri-state override", async () => {
+    panel = await mountPanel(CFG);
+    await openSettingsCard(panel, "Capability overrides");
+    addRow("Overrides");
+    setCell("Overrides", 0, 0, "glm-5.2");
+    setRowSelect("Overrides", 0, 0, "on"); // tools
+    setRowSelect("Overrides", 0, 1, "off"); // vision
+    setCell("Overrides", 0, 1, "128000"); // context
+    saveForm();
+    await panel.flush();
+
+    const put = lastPut(panel);
+    expect(put.path).toBe("admin/config/settings/overrides");
+    expect(put.body).toEqual({ "glm-5.2": { tools: true, vision: false, context: 128000 } });
+  });
+
+  it("omits a flag left unset", async () => {
+    panel = await mountPanel(CFG);
+    await openSettingsCard(panel, "Capability overrides");
+    addRow("Overrides");
+    setCell("Overrides", 0, 0, "glm-5.2");
+    setRowSelect("Overrides", 0, 0, "on"); // tools only
+    saveForm();
+    await panel.flush();
+
+    expect(lastPut(panel).body).toEqual({ "glm-5.2": { tools: true } });
+  });
+
+  it("round-trips an existing override unchanged", async () => {
+    const withOv = JSON.parse(JSON.stringify(CFG));
+    withOv.overrides = { "minimax-m3": { vision: true, context: 200000 } };
+    panel = await mountPanel(withOv);
+    await openSettingsCard(panel, "Capability overrides");
+    saveForm();
+    await panel.flush();
+
+    expect(lastPut(panel).body).toEqual({ "minimax-m3": { vision: true, context: 200000 } });
   });
 });

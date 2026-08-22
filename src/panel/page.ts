@@ -508,6 +508,27 @@ export const PANEL_HTML = `<!doctype html>
       var add=el("button","act",""); add.type="button"; add.textContent="+ Add model"; add.onclick=function(){ rows.push(["","",""]); draw(); }; wrap.appendChild(add); }
     draw(); f.appendChild(wrap); f._get=function(){ return rows.slice(); }; return f; }
 
+  // model id -> {tools?, vision?, context?}. Each flag is TRI-STATE: "unset"
+  // omits the key entirely. This map is only consulted when /api/show discovery
+  // FAILS (see degrade() in src/capabilities.ts) -- it is a fallback, not a force.
+  function fOverrides(label, hint, obj){ var f=fld(label,hint); var wrap=el("div","rows");
+    var TRI=[{label:"unset",value:""},{label:"yes",value:"on"},{label:"no",value:"off"}];
+    var rows=Object.keys(obj||{}).map(function(k){ var e=obj[k]||{};
+      return [k, e.tools==null?"":(e.tools?"on":"off"), e.vision==null?"":(e.vision?"on":"off"), e.context==null?"":String(e.context)]; });
+    function draw(){ wrap.textContent="";
+      rows.forEach(function(p,i){ var row=el("div","kv");
+        var k=el("input"); k.type="text"; k.className="mono k1"; k.placeholder="upstream model id"; k.setAttribute("aria-label","Overridden model"); k.value=p[0];
+        k.oninput=function(){ p[0]=k.value; }; row.appendChild(k);
+        [[1,"tools"],[2,"vision"]].forEach(function(d){ var s=el("select"); s.setAttribute("aria-label",d[1]+" override");
+          TRI.forEach(function(o){ var op=el("option",null,d[1]+": "+o.label); op.value=o.value; if(o.value===p[d[0]]) op.selected=true; s.appendChild(op); });
+          s.onchange=function(){ p[d[0]]=s.value; }; row.appendChild(s); });
+        var c=el("input"); c.type="text"; c.className="mono num"; c.placeholder="context"; c.setAttribute("aria-label","Context window override"); c.value=p[3];
+        c.oninput=function(){ p[3]=c.value; }; row.appendChild(c);
+        var x=el("button","act",""); x.type="button"; x.textContent="×"; x.setAttribute("aria-label","Remove override row"); x.onclick=function(){ rows.splice(i,1); draw(); }; row.appendChild(x);
+        wrap.appendChild(row); });
+      var add=el("button","act",""); add.type="button"; add.textContent="+ Add override"; add.onclick=function(){ rows.push(["","","",""]); draw(); }; wrap.appendChild(add); }
+    draw(); f.appendChild(wrap); f._get=function(){ return rows.slice(); }; return f; }
+
   // Reveal/hide a container of sub-fields as a toggle flips. Layers on top of
   // fToggle's own handlers (its onclick fires first, then this), so reading the
   // toggle state here already sees the new value. Also drives initial visibility.
@@ -818,6 +839,10 @@ export const PANEL_HTML = `<!doctype html>
     box.appendChild(settingsCard("Model pricing",
       prCount?(prCount+" model(s) priced · "+Object.keys(pr).slice(0,3).map(esc).join(", ")+(prCount>3?", …":"")):"no prices set — cost reporting shows 0",
       function(){ pricingForm(pr); }, false));
+    var ovCount=Object.keys(ov).length;
+    box.appendChild(settingsCard("Capability overrides",
+      ovCount?(ovCount+" model(s) with a discovery fallback · "+Object.keys(ov).slice(0,3).map(esc).join(", ")+(ovCount>3?", …":"")):"none — discovery failures fall back to tools: yes, vision: no",
+      function(){ overridesForm(ov); }, false));
   }
   function serverForm(sv){ var fBind,fPort,fAuth,fAdmin;
     openForm("Edit server settings", function(body){
@@ -894,6 +919,24 @@ export const PANEL_HTML = `<!doctype html>
         if(r[2].trim()===""||!isFinite(vout)||vout<0){ formError("Output price for '"+k+"' must be a number of 0 or more."); return; }
         out[k]={ input_per_mtok:vin, output_per_mtok:vout }; }
       saveSettings("pricing", out, function(ok,err){ if(ok) closeForm(); else formError(err); });
+    });
+  }
+  function overridesForm(ov){ var fRows;
+    openForm("Edit capability overrides", function(body){
+      var note=el("div","hint"); note.style.margin="0 2px 14px";
+      note.textContent="A FALLBACK, not a force: these values are used only when capability discovery (/api/show) fails for that model. While discovery works, the discovered capabilities win. Keyed by the REAL upstream model id. Leave a flag on 'unset' to fall through to the conservative default (tools: yes, vision: no, context: unknown).";
+      body.appendChild(note);
+      fRows=fOverrides("Overrides","One row per model. Context is the window in tokens; leave it blank to keep it unknown.", ov);
+      body.appendChild(fRows);
+    }, function(){
+      var out={}, rs=fRows._get();
+      for(var i=0;i<rs.length;i++){ var r=rs[i], k=r[0].trim(); if(!k) continue; var e={};
+        if(r[1]) e.tools=(r[1]==="on");
+        if(r[2]) e.vision=(r[2]==="on");
+        var cv=r[3].trim();
+        if(cv!==""){ var n=Number(cv); if(!isFinite(n)||n!==Math.floor(n)){ formError("Context for '"+k+"' must be a whole number of tokens."); return; } e.context=n; }
+        out[k]=e; }
+      saveSettings("overrides", out, function(ok,err){ if(ok) closeForm(); else formError(err); });
     });
   }
   document.getElementById("restart-btn").onclick=function(){
