@@ -484,12 +484,15 @@ export const PANEL_HTML = `<!doctype html>
       add.appendChild(inp); add.appendChild(b); box.appendChild(add); }
     draw(); f.appendChild(box); f._get=function(){ return vals.slice(); };
     f._setSuggest=function(list){ sugg=(list||[]).slice(); if(curFill) curFill(sugg); }; return f; }
-  function fKV(label, hint, obj){ var f=fld(label,hint); var wrap=el("div","rows"); var pairs=Object.keys(obj||{}).map(function(k){ return [k,String(obj[k])]; });
+  function fKV(label, hint, obj){ var f=fld(label,hint); var wrap=el("div","rows"); var pairs=Object.keys(obj||{}).map(function(k){ return [k,String(obj[k]),obj[k]]; });
     function draw(){ wrap.textContent=""; pairs.forEach(function(p,i){ var row=el("div","kv"); var k=el("input"); k.type="text"; k.className="mono"; k.placeholder="from"; k.setAttribute("aria-label",label+" key"); k.value=p[0]; var v=el("input"); v.type="text"; v.className="mono"; v.placeholder="to"; v.setAttribute("aria-label",label+" value"); v.value=p[1];
       k.oninput=function(){ p[0]=k.value; }; v.oninput=function(){ p[1]=v.value; }; var x=el("button","act",""); x.type="button"; x.textContent="×"; x.onclick=function(){ pairs.splice(i,1); draw(); };
       row.appendChild(k); row.appendChild(v); row.appendChild(x); wrap.appendChild(row); });
-      var add=el("button","act",""); add.type="button"; add.textContent="+ Add mapping"; add.onclick=function(){ pairs.push(["",""]); draw(); }; wrap.appendChild(add); }
-    draw(); f.appendChild(wrap); f._get=function(){ var o={}; pairs.forEach(function(p){ if(p[0].trim()) o[p[0].trim()]=p[1].trim(); }); return o; }; return f; }
+      var add=el("button","act",""); add.type="button"; add.textContent="+ Add mapping"; add.onclick=function(){ pairs.push(["","",undefined]); draw(); }; wrap.appendChild(add); }
+    // A pair the operator never touched keeps its ORIGINAL value and type (a bare
+    // string form would silently turn e.g. request_overrides:{think:false} into
+    // {think:"false"} the moment any OTHER field on the same form is edited).
+    draw(); f.appendChild(wrap); f._get=function(){ var o={}; pairs.forEach(function(p){ var k=p[0].trim(); if(!k) return; var vs=p[1].trim(); o[k]=(vs===String(p[2]))?p[2]:vs; }); return o; }; return f; }
   // model id -> {input_per_mtok, output_per_mtok}. A three-column cousin of fKV;
   // pricing is the only place that needs two values per key. _get() returns the
   // RAW string rows so the caller can report which cell is bad by name.
@@ -759,7 +762,7 @@ export const PANEL_HTML = `<!doctype html>
           // request_overrides, which the fusion strategy ignores. Without this control
           // a panel save would silently wipe synth_request_overrides (same round-trip
           // class as the web_search/bineval fix in v0.1.32) and re-open the synth leak.
-          dyn.synthOverrides=fKV("Synth request overrides (optional)","Extra request-body fields sent upstream to the SYNTH stage only, e.g. reasoning_effort → none (stops the synth from leaking its reasoning). Panel & judge are unaffected.", (ex&&ex.synth_request_overrides)||{}); h.appendChild(dyn.synthOverrides);
+          dyn.synthOverrides=fKV("Synth request overrides (optional)","Extra request-body fields sent upstream to the SYNTH stage only, e.g. reasoning_effort → none (stops the synth from leaking its reasoning). Panel & judge are unaffected. A value you edit is sent as text; one you leave alone keeps its original type.", (ex&&ex.synth_request_overrides)||{}); h.appendChild(dyn.synthOverrides);
         }
         else if(strat==="smart"){
           dyn.router=fText("Router model","A fast model that classifies each request as simple vs deep (needs reliable JSON). Pick from the provider's list.", ex&&ex.router, true, up); h.appendChild(dyn.router);
@@ -784,7 +787,7 @@ export const PANEL_HTML = `<!doctype html>
       function addPromote(h, ex){ var v=(ex&&ex.promote_reasoning_to_content); dyn.promote=fSelect("Promote reasoning to content","Normalize a reasoning-only reply so plain clients see the answer. inherit = use the global default.", v==null?"inherit":(v?"on":"off"),[{label:"inherit (global default)",value:"inherit"},{label:"on",value:"on"},{label:"off",value:"off"}]); h.appendChild(dyn.promote); }
       // Extra request-body fields merged into every upstream call for this model
       // (e.g. reasoning_effort → none). Core keys are protected server-side.
-      function addOverrides(h, ex){ dyn.overrides=fKV("Request overrides (optional)","Extra request-body fields sent upstream for this model, e.g. reasoning_effort → none. Values are sent as strings.", (ex&&ex.request_overrides)||{}); h.appendChild(dyn.overrides); }
+      function addOverrides(h, ex){ dyn.overrides=fKV("Request overrides (optional)","Extra request-body fields sent upstream for this model, e.g. reasoning_effort → none. A value you edit is sent as text; one you leave alone keeps its original type.", (ex&&ex.request_overrides)||{}); h.appendChild(dyn.overrides); }
     }, function(){
       var nm=fName._get(); if(!nm){ formError("Model name is required."); return; }
       var strat=fStrat._get();

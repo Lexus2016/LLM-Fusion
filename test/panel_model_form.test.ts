@@ -56,7 +56,7 @@ function lastPut(p: Panel): { method: string; path: string; body: unknown } {
 }
 
 describe("model form round-trip", () => {
-  it("keeps a key the form does not render", async () => {
+  it("round-trips an unedited model save unchanged", async () => {
     panel = await mountPanel(CFG);
     await openModelForm(panel, "fusion-coder");
     saveForm();
@@ -159,5 +159,29 @@ describe("model form round-trip", () => {
     if (!card) throw new Error("no card");
     const badges = Array.from(card.querySelectorAll(".badge")).map((b) => b.textContent);
     expect(badges).toContain("vision pre-stage");
+  });
+
+  it("keeps request_overrides values typed when an unrelated field is edited", async () => {
+    const withOverrides = JSON.parse(JSON.stringify(CFG));
+    delete withOverrides.models["fusion-coder"];
+    withOverrides.models["single-model"] = {
+      strategy: "single",
+      provider: "ollama-cloud",
+      target: "glm-5.2",
+      request_overrides: { think: false, temperature: 0.7 },
+    };
+    panel = await mountPanel(withOverrides);
+    await openModelForm(panel, "single-model");
+    // Edit a field unrelated to request_overrides — the fKV rows for
+    // request_overrides are never touched.
+    setInput("Target model", "deepseek-v4-pro");
+    saveForm();
+    await panel.flush();
+
+    const body = lastPut(panel).body;
+    expect(body).toMatchObject({
+      target: "deepseek-v4-pro",
+      request_overrides: { think: false, temperature: 0.7 },
+    });
   });
 });
