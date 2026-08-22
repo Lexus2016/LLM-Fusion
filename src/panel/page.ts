@@ -681,29 +681,41 @@ export const PANEL_HTML = `<!doctype html>
       function addOverrides(h, ex){ dyn.overrides=fKV("Request overrides (optional)","Extra request-body fields sent upstream for this model, e.g. reasoning_effort → none. Values are sent as strings.", (ex&&ex.request_overrides)||{}); h.appendChild(dyn.overrides); }
     }, function(){
       var nm=fName._get(); if(!nm){ formError("Model name is required."); return; }
-      var strat=fStrat._get(); var obj={ strategy:strat }; var prov=fProv._get(); if(prov) obj.provider=prov;
+      var strat=fStrat._get();
+      // MERGE-ON-SAVE: start from the model we LOADED, so a key this form does
+      // not render (image_describe, or whatever the schema grows next) rides
+      // along instead of being silently deleted from fusion.yaml. Rebuilding
+      // from scratch is what lost web_search/bineval in v0.1.32 — same class.
+      // A strategy SWITCH starts clean: ModelSchema is a .strict() discriminated
+      // union, so the previous strategy's keys would be rejected outright.
+      // The trade: every optional control must now DELETE its key explicitly.
+      var obj=(existing&&existing.strategy===strat)?JSON.parse(JSON.stringify(existing)):{};
+      obj.strategy=strat;
+      var prov=fProv._get(); if(prov) obj.provider=prov; else delete obj.provider;
       // Collect the per-model promote override (tri-state) + request_overrides onto obj.
-      function applyCommon(o){ if(dyn.promote){ var pv=dyn.promote._get(); if(pv==="on") o.promote_reasoning_to_content=true; else if(pv==="off") o.promote_reasoning_to_content=false; }
-        if(dyn.overrides){ var ov=dyn.overrides._get(); if(Object.keys(ov).length) o.request_overrides=ov; } }
+      function applyCommon(o){ if(dyn.promote){ var pv=dyn.promote._get(); if(pv==="on") o.promote_reasoning_to_content=true; else if(pv==="off") o.promote_reasoning_to_content=false; else delete o.promote_reasoning_to_content; }
+        if(dyn.overrides){ var ov=dyn.overrides._get(); if(Object.keys(ov).length) o.request_overrides=ov; else delete o.request_overrides; } }
       if(strat==="single"){ var t=dyn.target._get(); if(!t){ formError("Target model is required."); return; } obj.target=t; applyCommon(obj); }
       else if(strat==="failover"){ var ch=dyn.chain._get(); if(!ch.length){ formError("Add at least one model to the chain."); return; } obj.chain=ch; applyCommon(obj); }
       else if(strat==="fusion"){ var panel=dyn.panel._get(); if(panel.length<1){ formError("Add at least one panel member."); return; }
         var judge=dyn.judge._get(), synth=dyn.synth._get(); if(!judge||!synth){ formError("Judge and Synthesizer are required."); return; }
-        obj.panel=panel; obj.judge=judge; obj.synth=synth; var adv=dyn.adv._get(); if(adv) obj.adversarial=adv;
-        obj.tool_mode=dyn.tool._get(); if(dyn.planOnly._get()) obj.fusion_planning_turn_only=true;
+        obj.panel=panel; obj.judge=judge; obj.synth=synth; var adv=dyn.adv._get(); if(adv) obj.adversarial=adv; else delete obj.adversarial;
+        obj.tool_mode=dyn.tool._get(); if(dyn.planOnly._get()) obj.fusion_planning_turn_only=true; else delete obj.fusion_planning_turn_only;
         if(dyn.web._get()){ var ws={ enabled:true };
           var wm=dyn.wsMax._get(); if(wm!==undefined){ if(isNaN(wm)){ formError("Web search max results must be a number."); return; } ws.max_results=wm; }
           var wt=dyn.wsTimeout._get(); if(wt!==undefined){ if(isNaN(wt)){ formError("Web search timeout must be a number."); return; } ws.timeout_s=wt; }
           var wc=dyn.wsCtx._get(); if(wc!==undefined){ if(isNaN(wc)){ formError("Web search max context chars must be a number."); return; } ws.max_context_chars=wc; }
           var wp=dyn.wsPrompt._get(); if(wp!==undefined){ if(isNaN(wp)){ formError("Web search prompt cap must be a number."); return; } ws.max_prompt_chars=wp; }
           obj.web_search=ws; }
+        else delete obj.web_search;
         if(dyn.bineval._get()){ var be={ enabled:true };
           var bm=dyn.beModel._get(); if(bm) be.model=bm;
           var bth=dyn.beThresh._get(); if(bth!==undefined){ if(isNaN(bth)){ formError("BinEval threshold must be a number."); return; } be.threshold=bth; }
           var bto=dyn.beTimeout._get(); if(bto!==undefined){ if(isNaN(bto)){ formError("BinEval timeout must be a number."); return; } be.timeout_s=bto; }
           if(existing&&existing.bineval&&existing.bineval.dimensions) be.dimensions=existing.bineval.dimensions; // preserve custom questions
           obj.bineval=be; }
-        if(dyn.synthOverrides){ var so=dyn.synthOverrides._get(); if(Object.keys(so).length) obj.synth_request_overrides=so; }
+        else delete obj.bineval;
+        if(dyn.synthOverrides){ var so=dyn.synthOverrides._get(); if(Object.keys(so).length) obj.synth_request_overrides=so; else delete obj.synth_request_overrides; }
         applyCommon(obj);
       }
       else if(strat==="smart"){ var router=dyn.router._get(); if(!router){ formError("Router model is required."); return; }
