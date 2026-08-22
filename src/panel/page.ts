@@ -529,6 +529,21 @@ export const PANEL_HTML = `<!doctype html>
       var add=el("button","act",""); add.type="button"; add.textContent="+ Add override"; add.onclick=function(){ rows.push(["","","",""]); draw(); }; wrap.appendChild(add); }
     draw(); f.appendChild(wrap); f._get=function(){ return rows.slice(); }; return f; }
 
+  // Raw-JSON escape hatch. Deliberately NOT merged with the form fields: two
+  // clearly separated modes, so there is never a "which one wins?" question.
+  function fJson(label, hint, value){ var f=fld(label,hint); var t=el("textarea"); t.className="mono"; t.rows=20; t.spellcheck=false;
+    t.id="fi"+(++dlSeq); if(f._label)f._label.htmlFor=t.id; if(f._hintId)t.setAttribute("aria-describedby",f._hintId);
+    t.value=JSON.stringify(value,null,2); f.appendChild(t); f._get=function(){ return t.value; }; return f; }
+  // Parse-and-hand-off. Whole-config zod validation still gates the result
+  // server-side, so this only rejects what is not even a JSON object.
+  function jsonForm(title, hint, value, onParsed){ var fJ;
+    openForm(title, function(body){ fJ=fJson("JSON", hint, value); body.appendChild(fJ); },
+      function(){ var parsed;
+        try { parsed=JSON.parse(fJ._get()); } catch(e){ formError("Invalid JSON: "+String(e.message||e)); return; }
+        if(!parsed||typeof parsed!=="object"||Array.isArray(parsed)){ formError("The top level must be a JSON object."); return; }
+        onParsed(parsed); });
+  }
+
   // Reveal/hide a container of sub-fields as a toggle flips. Layers on top of
   // fToggle's own handlers (its onclick fires first, then this), so reading the
   // toggle state here already sees the new value. Also drives initial visibility.
@@ -550,6 +565,9 @@ export const PANEL_HTML = `<!doctype html>
       var r=el("div","er1"); r.appendChild(el("span","ename",id)); r.appendChild(el("span","ptype",p.type));
       var acts=el("div","eacts"); acts.appendChild(mkBtn("+ Account","act",false,function(){ accountForm(id,null); }));
       acts.appendChild(mkBtn("Edit","act",false,function(){ providerForm(id,p); }));
+      acts.appendChild(mkBtn("JSON","act",false,function(){ jsonForm("Edit provider "+id+" as JSON",
+        "The whole provider group including every account. Use this for anything the forms cannot express — accounts[].extra_headers. Header VALUES are shown masked as ••• and the server swaps the real ones back in on save; leave a mask alone to keep the stored value.", p,
+        function(o){ saveProvider(id, o, function(ok,err){ if(ok) closeForm(); else formError(err); }); }); }));
       acts.appendChild(mkBtn("Delete","act danger",false,function(){ confirmAction("Delete","Delete provider <b>"+esc(id)+"</b> and all its accounts? Models bound to it will fail to load until reassigned.",true,function(){ deleteProvider(id); }); }));
       r.appendChild(acts); c.appendChild(r);
       c.appendChild(el("div","edesc",(p.base_url||"(no base_url)")+" · "+(p.accounts?p.accounts.length:0)+" account(s)"));
@@ -650,6 +668,9 @@ export const PANEL_HTML = `<!doctype html>
     names.forEach(function(name){ var m=models[name]; var c=el("div","ecard"); var r=el("div","er1");
       r.appendChild(el("span","ename",name)); r.appendChild(el("span","ptype",m.strategy)); if(m.provider) r.appendChild(el("span","badge",m.provider));
       var acts=el("div","eacts"); acts.appendChild(mkBtn("Edit","act",false,function(){ modelForm(name,m); }));
+      acts.appendChild(mkBtn("JSON","act",false,function(){ jsonForm("Edit model "+name+" as JSON",
+        "The whole model object. Use this for anything the form cannot express — an inline smart simple/fusion block, custom bineval questions. The config schema still validates it on save.", m,
+        function(o){ saveModel(name, o, function(ok,err){ if(ok) closeForm(); else formError(err); }); }); }));
       acts.appendChild(mkBtn("Delete","act danger",false,function(){ confirmAction("Delete","Delete model <b>"+esc(name)+"</b>? Clients using it will get 404 until re-created.",true,function(){ deleteModel(name); }); }));
       r.appendChild(acts); c.appendChild(r); c.appendChild(el("div","edesc",strategySummary(m))); box.appendChild(c); });
   }
