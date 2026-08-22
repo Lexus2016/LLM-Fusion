@@ -285,7 +285,10 @@ It has four tabs:
   models the same way: pick a strategy and the form shows only the fields that
   strategy needs (panel, judge, synth, router, …), each explained inline —
   including the fusion tuning knobs (`web_search`, `bineval`,
-  `promote_reasoning_to_content`, `request_overrides`).
+  `promote_reasoning_to_content`, `synth_request_overrides`, and
+  `image_describe` — the vision pre-stage). `request_overrides` belongs to
+  `single` models (and a smart inline `simple` block), and the form offers it
+  there only.
 - **Settings** — global, non-fusion-specific config: `server` (bind, port,
   client-auth + admin-token env vars), `upstream` (concurrency, timeouts,
   connector cooldowns), and fusion `defaults` (stage timeouts, min panel
