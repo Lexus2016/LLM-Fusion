@@ -694,8 +694,19 @@ export const PANEL_HTML = `<!doctype html>
         else if(strat==="smart"){
           dyn.router=fText("Router model","A fast model that classifies each request as simple vs deep (needs reliable JSON). Pick from the provider's list.", ex&&ex.router, true, up); h.appendChild(dyn.router);
           dyn.def=fSelect("Default route","Used when the router is unsure or errors.", ex?ex.default:"simple",[{label:"simple",value:"simple"},{label:"fusion",value:"fusion"}]); h.appendChild(dyn.def);
-          dyn.simple=fText("Simple route","Name of a single/failover model to use for cheap steps (a model from the Models list).", ex&&typeof ex.simple==="string"?ex.simple:"", true, virt); h.appendChild(dyn.simple);
-          dyn.fusion=fText("Fusion route","Name of a fusion model to use for deep steps (must be in the same provider group).", ex&&typeof ex.fusion==="string"?ex.fusion:"", true, virt); h.appendChild(dyn.fusion);
+          dyn.escalate=fToggle("Escalate on tool error","On: if the simple route's tool call fails, retry that step on the fusion route. Off: surface the failure to the client.", ex?(ex.escalate_on_tool_error==null?true:!!ex.escalate_on_tool_error):true); h.appendChild(dyn.escalate);
+          // simple/fusion accept either a model NAME or an INLINE block. The form
+          // only edits names; an inline block is shown read-only and rides through
+          // the save untouched (merge-on-save already carries it on "obj").
+          var sInline=!!(ex&&ex.simple&&typeof ex.simple==="object");
+          var fInline=!!(ex&&ex.fusion&&typeof ex.fusion==="object");
+          var INLINE_HINT=' Defined INLINE in fusion.yaml — open the model card\\'s "JSON" button to edit it. Saving this form leaves the block as-is.';
+          dyn.simple=fText("Simple route", sInline?INLINE_HINT:"Name of a single/failover model to use for cheap steps (a model from the Models list).", sInline?"":(ex&&typeof ex.simple==="string"?ex.simple:""), true, virt);
+          if(sInline){ var si=dyn.simple.querySelector("input"); si.disabled=true; si.placeholder="(inline block)"; }
+          h.appendChild(dyn.simple);
+          dyn.fusion=fText("Fusion route", fInline?INLINE_HINT:"Name of a fusion model to use for deep steps (must be in the same provider group).", fInline?"":(ex&&typeof ex.fusion==="string"?ex.fusion:""), true, virt);
+          if(fInline){ var fi=dyn.fusion.querySelector("input"); fi.disabled=true; fi.placeholder="(inline block)"; }
+          h.appendChild(dyn.fusion);
         }
       }
       // Per-model override of the global promote_reasoning_to_content. Tri-state:
@@ -750,8 +761,16 @@ export const PANEL_HTML = `<!doctype html>
         applyCommon(obj);
       }
       else if(strat==="smart"){ var router=dyn.router._get(); if(!router){ formError("Router model is required."); return; }
-        obj.router=router; obj.default=dyn.def._get(); var s=dyn.simple._get(), fu=dyn.fusion._get();
-        if(!s||!fu){ formError("Simple and Fusion route model names are required."); return; } obj.simple=s; obj.fusion=fu;
+        obj.router=router; obj.default=dyn.def._get();
+        // "true" is the schema default — omit it so the YAML stays minimal, and
+        // only write the key when the operator turns escalation OFF.
+        if(dyn.escalate._get()) delete obj.escalate_on_tool_error; else obj.escalate_on_tool_error=false;
+        // A blank input is only acceptable when "obj" already carries an INLINE
+        // block for that route (merge-on-save kept it); otherwise a name is required.
+        var s=dyn.simple._get(); if(s) obj.simple=s;
+        else if(!obj.simple||typeof obj.simple!=="object"){ formError("Simple route model name is required."); return; }
+        var fu=dyn.fusion._get(); if(fu) obj.fusion=fu;
+        else if(!obj.fusion||typeof obj.fusion!=="object"){ formError("Fusion route model name is required."); return; }
       }
       saveModel(nm, obj, function(ok,err){ if(ok) closeForm(); else formError(err); });
     });
