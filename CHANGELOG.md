@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.1.38] - 2026-08-22
 
 ### Fixed
 - **Panel saves no longer delete config keys the form does not render.** The
