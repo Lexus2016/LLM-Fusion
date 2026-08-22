@@ -26,13 +26,26 @@ function extract(re: RegExp, what: string): string {
 }
 
 /**
+ * Opt-in failure hook for `mountPanel`: given the request's method and path,
+ * return the error body to fail the request with, or `undefined`/`null` to let
+ * it succeed normally. Lets a test exercise the `.catch → formError/toast` path
+ * of a save/delete handler, which the default stub never triggers.
+ */
+export type FailRequest = (method: string, path: string) => { status?: number; body?: unknown } | undefined | null;
+
+export interface MountOpts {
+  /** When set, requests it flags fail instead of the default `{ok:true}`. */
+  failRequest?: FailRequest;
+}
+
+/**
  * Mount the SHIPPED panel markup + script into jsdom and stub the network.
  *
  * The point of running the real string (rather than a copy of the logic) is that
  * a schema field the form forgets to round-trip must fail HERE, in a test, not
  * in fusion.yaml. Keep it black-box: drive the panel through DOM clicks only.
  */
-export async function mountPanel(cfg: unknown): Promise<Panel> {
+export async function mountPanel(cfg: unknown, opts?: MountOpts): Promise<Panel> {
   // Only setInterval is faked: the 3s monitor poll would otherwise fire for the
   // whole test run. setTimeout stays REAL so `flush()` and the panel's own
   // reloadConfigSoon(400ms) behave normally.
@@ -47,6 +60,12 @@ export async function mountPanel(cfg: unknown): Promise<Panel> {
     const method = (opt && opt.method) || "GET";
     if (method !== "GET") {
       sent.push({ method, path, body: opt && opt.body ? JSON.parse(opt.body) : undefined });
+      const failure = opts && opts.failRequest ? opts.failRequest(method, path) : null;
+      if (failure) {
+        return Promise.resolve(
+          fakeResponse(failure.body !== undefined ? failure.body : { error: "simulated failure" }, false, failure.status || 500),
+        );
+      }
       return Promise.resolve(fakeResponse({ ok: true }));
     }
     if (path === "admin/config") return Promise.resolve(fakeResponse(cfg));
@@ -62,8 +81,8 @@ export async function mountPanel(cfg: unknown): Promise<Panel> {
 }
 
 /** Minimal Response stand-in — the panel only reads .ok, .status and .json(). */
-function fakeResponse(data: unknown): { ok: boolean; status: number; json(): Promise<unknown> } {
-  return { ok: true, status: 200, json: () => Promise.resolve(data) };
+function fakeResponse(data: unknown, ok = true, status = 200): { ok: boolean; status: number; json(): Promise<unknown> } {
+  return { ok, status, json: () => Promise.resolve(data) };
 }
 
 function flush(): Promise<void> {
