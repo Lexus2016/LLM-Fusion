@@ -484,7 +484,7 @@ export const PANEL_HTML = `<!doctype html>
       add.appendChild(inp); add.appendChild(b); box.appendChild(add); }
     draw(); f.appendChild(box); f._get=function(){ return vals.slice(); };
     f._setSuggest=function(list){ sugg=(list||[]).slice(); if(curFill) curFill(sugg); }; return f; }
-  function fKV(label, hint, obj){ var f=fld(label,hint); var wrap=el("div","rows"); var pairs=Object.keys(obj||{}).map(function(k){ return [k,obj[k]]; });
+  function fKV(label, hint, obj){ var f=fld(label,hint); var wrap=el("div","rows"); var pairs=Object.keys(obj||{}).map(function(k){ return [k,String(obj[k])]; });
     function draw(){ wrap.textContent=""; pairs.forEach(function(p,i){ var row=el("div","kv"); var k=el("input"); k.type="text"; k.className="mono"; k.placeholder="from"; k.setAttribute("aria-label",label+" key"); k.value=p[0]; var v=el("input"); v.type="text"; v.className="mono"; v.placeholder="to"; v.setAttribute("aria-label",label+" value"); v.value=p[1];
       k.oninput=function(){ p[0]=k.value; }; v.oninput=function(){ p[1]=v.value; }; var x=el("button","act",""); x.type="button"; x.textContent="×"; x.onclick=function(){ pairs.splice(i,1); draw(); };
       row.appendChild(k); row.appendChild(v); row.appendChild(x); wrap.appendChild(row); });
@@ -813,7 +813,7 @@ export const PANEL_HTML = `<!doctype html>
       saveSettings("server", obj, function(ok,err){ if(ok) closeForm(); else formError(err); });
     });
   }
-  function upstreamForm(up){ var fMode,fConc,fTimeout,fCool,fRecheck,fPerDef;
+  function upstreamForm(up){ var fMode,fConc,fTimeout,fCool,fRecheck,fPerDef,fPerModel;
     openForm("Edit upstream settings", function(body){
       var note=el("div","hint"); note.style.margin="0 2px 14px"; note.textContent="Concurrency and timeouts are read at boot — restart to apply. base_url / API keys live under Providers."; body.appendChild(note);
       fMode=fSelect("API mode","auto = detect per provider. openai = force the /v1 OpenAI shape. native = force the Ollama /api shape.", up.api_mode||"auto",[{label:"auto",value:"auto"},{label:"openai",value:"openai"},{label:"native",value:"native"}]);
@@ -822,15 +822,21 @@ export const PANEL_HTML = `<!doctype html>
       fCool=fNum("Connector cooldown (s)","How long a connector rests after a soft failure (rate-limit/5xx/timeout) before it is probed again. Default 60.", up.connector_cooldown_s==null?60:up.connector_cooldown_s);
       fRecheck=fNum("Connector down recheck (s)","How long a connector stays down after a HARD failure (auth/quota) before an automatic probe. 0 = never auto-probe (manual reset only). Default 900.", up.connector_down_recheck_s==null?900:up.connector_down_recheck_s);
       fPerDef=fNum("Per-model concurrency default (optional)","Default budget applied to each model's own gate. Blank = a model may use the full global budget.", up.per_model_concurrency_default);
-      body.appendChild(fMode); body.appendChild(fConc); body.appendChild(fTimeout); body.appendChild(fCool); body.appendChild(fRecheck); body.appendChild(fPerDef);
+      fPerModel=fKV("Per-model concurrency (optional)","A per-model budget that overrides the default above, e.g. deepseek-v4-pro → 5. Each value must be a whole number above 0. Models not listed use the default.", up.per_model_concurrency||{});
+      body.appendChild(fMode); body.appendChild(fConc); body.appendChild(fTimeout); body.appendChild(fCool); body.appendChild(fRecheck); body.appendChild(fPerDef); body.appendChild(fPerModel);
     }, function(){
-      var obj=Object.assign({},up); // preserve base_url/api_key_env/per_model_concurrency the form doesn't edit
+      var obj=Object.assign({},up); // preserve base_url/api_key_env the form doesn't edit
       obj.api_mode=fMode._get();
       var conc=fConc._get(); if(conc===undefined||isNaN(conc)){ formError("Max concurrency is required and must be a number."); return; } obj.max_concurrency=conc;
       var to=fTimeout._get(); if(to===undefined||isNaN(to)){ formError("Request timeout is required and must be a number."); return; } obj.request_timeout_s=to;
       var cool=fCool._get(); if(cool===undefined||isNaN(cool)){ formError("Connector cooldown is required and must be a number."); return; } obj.connector_cooldown_s=cool;
       var rc=fRecheck._get(); if(rc===undefined||isNaN(rc)){ formError("Connector down recheck is required and must be a number."); return; } obj.connector_down_recheck_s=rc;
       var pd=fPerDef._get(); if(pd===undefined) delete obj.per_model_concurrency_default; else if(isNaN(pd)){ formError("Per-model concurrency default must be a number."); return; } else obj.per_model_concurrency_default=pd;
+      // fKV yields strings; the schema wants positive integers.
+      var pmRaw=fPerModel._get(); var pm={}; var pmBad=null;
+      Object.keys(pmRaw).forEach(function(k){ var n=Number(pmRaw[k]); if(pmRaw[k]===""||!isFinite(n)) pmBad=k; else pm[k]=n; });
+      if(pmBad){ formError("Per-model concurrency for '"+pmBad+"' must be a number."); return; }
+      if(Object.keys(pm).length) obj.per_model_concurrency=pm; else delete obj.per_model_concurrency;
       saveSettings("upstream", obj, function(ok,err){ if(ok) closeForm(); else formError(err); });
     });
   }

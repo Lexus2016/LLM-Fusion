@@ -195,3 +195,45 @@ export async function openAccountForm(panel: Panel, provId: string, accId: strin
   if (!btn) throw new Error("no Edit button on account '" + accId + "'");
   btn.click();
 }
+
+/** Load the config, open the Settings tab, click Edit on the named card. */
+export async function openSettingsCard(panel: Panel, title: string): Promise<void> {
+  clickTab("settings");
+  await panel.flush();
+  cardButton("settings-editor", title, "Edit").click();
+}
+
+/** The Nth row of a multi-column rows editor inside the open form. */
+export function rows(label: string): Element[] {
+  return Array.from(field(label).querySelectorAll(".kv"));
+}
+
+/** Click the "+ Add …" button of a rows editor. */
+export function addRow(label: string): void {
+  const btns = Array.from(field(label).querySelectorAll("button"));
+  const add = btns.find((b) => (b.textContent || "").indexOf("+ Add") === 0);
+  if (!add) throw new Error("no '+ Add' button in field '" + label + "'");
+  add.click();
+}
+
+/** Set the Nth input of the Nth row of a rows editor. */
+export function setCell(label: string, row: number, col: number, value: string): void {
+  const r = rows(label)[row];
+  if (!r) throw new Error("no row " + row + " in field '" + label + "'");
+  const inputs = Array.from(r.querySelectorAll("input"));
+  const cell = inputs[col];
+  if (!cell) throw new Error("no input column " + col + " in row " + row);
+  cell.value = value;
+  cell.dispatchEvent(new Event("input"));
+}
+
+/** Set the Nth select of the Nth row of a rows editor. */
+export function setRowSelect(label: string, row: number, col: number, value: string): void {
+  const r = rows(label)[row];
+  if (!r) throw new Error("no row " + row + " in field '" + label + "'");
+  const selects = Array.from(r.querySelectorAll("select"));
+  const cell = selects[col];
+  if (!cell) throw new Error("no select column " + col + " in row " + row);
+  cell.value = value;
+  cell.dispatchEvent(new Event("change"));
+}
