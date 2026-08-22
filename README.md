@@ -308,6 +308,16 @@ token so the client API token doesn't also grant config edits + restart.
 Backward compatible: omit `providers:` and the legacy single
 `upstream.base_url` + `api_key_env` still works unchanged.
 
+The Settings tab covers server, upstream, fusion defaults, model pricing and
+capability overrides. Every model and provider card also has a **JSON** button
+that opens the raw object — use it for anything the forms do not render, such as
+an inline `simple`/`fusion` block on a `smart` model or `accounts[].extra_headers`.
+
+**Known limitation:** saving from the panel replaces the edited node in
+`fusion.yaml`, so comments written *inside* that model or provider block are
+lost (comments on sibling entries survive). Every write is preceded by a
+timestamped backup — the last 10 are kept next to the config file.
+
 ## The honest cost note (read this)
 
 Full fusion runs on **every** step. An agent loop (read → think → edit → run tests → re-read …) multiplies upstream **model API calls**:

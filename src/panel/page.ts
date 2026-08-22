@@ -662,11 +662,22 @@ export const PANEL_HTML = `<!doctype html>
     if(m.strategy==="failover") return "failover → "+(m.chain||[]).join(", ");
     if(m.strategy==="fusion") return "fusion · panel ["+(m.panel||[]).join(", ")+"] · judge "+m.judge+" · synth "+m.synth;
     if(m.strategy==="smart") return "smart · router "+m.router; return m.strategy; }
+  // Extras that are easy to forget exist. They live inside nested blocks, so
+  // strategySummary can't show them and an operator cannot tell from the list
+  // that a model has (say) a vision pre-stage configured.
+  function modelBadges(m){ var out=[];
+    if(m.image_describe&&m.image_describe.enabled) out.push("vision pre-stage");
+    if(m.web_search&&m.web_search.enabled) out.push("web search");
+    if(m.bineval&&m.bineval.enabled) out.push("bineval");
+    if(m.adversarial) out.push("adversarial");
+    if(m.strategy==="smart"&&m.escalate_on_tool_error===false) out.push("no escalation");
+    return out; }
   function renderModels(){
     var box=document.getElementById("models-editor"); box.textContent="";
     var models=cfg && cfg.models ? cfg.models : {}; var names=Object.keys(models); show(document.getElementById("empty-models"),names.length===0);
     names.forEach(function(name){ var m=models[name]; var c=el("div","ecard"); var r=el("div","er1");
       r.appendChild(el("span","ename",name)); r.appendChild(el("span","ptype",m.strategy)); if(m.provider) r.appendChild(el("span","badge",m.provider));
+      modelBadges(m).forEach(function(b){ r.appendChild(el("span","badge",b)); });
       var acts=el("div","eacts"); acts.appendChild(mkBtn("Edit","act",false,function(){ modelForm(name,m); }));
       acts.appendChild(mkBtn("JSON","act",false,function(){ jsonForm("Edit model "+name+" as JSON",
         "The whole model object. Use this for anything the form cannot express — an inline smart simple/fusion block, custom bineval questions. The config schema still validates it on save.", m,

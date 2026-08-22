@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Panel saves no longer delete config keys the form does not render.** The
+  model and account forms now edit the object they loaded instead of rebuilding
+  it from the rendered fields. Previously an unrelated edit silently dropped
+  `image_describe`, `escalate_on_tool_error`, `accounts[].request_timeout_s` and
+  anything else the form did not know about. Covered by a new jsdom test suite
+  that runs the shipped panel script.
+- The fusion form no longer renders a `request_overrides` field, which
+  `FusionModelSchema` rejects outright. Its real counterpart,
+  `synth_request_overrides`, is unchanged.
+
+### Added
+- Panel: `image_describe` (vision pre-stage) controls on the fusion form.
+- Panel: `escalate_on_tool_error` on the smart form; an inline `simple`/`fusion`
+  block is now shown read-only and preserved instead of being wiped.
+- Panel: `accounts[].request_timeout_s` and `upstream.per_model_concurrency`.
+- Panel: **Model pricing** and **Capability overrides** settings cards.
+- Panel: a **JSON** button on every model and provider card for raw editing.
+- Panel: model cards badge the vision pre-stage, web search, BinEval,
+  adversarial member and disabled escalation.
+
 ## [0.1.37] - 2026-08-21
 
 Remediation of the `AUDIT-v0.1.36.md` findings, plus everything two adversarial

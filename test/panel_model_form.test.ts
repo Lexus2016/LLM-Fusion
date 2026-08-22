@@ -7,6 +7,7 @@ import {
   setSelect,
   setInput,
   clickToggle,
+  clickTab,
   hasField,
   input,
   formError,
@@ -145,5 +146,18 @@ describe("model form round-trip", () => {
 
     expect(formError()).toContain("describer model is required");
     expect(panel.sent.filter((r) => r.method === "PUT")).toHaveLength(0);
+  });
+
+  it("badges the extras on the model card", async () => {
+    panel = await mountPanel(CFG);
+    clickTab("models");
+    await panel.flush();
+    const card = Array.from(document.querySelectorAll("#models-editor .ecard")).find((c) => {
+      const n = c.querySelector(".ename");
+      return n !== null && n.textContent === "fusion-coder";
+    });
+    if (!card) throw new Error("no card");
+    const badges = Array.from(card.querySelectorAll(".badge")).map((b) => b.textContent);
+    expect(badges).toContain("vision pre-stage");
   });
 });
