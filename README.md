@@ -286,9 +286,10 @@ It has four tabs:
   strategy needs (panel, judge, synth, router, …), each explained inline —
   including the fusion tuning knobs (`web_search`, `bineval`,
   `promote_reasoning_to_content`, `synth_request_overrides`, and
-  `image_describe` — the vision pre-stage). `request_overrides` belongs to
-  `single` models (and a smart inline `simple` block), and the form offers it
-  there only.
+  `image_describe` — the vision pre-stage). `request_overrides` is not a fusion
+  key at all: the schema puts it on `single` models and on a smart inline
+  `simple` block, and the form renders a field for it on `single` only — edit
+  an inline block's copy through that model's **JSON** button.
 - **Settings** — global, non-fusion-specific config: `server` (bind, port,
   client-auth + admin-token env vars), `upstream` (concurrency, timeouts,
   connector cooldowns), and fusion `defaults` (stage timeouts, min panel
