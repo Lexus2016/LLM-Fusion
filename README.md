@@ -285,7 +285,11 @@ It has four tabs:
   models the same way: pick a strategy and the form shows only the fields that
   strategy needs (panel, judge, synth, router, …), each explained inline —
   including the fusion tuning knobs (`web_search`, `bineval`,
-  `promote_reasoning_to_content`, `request_overrides`).
+  `promote_reasoning_to_content`, `synth_request_overrides`, and
+  `image_describe` — the vision pre-stage). `request_overrides` is not a fusion
+  key at all: the schema puts it on `single` models and on a smart inline
+  `simple` block, and the form renders a field for it on `single` only — edit
+  an inline block's copy through that model's **JSON** button.
 - **Settings** — global, non-fusion-specific config: `server` (bind, port,
   client-auth + admin-token env vars), `upstream` (concurrency, timeouts,
   connector cooldowns), and fusion `defaults` (stage timeouts, min panel
@@ -307,6 +311,16 @@ actions require it (the HTML shell carries no secrets); set
 token so the client API token doesn't also grant config edits + restart.
 Backward compatible: omit `providers:` and the legacy single
 `upstream.base_url` + `api_key_env` still works unchanged.
+
+The Settings tab covers server, upstream, fusion defaults, model pricing and
+capability overrides. Every model and provider card also has a **JSON** button
+that opens the raw object — use it for anything the forms do not render, such as
+an inline `simple`/`fusion` block on a `smart` model or `accounts[].extra_headers`.
+
+**Known limitation:** saving from the panel replaces the edited node in
+`fusion.yaml`, so comments written *inside* that model or provider block are
+lost (comments on sibling entries survive). Every write is preceded by a
+timestamped backup — the last 10 are kept next to the config file.
 
 ## The honest cost note (read this)
 
@@ -510,7 +524,7 @@ Without `OLLAMA_API_KEY` the suite is **skipped**, so it never runs in CI or the
 
 ```bash
 npm test          # vitest run — fast, offline, no key, no network (live smoke is skipped)
-npm run typecheck # tsc --noEmit
+npm run typecheck # tsc --noEmit over src/ and test/ (two projects)
 ```
 
 The unit/integration suite uses a mock upstream (intercepted `fetch`); it covers config validation, routing, capability parsing, every strategy, the tool gate, the vision gate, and smart routing. The live smoke test is the only one that touches the network, and only with a key.

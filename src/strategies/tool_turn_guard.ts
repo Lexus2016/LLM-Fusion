@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { TextEncoder as NodeTextEncoder } from "node:util";
 import type { ChatCompletionResult, StrategyContext } from "../types";
 import type { Resilience } from "../concurrency";
 import { extractAnswer, stripThinkingTags } from "../reasoning";
@@ -288,7 +289,7 @@ async function streamRetryToolTurn(
   originalBody: Record<string, unknown>,
   reason: "empty" | "intent_tail" | "broken_tool_call" | "upstream_cut",
   controller: SseSink,
-  encoder: TextEncoder,
+  encoder: NodeTextEncoder,
 ): Promise<boolean> {
   const body = appendToolTurnNudge({ ...originalBody, model: target }, true);
   ctx.logger.warn(
@@ -1197,7 +1198,7 @@ async function runStreamingRecoveryWithKeepalive(
   originalBody: Record<string, unknown>,
   incomplete: "empty" | "intent_tail" | "broken_tool_call" | "upstream_cut",
   controller: SseSink,
-  encoder: TextEncoder,
+  encoder: NodeTextEncoder,
 ): Promise<boolean> {
   const envPing = Number(process.env.SINGLE_TOOLTURN_RECOVERY_PING_MS ?? "");
   const pingMs = Number.isFinite(envPing) && envPing > 0 ? envPing : 5_000;

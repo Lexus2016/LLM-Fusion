@@ -31,7 +31,7 @@ OpenCode shortcut: `./bin/fusion-opencode fusion-coder` (starts the proxy + wire
 
 ## Develop it (conventions)
 
-- **Verify before claiming done.** `npm test` (vitest, offline mock upstream — no key, no network) and `npm run typecheck` (`tsc --noEmit`) must both pass.
+- **Verify before claiming done.** `npm test` (vitest, offline mock upstream — no key, no network) and `npm run typecheck` (two projects: `tsconfig.json` for `src/`, `tsconfig.test.json` for `test/` — a bare `tsc --noEmit` silently skips the tests) must both pass.
 - **Live checks** that hit the real API run only with a key: `npm run smoke`.
 - **No build step / no `dist`.** Edit `src/*.ts`; `tsx` runs them directly. Do not add a compile step.
 - **Avoid typecasting.** No `as` casts in new TypeScript — fix the types at the source where practical (some legacy casts remain, e.g. in `src/strategies/fusion.ts`; don't add more).

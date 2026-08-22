@@ -187,7 +187,7 @@ export const PANEL_HTML = `<!doctype html>
   .sw.on{background:var(--accent)} .sw.on:after{left:23px}
   .fld.toggle:focus-visible{outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-bg)}
   .rows{display:flex; flex-direction:column; gap:6px}
-  .kv{display:flex; gap:6px} .kv input{flex:1}
+  .kv{display:flex; gap:6px} .kv input, .kv select{flex:1} .kv .k1{flex:2}
   .tags{display:flex; flex-wrap:wrap; gap:6px; align-items:center}
   .tag{display:inline-flex; align-items:center; gap:6px; background:var(--panel-2); border:1px solid var(--line-2); border-radius:7px; padding:3px 4px 3px 9px; font-size:12.5px; font-family:var(--mono)}
   .tag button{border:none;background:none;color:var(--muted);cursor:pointer;font-size:14px;line-height:1;padding:0 2px}
@@ -484,12 +484,68 @@ export const PANEL_HTML = `<!doctype html>
       add.appendChild(inp); add.appendChild(b); box.appendChild(add); }
     draw(); f.appendChild(box); f._get=function(){ return vals.slice(); };
     f._setSuggest=function(list){ sugg=(list||[]).slice(); if(curFill) curFill(sugg); }; return f; }
-  function fKV(label, hint, obj){ var f=fld(label,hint); var wrap=el("div","rows"); var pairs=Object.keys(obj||{}).map(function(k){ return [k,obj[k]]; });
+  function fKV(label, hint, obj){ var f=fld(label,hint); var wrap=el("div","rows"); var pairs=Object.keys(obj||{}).map(function(k){ return [k,String(obj[k]),obj[k]]; });
     function draw(){ wrap.textContent=""; pairs.forEach(function(p,i){ var row=el("div","kv"); var k=el("input"); k.type="text"; k.className="mono"; k.placeholder="from"; k.setAttribute("aria-label",label+" key"); k.value=p[0]; var v=el("input"); v.type="text"; v.className="mono"; v.placeholder="to"; v.setAttribute("aria-label",label+" value"); v.value=p[1];
       k.oninput=function(){ p[0]=k.value; }; v.oninput=function(){ p[1]=v.value; }; var x=el("button","act",""); x.type="button"; x.textContent="×"; x.onclick=function(){ pairs.splice(i,1); draw(); };
       row.appendChild(k); row.appendChild(v); row.appendChild(x); wrap.appendChild(row); });
-      var add=el("button","act",""); add.type="button"; add.textContent="+ Add mapping"; add.onclick=function(){ pairs.push(["",""]); draw(); }; wrap.appendChild(add); }
-    draw(); f.appendChild(wrap); f._get=function(){ var o={}; pairs.forEach(function(p){ if(p[0].trim()) o[p[0].trim()]=p[1].trim(); }); return o; }; return f; }
+      var add=el("button","act",""); add.type="button"; add.textContent="+ Add mapping"; add.onclick=function(){ pairs.push(["","",undefined]); draw(); }; wrap.appendChild(add); }
+    // A pair the operator never touched keeps its ORIGINAL value and type (a bare
+    // string form would silently turn e.g. request_overrides:{think:false} into
+    // {think:"false"} the moment any OTHER field on the same form is edited).
+    draw(); f.appendChild(wrap); f._get=function(){ var o={}; pairs.forEach(function(p){ var k=p[0].trim(); if(!k) return; var vs=p[1].trim(); o[k]=(vs===String(p[2]))?p[2]:vs; }); return o; }; return f; }
+  // model id -> {input_per_mtok, output_per_mtok}. A three-column cousin of fKV;
+  // pricing is the only place that needs two values per key. _get() returns the
+  // RAW string rows so the caller can report which cell is bad by name.
+  function fPricing(label, hint, obj){ var f=fld(label,hint); var wrap=el("div","rows");
+    var rows=Object.keys(obj||{}).map(function(k){ var e=obj[k]||{};
+      return [k, e.input_per_mtok==null?"":String(e.input_per_mtok), e.output_per_mtok==null?"":String(e.output_per_mtok)]; });
+    function cell(p, idx, ph, aria, cls){ var n=el("input"); n.type="text"; n.className=cls; n.placeholder=ph; n.setAttribute("aria-label",aria); n.value=p[idx];
+      n.oninput=function(){ p[idx]=n.value; }; return n; }
+    function draw(){ wrap.textContent="";
+      rows.forEach(function(p,i){ var row=el("div","kv");
+        row.appendChild(cell(p,0,"upstream model id","Priced model","mono k1"));
+        row.appendChild(cell(p,1,"in $/Mtok","Input price per million tokens","mono num"));
+        row.appendChild(cell(p,2,"out $/Mtok","Output price per million tokens","mono num"));
+        var x=el("button","act",""); x.type="button"; x.textContent="×"; x.setAttribute("aria-label","Remove pricing row"); x.onclick=function(){ rows.splice(i,1); draw(); }; row.appendChild(x);
+        wrap.appendChild(row); });
+      var add=el("button","act",""); add.type="button"; add.textContent="+ Add model"; add.onclick=function(){ rows.push(["","",""]); draw(); }; wrap.appendChild(add); }
+    draw(); f.appendChild(wrap); f._get=function(){ return rows.slice(); }; return f; }
+
+  // model id -> {tools?, vision?, context?}. Each flag is TRI-STATE: "unset"
+  // omits the key entirely. This map is only consulted when /api/show discovery
+  // FAILS (see degrade() in src/capabilities.ts) -- it is a fallback, not a force.
+  function fOverrides(label, hint, obj){ var f=fld(label,hint); var wrap=el("div","rows");
+    var TRI=[{label:"unset",value:""},{label:"yes",value:"on"},{label:"no",value:"off"}];
+    var rows=Object.keys(obj||{}).map(function(k){ var e=obj[k]||{};
+      return [k, e.tools==null?"":(e.tools?"on":"off"), e.vision==null?"":(e.vision?"on":"off"), e.context==null?"":String(e.context)]; });
+    function draw(){ wrap.textContent="";
+      rows.forEach(function(p,i){ var row=el("div","kv");
+        var k=el("input"); k.type="text"; k.className="mono k1"; k.placeholder="upstream model id"; k.setAttribute("aria-label","Overridden model"); k.value=p[0];
+        k.oninput=function(){ p[0]=k.value; }; row.appendChild(k);
+        [[1,"tools"],[2,"vision"]].forEach(function(d){ var s=el("select"); s.setAttribute("aria-label",d[1]+" override");
+          TRI.forEach(function(o){ var op=el("option",null,d[1]+": "+o.label); op.value=o.value; if(o.value===p[d[0]]) op.selected=true; s.appendChild(op); });
+          s.onchange=function(){ p[d[0]]=s.value; }; row.appendChild(s); });
+        var c=el("input"); c.type="text"; c.className="mono num"; c.placeholder="context"; c.setAttribute("aria-label","Context window override"); c.value=p[3];
+        c.oninput=function(){ p[3]=c.value; }; row.appendChild(c);
+        var x=el("button","act",""); x.type="button"; x.textContent="×"; x.setAttribute("aria-label","Remove override row"); x.onclick=function(){ rows.splice(i,1); draw(); }; row.appendChild(x);
+        wrap.appendChild(row); });
+      var add=el("button","act",""); add.type="button"; add.textContent="+ Add override"; add.onclick=function(){ rows.push(["","","",""]); draw(); }; wrap.appendChild(add); }
+    draw(); f.appendChild(wrap); f._get=function(){ return rows.slice(); }; return f; }
+
+  // Raw-JSON escape hatch. Deliberately NOT merged with the form fields: two
+  // clearly separated modes, so there is never a "which one wins?" question.
+  function fJson(label, hint, value){ var f=fld(label,hint); var t=el("textarea"); t.className="mono"; t.rows=20; t.spellcheck=false;
+    t.id="fi"+(++dlSeq); if(f._label)f._label.htmlFor=t.id; if(f._hintId)t.setAttribute("aria-describedby",f._hintId);
+    t.value=JSON.stringify(value,null,2); f.appendChild(t); f._get=function(){ return t.value; }; return f; }
+  // Parse-and-hand-off. Whole-config zod validation still gates the result
+  // server-side, so this only rejects what is not even a JSON object.
+  function jsonForm(title, hint, value, onParsed){ var fJ;
+    openForm(title, function(body){ fJ=fJson("JSON", hint, value); body.appendChild(fJ); },
+      function(){ var parsed;
+        try { parsed=JSON.parse(fJ._get()); } catch(e){ formError("Invalid JSON: "+String(e.message||e)); return; }
+        if(!parsed||typeof parsed!=="object"||Array.isArray(parsed)){ formError("The top level must be a JSON object."); return; }
+        onParsed(parsed); });
+  }
 
   // Reveal/hide a container of sub-fields as a toggle flips. Layers on top of
   // fToggle's own handlers (its onclick fires first, then this), so reading the
@@ -512,6 +568,9 @@ export const PANEL_HTML = `<!doctype html>
       var r=el("div","er1"); r.appendChild(el("span","ename",id)); r.appendChild(el("span","ptype",p.type));
       var acts=el("div","eacts"); acts.appendChild(mkBtn("+ Account","act",false,function(){ accountForm(id,null); }));
       acts.appendChild(mkBtn("Edit","act",false,function(){ providerForm(id,p); }));
+      acts.appendChild(mkBtn("JSON","act",false,function(){ jsonForm("Edit provider "+id+" as JSON",
+        "The whole provider group including every account. Use this for anything the forms cannot express — accounts[].extra_headers. Header VALUES are shown masked as ••• and the server swaps the real ones back in on save; leave a mask alone to keep the stored value.", p,
+        function(o){ saveProvider(id, o, function(ok,err){ if(ok) closeForm(); else formError(err); }); }); }));
       acts.appendChild(mkBtn("Delete","act danger",false,function(){ confirmAction("Delete","Delete provider <b>"+esc(id)+"</b> and all its accounts? Models bound to it will fail to load until reassigned.",true,function(){ deleteProvider(id); }); }));
       r.appendChild(acts); c.appendChild(r);
       c.appendChild(el("div","edesc",(p.base_url||"(no base_url)")+" · "+(p.accounts?p.accounts.length:0)+" account(s)"));
@@ -564,21 +623,32 @@ export const PANEL_HTML = `<!doctype html>
     });
   }
   function accountForm(provId, existing){
-    var p=cfg.providers[provId]; var fId,fEnv,fBase,fMap,f403,fQuota;
+    var p=cfg.providers[provId]; var fId,fEnv,fBase,fTimeout,fMap,f403,fQuota;
     openForm(existing?("Edit account "+existing.id):("Add account to "+provId), function(body){
       fId=fText("Account id","Unique across ALL providers (e.g. ollama-1). Used in the monitor + controls.", existing?existing.id:"", true);
       if(existing){ fId.querySelector("input").disabled=true; }
       fEnv=fText("API key env var","Name of the environment variable holding this account's key — never the key itself (e.g. OLLAMA_API_KEY, OLLAMA_API_KEY_2).", existing?existing.api_key_env:"", true);
       fBase=fText("Base URL override (optional)","Leave blank to use the provider's base URL. Set only if this account uses a different endpoint.", existing?existing.base_url:"", true);
+      fTimeout=fNum("Request timeout override (s)","Per-request deadline for THIS account only. Blank = inherit the global upstream request timeout. Must stay below ~182s (the Ollama Cloud ceiling).", existing?existing.request_timeout_s:undefined);
       fMap=fKV("Model-id map (optional)","Map a logical model id (used in Models) to THIS provider's id — e.g. glm-5.2 → z-ai/glm-4.6. Needed when the provider names models differently than Ollama.", existing?existing.model_map:{});
       f403=fSelect("On HTTP 403","passthrough = treat as a client error (account stays healthy). down = mark the account down (some gateways use 403 for no-credits).", existing?existing.treat_403_as:"passthrough",[{label:"passthrough",value:"passthrough"},{label:"down",value:"down"}]);
       fQuota=fTags("Quota markers (optional)","Lowercase phrases in a 429 body that mean the account is OUT OF QUOTA (mark it down) rather than a brief rate-limit — e.g. insufficient, out of credit.", existing?existing.quota_markers:[]);
-      body.appendChild(fId); body.appendChild(fEnv); body.appendChild(fBase); body.appendChild(fMap); body.appendChild(f403); body.appendChild(fQuota);
+      body.appendChild(fId); body.appendChild(fEnv); body.appendChild(fBase); body.appendChild(fTimeout); body.appendChild(fMap); body.appendChild(f403); body.appendChild(fQuota);
     }, function(){
       var nid=fId._get(), env=fEnv._get(); if(!nid||!env){ formError("Account id and API key env var are required."); return; }
-      var acc={ id:nid, api_key_env:env }; var b=fBase._get(); if(b) acc.base_url=b;
-      var m=fMap._get(); if(Object.keys(m).length) acc.model_map=m; var q=fQuota._get(); if(q.length) acc.quota_markers=q;
-      var t=f403._get(); if(t!=="passthrough") acc.treat_403_as=t;
+      // MERGE-ON-SAVE (see modelForm): edit the account we LOADED so unrendered
+      // keys survive. extra_headers rides through with its values still masked
+      // as ••• — restoreExtraHeaders() on the server swaps the real ones back in.
+      var acc=existing?JSON.parse(JSON.stringify(existing)):{};
+      acc.id=nid; acc.api_key_env=env;
+      var b=fBase._get(); if(b) acc.base_url=b; else delete acc.base_url;
+      var rt=fTimeout._get();
+      if(rt===undefined) delete acc.request_timeout_s;
+      else if(isNaN(rt)){ formError("Request timeout override must be a number."); return; }
+      else acc.request_timeout_s=rt;
+      var m=fMap._get(); if(Object.keys(m).length) acc.model_map=m; else delete acc.model_map;
+      var q=fQuota._get(); if(q.length) acc.quota_markers=q; else delete acc.quota_markers;
+      var t=f403._get(); if(t!=="passthrough") acc.treat_403_as=t; else delete acc.treat_403_as;
       var accounts=(p.accounts||[]).slice(); var idx=accounts.map(function(a){return a.id;}).indexOf(nid);
       if(idx>=0) accounts[idx]=acc; else accounts.push(acc);
       var obj=Object.assign({},p,{accounts:accounts});
@@ -587,7 +657,7 @@ export const PANEL_HTML = `<!doctype html>
   }
   function deleteAccount(provId, accId){ var p=cfg.providers[provId]; var accounts=(p.accounts||[]).filter(function(a){ return a.id!==accId; });
     if(accounts.length===0){ toast("a provider must keep at least one account — delete the provider instead","err"); return; }
-    saveProvider(provId, Object.assign({},p,{accounts:accounts})); }
+    saveProvider(provId, Object.assign({},p,{accounts:accounts}), function(ok,err){ if(!ok) toast(err,"err"); }); }
   document.getElementById("add-provider").onclick=function(){ providerForm(null,null); };
 
   // ---- Models tab ----
@@ -595,12 +665,26 @@ export const PANEL_HTML = `<!doctype html>
     if(m.strategy==="failover") return "failover → "+(m.chain||[]).join(", ");
     if(m.strategy==="fusion") return "fusion · panel ["+(m.panel||[]).join(", ")+"] · judge "+m.judge+" · synth "+m.synth;
     if(m.strategy==="smart") return "smart · router "+m.router; return m.strategy; }
+  // Extras that are easy to forget exist. They live inside nested blocks, so
+  // strategySummary can't show them and an operator cannot tell from the list
+  // that a model has (say) a vision pre-stage configured.
+  function modelBadges(m){ var out=[];
+    if(m.image_describe&&m.image_describe.enabled) out.push("vision pre-stage");
+    if(m.web_search&&m.web_search.enabled) out.push("web search");
+    if(m.bineval&&m.bineval.enabled) out.push("bineval");
+    if(m.adversarial) out.push("adversarial");
+    if(m.strategy==="smart"&&m.escalate_on_tool_error===false) out.push("no escalation");
+    return out; }
   function renderModels(){
     var box=document.getElementById("models-editor"); box.textContent="";
     var models=cfg && cfg.models ? cfg.models : {}; var names=Object.keys(models); show(document.getElementById("empty-models"),names.length===0);
     names.forEach(function(name){ var m=models[name]; var c=el("div","ecard"); var r=el("div","er1");
       r.appendChild(el("span","ename",name)); r.appendChild(el("span","ptype",m.strategy)); if(m.provider) r.appendChild(el("span","badge",m.provider));
+      modelBadges(m).forEach(function(b){ r.appendChild(el("span","badge",b)); });
       var acts=el("div","eacts"); acts.appendChild(mkBtn("Edit","act",false,function(){ modelForm(name,m); }));
+      acts.appendChild(mkBtn("JSON","act",false,function(){ jsonForm("Edit model "+name+" as JSON",
+        "The whole model object. Use this for anything the form cannot express — an inline smart simple/fusion block, custom bineval questions. The config schema still validates it on save.", m,
+        function(o){ saveModel(name, o, function(ok,err){ if(ok) closeForm(); else formError(err); }); }); }));
       acts.appendChild(mkBtn("Delete","act danger",false,function(){ confirmAction("Delete","Delete model <b>"+esc(name)+"</b>? Clients using it will get 404 until re-created.",true,function(){ deleteModel(name); }); }));
       r.appendChild(acts); c.appendChild(r); c.appendChild(el("div","edesc",strategySummary(m))); box.appendChild(c); });
   }
@@ -659,18 +743,43 @@ export const PANEL_HTML = `<!doctype html>
           dyn.beThresh=fNum("Low-quality threshold","Overall score (0–1) below which the answer is flagged in the headers. Default 0.7.", be.threshold); bsub.appendChild(dyn.beThresh);
           dyn.beTimeout=fNum("Eval timeout (s)","Per-evaluation deadline. Blank = use the judge timeout.", be.timeout_s); bsub.appendChild(dyn.beTimeout);
           h.appendChild(bsub); bindReveal(dyn.bineval, bsub);
-          addPromote(h, ex); addOverrides(h, ex);
+          // Vision pre-stage. Each image_url block is described ONCE by a
+          // multimodal model and replaced in place with that text, so no panel
+          // member needs vision at all. All-or-nothing: any describer failure
+          // falls the whole request back to the legacy per-member vision gate.
+          var idc=(ex&&ex.image_describe)||{};
+          dyn.imgDesc=fToggle("Image description (vision pre-stage)","Describe every image once with a multimodal model and splice that text into the prompt, so text-only panel members can still answer. On any describer failure the whole request falls back to the per-member vision gate.", !!idc.enabled); h.appendChild(dyn.imgDesc);
+          var isub=subGroup();
+          dyn.idModel=fText("Describer model","A multimodal model that turns each image into text (e.g. minimax-m3). Required while this is on.", idc.model, true, up); isub.appendChild(dyn.idModel);
+          dyn.idChars=fNum("Max description chars","Cap on one image's description before it is truncated. Default 12000.", idc.max_chars); isub.appendChild(dyn.idChars);
+          dyn.idTimeout=fNum("Describe timeout (s)","Per-image deadline; must stay below 182. Default 60.", idc.timeout_s); isub.appendChild(dyn.idTimeout);
+          h.appendChild(isub); bindReveal(dyn.imgDesc, isub);
+          // NO addOverrides() here: FusionModelSchema is .strict() and has no
+          // request_overrides — the fusion strategy ignores it. The synth-only
+          // control below is the real one.
+          addPromote(h, ex);
           // Synth-only overrides (e.g. reasoning_effort → none): kept DISTINCT from
           // request_overrides, which the fusion strategy ignores. Without this control
           // a panel save would silently wipe synth_request_overrides (same round-trip
           // class as the web_search/bineval fix in v0.1.32) and re-open the synth leak.
-          dyn.synthOverrides=fKV("Synth request overrides (optional)","Extra request-body fields sent upstream to the SYNTH stage only, e.g. reasoning_effort → none (stops the synth from leaking its reasoning). Panel & judge are unaffected.", (ex&&ex.synth_request_overrides)||{}); h.appendChild(dyn.synthOverrides);
+          dyn.synthOverrides=fKV("Synth request overrides (optional)","Extra request-body fields sent upstream to the SYNTH stage only, e.g. reasoning_effort → none (stops the synth from leaking its reasoning). Panel & judge are unaffected. A value you edit is sent as text; one you leave alone keeps its original type.", (ex&&ex.synth_request_overrides)||{}); h.appendChild(dyn.synthOverrides);
         }
         else if(strat==="smart"){
           dyn.router=fText("Router model","A fast model that classifies each request as simple vs deep (needs reliable JSON). Pick from the provider's list.", ex&&ex.router, true, up); h.appendChild(dyn.router);
           dyn.def=fSelect("Default route","Used when the router is unsure or errors.", ex?ex.default:"simple",[{label:"simple",value:"simple"},{label:"fusion",value:"fusion"}]); h.appendChild(dyn.def);
-          dyn.simple=fText("Simple route","Name of a single/failover model to use for cheap steps (a model from the Models list).", ex&&typeof ex.simple==="string"?ex.simple:"", true, virt); h.appendChild(dyn.simple);
-          dyn.fusion=fText("Fusion route","Name of a fusion model to use for deep steps (must be in the same provider group).", ex&&typeof ex.fusion==="string"?ex.fusion:"", true, virt); h.appendChild(dyn.fusion);
+          dyn.escalate=fToggle("Escalate on tool error","On: if the simple route's tool call fails, retry that step on the fusion route. Off: surface the failure to the client.", ex?(ex.escalate_on_tool_error==null?true:!!ex.escalate_on_tool_error):true); h.appendChild(dyn.escalate);
+          // simple/fusion accept either a model NAME or an INLINE block. The form
+          // only edits names; an inline block is shown read-only and rides through
+          // the save untouched (merge-on-save already carries it on "obj").
+          var sInline=!!(ex&&ex.simple&&typeof ex.simple==="object");
+          var fInline=!!(ex&&ex.fusion&&typeof ex.fusion==="object");
+          var INLINE_HINT=' Defined INLINE in fusion.yaml — open the model card\\'s "JSON" button to edit it. Saving this form leaves the block as-is.';
+          dyn.simple=fText("Simple route", sInline?INLINE_HINT:"Name of a single/failover model to use for cheap steps (a model from the Models list).", sInline?"":(ex&&typeof ex.simple==="string"?ex.simple:""), true, virt);
+          if(sInline){ var si=dyn.simple.querySelector("input"); si.disabled=true; si.placeholder="(inline block)"; }
+          h.appendChild(dyn.simple);
+          dyn.fusion=fText("Fusion route", fInline?INLINE_HINT:"Name of a fusion model to use for deep steps (must be in the same provider group).", fInline?"":(ex&&typeof ex.fusion==="string"?ex.fusion:""), true, virt);
+          if(fInline){ var fi=dyn.fusion.querySelector("input"); fi.disabled=true; fi.placeholder="(inline block)"; }
+          h.appendChild(dyn.fusion);
         }
       }
       // Per-model override of the global promote_reasoning_to_content. Tri-state:
@@ -678,37 +787,63 @@ export const PANEL_HTML = `<!doctype html>
       function addPromote(h, ex){ var v=(ex&&ex.promote_reasoning_to_content); dyn.promote=fSelect("Promote reasoning to content","Normalize a reasoning-only reply so plain clients see the answer. inherit = use the global default.", v==null?"inherit":(v?"on":"off"),[{label:"inherit (global default)",value:"inherit"},{label:"on",value:"on"},{label:"off",value:"off"}]); h.appendChild(dyn.promote); }
       // Extra request-body fields merged into every upstream call for this model
       // (e.g. reasoning_effort → none). Core keys are protected server-side.
-      function addOverrides(h, ex){ dyn.overrides=fKV("Request overrides (optional)","Extra request-body fields sent upstream for this model, e.g. reasoning_effort → none. Values are sent as strings.", (ex&&ex.request_overrides)||{}); h.appendChild(dyn.overrides); }
+      function addOverrides(h, ex){ dyn.overrides=fKV("Request overrides (optional)","Extra request-body fields sent upstream for this model, e.g. reasoning_effort → none. A value you edit is sent as text; one you leave alone keeps its original type.", (ex&&ex.request_overrides)||{}); h.appendChild(dyn.overrides); }
     }, function(){
       var nm=fName._get(); if(!nm){ formError("Model name is required."); return; }
-      var strat=fStrat._get(); var obj={ strategy:strat }; var prov=fProv._get(); if(prov) obj.provider=prov;
+      var strat=fStrat._get();
+      // MERGE-ON-SAVE: start from the model we LOADED, so a key this form does
+      // not render (image_describe, or whatever the schema grows next) rides
+      // along instead of being silently deleted from fusion.yaml. Rebuilding
+      // from scratch is what lost web_search/bineval in v0.1.32 — same class.
+      // A strategy SWITCH starts clean: ModelSchema is a .strict() discriminated
+      // union, so the previous strategy's keys would be rejected outright.
+      // The trade: every optional control must now DELETE its key explicitly.
+      var obj=(existing&&existing.strategy===strat)?JSON.parse(JSON.stringify(existing)):{};
+      obj.strategy=strat;
+      var prov=fProv._get(); if(prov) obj.provider=prov; else delete obj.provider;
       // Collect the per-model promote override (tri-state) + request_overrides onto obj.
-      function applyCommon(o){ if(dyn.promote){ var pv=dyn.promote._get(); if(pv==="on") o.promote_reasoning_to_content=true; else if(pv==="off") o.promote_reasoning_to_content=false; }
-        if(dyn.overrides){ var ov=dyn.overrides._get(); if(Object.keys(ov).length) o.request_overrides=ov; } }
+      function applyCommon(o){ if(dyn.promote){ var pv=dyn.promote._get(); if(pv==="on") o.promote_reasoning_to_content=true; else if(pv==="off") o.promote_reasoning_to_content=false; else delete o.promote_reasoning_to_content; }
+        if(dyn.overrides){ var ov=dyn.overrides._get(); if(Object.keys(ov).length) o.request_overrides=ov; else delete o.request_overrides; } }
       if(strat==="single"){ var t=dyn.target._get(); if(!t){ formError("Target model is required."); return; } obj.target=t; applyCommon(obj); }
       else if(strat==="failover"){ var ch=dyn.chain._get(); if(!ch.length){ formError("Add at least one model to the chain."); return; } obj.chain=ch; applyCommon(obj); }
       else if(strat==="fusion"){ var panel=dyn.panel._get(); if(panel.length<1){ formError("Add at least one panel member."); return; }
         var judge=dyn.judge._get(), synth=dyn.synth._get(); if(!judge||!synth){ formError("Judge and Synthesizer are required."); return; }
-        obj.panel=panel; obj.judge=judge; obj.synth=synth; var adv=dyn.adv._get(); if(adv) obj.adversarial=adv;
-        obj.tool_mode=dyn.tool._get(); if(dyn.planOnly._get()) obj.fusion_planning_turn_only=true;
+        obj.panel=panel; obj.judge=judge; obj.synth=synth; var adv=dyn.adv._get(); if(adv) obj.adversarial=adv; else delete obj.adversarial;
+        obj.tool_mode=dyn.tool._get(); if(dyn.planOnly._get()) obj.fusion_planning_turn_only=true; else delete obj.fusion_planning_turn_only;
         if(dyn.web._get()){ var ws={ enabled:true };
           var wm=dyn.wsMax._get(); if(wm!==undefined){ if(isNaN(wm)){ formError("Web search max results must be a number."); return; } ws.max_results=wm; }
           var wt=dyn.wsTimeout._get(); if(wt!==undefined){ if(isNaN(wt)){ formError("Web search timeout must be a number."); return; } ws.timeout_s=wt; }
           var wc=dyn.wsCtx._get(); if(wc!==undefined){ if(isNaN(wc)){ formError("Web search max context chars must be a number."); return; } ws.max_context_chars=wc; }
           var wp=dyn.wsPrompt._get(); if(wp!==undefined){ if(isNaN(wp)){ formError("Web search prompt cap must be a number."); return; } ws.max_prompt_chars=wp; }
           obj.web_search=ws; }
+        else delete obj.web_search;
         if(dyn.bineval._get()){ var be={ enabled:true };
           var bm=dyn.beModel._get(); if(bm) be.model=bm;
           var bth=dyn.beThresh._get(); if(bth!==undefined){ if(isNaN(bth)){ formError("BinEval threshold must be a number."); return; } be.threshold=bth; }
           var bto=dyn.beTimeout._get(); if(bto!==undefined){ if(isNaN(bto)){ formError("BinEval timeout must be a number."); return; } be.timeout_s=bto; }
           if(existing&&existing.bineval&&existing.bineval.dimensions) be.dimensions=existing.bineval.dimensions; // preserve custom questions
           obj.bineval=be; }
-        if(dyn.synthOverrides){ var so=dyn.synthOverrides._get(); if(Object.keys(so).length) obj.synth_request_overrides=so; }
+        else delete obj.bineval;
+        if(dyn.imgDesc._get()){ var idm=dyn.idModel._get(); if(!idm){ formError("A describer model is required when image description is on."); return; }
+          var idobj={ enabled:true, model:idm };
+          var idc2=dyn.idChars._get(); if(idc2!==undefined){ if(isNaN(idc2)){ formError("Max description chars must be a number."); return; } idobj.max_chars=idc2; }
+          var idt=dyn.idTimeout._get(); if(idt!==undefined){ if(isNaN(idt)){ formError("Describe timeout must be a number."); return; } idobj.timeout_s=idt; }
+          obj.image_describe=idobj; }
+        else delete obj.image_describe;
+        if(dyn.synthOverrides){ var so=dyn.synthOverrides._get(); if(Object.keys(so).length) obj.synth_request_overrides=so; else delete obj.synth_request_overrides; }
         applyCommon(obj);
       }
       else if(strat==="smart"){ var router=dyn.router._get(); if(!router){ formError("Router model is required."); return; }
-        obj.router=router; obj.default=dyn.def._get(); var s=dyn.simple._get(), fu=dyn.fusion._get();
-        if(!s||!fu){ formError("Simple and Fusion route model names are required."); return; } obj.simple=s; obj.fusion=fu;
+        obj.router=router; obj.default=dyn.def._get();
+        // "true" is the schema default — omit it so the YAML stays minimal, and
+        // only write the key when the operator turns escalation OFF.
+        if(dyn.escalate._get()) delete obj.escalate_on_tool_error; else obj.escalate_on_tool_error=false;
+        // A blank input is only acceptable when "obj" already carries an INLINE
+        // block for that route (merge-on-save kept it); otherwise a name is required.
+        var s=dyn.simple._get(); if(s) obj.simple=s;
+        else if(!obj.simple||typeof obj.simple!=="object"){ formError("Simple route model name is required."); return; }
+        var fu=dyn.fusion._get(); if(fu) obj.fusion=fu;
+        else if(!obj.fusion||typeof obj.fusion!=="object"){ formError("Fusion route model name is required."); return; }
       }
       saveModel(nm, obj, function(ok,err){ if(ok) closeForm(); else formError(err); });
     });
@@ -725,7 +860,7 @@ export const PANEL_HTML = `<!doctype html>
     var acts=el("div","eacts"); acts.appendChild(mkBtn("Edit","act",false,onEdit)); r.appendChild(acts); c.appendChild(r);
     c.appendChild(el("div","edesc",desc)); return c; }
   function renderSettings(){ var box=document.getElementById("settings-editor"); box.textContent=""; if(!cfg) return;
-    var sv=cfg.server||{}, up=cfg.upstream||{}, df=cfg.defaults||{};
+    var sv=cfg.server||{}, up=cfg.upstream||{}, df=cfg.defaults||{}, pr=cfg.pricing||{}, ov=cfg.overrides||{};
     box.appendChild(settingsCard("Server",
       "Listen on "+esc(sv.bind||"127.0.0.1")+":"+(sv.port||8080)+(sv.auth_token_env?(" · client auth "+esc(sv.auth_token_env)):" · no client auth")+(sv.admin_token_env?(" · admin token "+esc(sv.admin_token_env)):""),
       function(){ serverForm(sv); }, true));
@@ -735,6 +870,14 @@ export const PANEL_HTML = `<!doctype html>
     box.appendChild(settingsCard("Fusion defaults",
       "panel timeout "+(df.panel_member_timeout_s==null?90:df.panel_member_timeout_s)+"s · judge "+(df.judge_timeout_s==null?60:df.judge_timeout_s)+"s · min panel success "+(df.min_panel_success==null?1:df.min_panel_success),
       function(){ defaultsForm(df); }, false));
+    var prCount=Object.keys(pr).length;
+    box.appendChild(settingsCard("Model pricing",
+      prCount?(prCount+" model(s) priced · "+Object.keys(pr).slice(0,3).map(esc).join(", ")+(prCount>3?", …":"")):"no prices set — cost_usd stays null",
+      function(){ pricingForm(pr); }, false));
+    var ovCount=Object.keys(ov).length;
+    box.appendChild(settingsCard("Capability overrides",
+      ovCount?(ovCount+" model(s) with a discovery fallback · "+Object.keys(ov).slice(0,3).map(esc).join(", ")+(ovCount>3?", …":"")):"none — discovery failures fall back to tools: yes, vision: no",
+      function(){ overridesForm(ov); }, false));
   }
   function serverForm(sv){ var fBind,fPort,fAuth,fAdmin;
     openForm("Edit server settings", function(body){
@@ -751,7 +894,7 @@ export const PANEL_HTML = `<!doctype html>
       saveSettings("server", obj, function(ok,err){ if(ok) closeForm(); else formError(err); });
     });
   }
-  function upstreamForm(up){ var fMode,fConc,fTimeout,fCool,fRecheck,fPerDef;
+  function upstreamForm(up){ var fMode,fConc,fTimeout,fCool,fRecheck,fPerDef,fPerModel;
     openForm("Edit upstream settings", function(body){
       var note=el("div","hint"); note.style.margin="0 2px 14px"; note.textContent="Concurrency and timeouts are read at boot — restart to apply. base_url / API keys live under Providers."; body.appendChild(note);
       fMode=fSelect("API mode","auto = detect per provider. openai = force the /v1 OpenAI shape. native = force the Ollama /api shape.", up.api_mode||"auto",[{label:"auto",value:"auto"},{label:"openai",value:"openai"},{label:"native",value:"native"}]);
@@ -760,15 +903,22 @@ export const PANEL_HTML = `<!doctype html>
       fCool=fNum("Connector cooldown (s)","How long a connector rests after a soft failure (rate-limit/5xx/timeout) before it is probed again. Default 60.", up.connector_cooldown_s==null?60:up.connector_cooldown_s);
       fRecheck=fNum("Connector down recheck (s)","How long a connector stays down after a HARD failure (auth/quota) before an automatic probe. 0 = never auto-probe (manual reset only). Default 900.", up.connector_down_recheck_s==null?900:up.connector_down_recheck_s);
       fPerDef=fNum("Per-model concurrency default (optional)","Default budget applied to each model's own gate. Blank = a model may use the full global budget.", up.per_model_concurrency_default);
-      body.appendChild(fMode); body.appendChild(fConc); body.appendChild(fTimeout); body.appendChild(fCool); body.appendChild(fRecheck); body.appendChild(fPerDef);
+      fPerModel=fKV("Per-model concurrency (optional)","A per-model budget that overrides the default above, e.g. deepseek-v4-pro → 5. Each value must be a whole number above 0. Models not listed use the default.", up.per_model_concurrency||{});
+      body.appendChild(fMode); body.appendChild(fConc); body.appendChild(fTimeout); body.appendChild(fCool); body.appendChild(fRecheck); body.appendChild(fPerDef); body.appendChild(fPerModel);
     }, function(){
-      var obj=Object.assign({},up); // preserve base_url/api_key_env/per_model_concurrency the form doesn't edit
+      var obj=Object.assign({},up); // preserve base_url/api_key_env the form doesn't edit
       obj.api_mode=fMode._get();
       var conc=fConc._get(); if(conc===undefined||isNaN(conc)){ formError("Max concurrency is required and must be a number."); return; } obj.max_concurrency=conc;
       var to=fTimeout._get(); if(to===undefined||isNaN(to)){ formError("Request timeout is required and must be a number."); return; } obj.request_timeout_s=to;
       var cool=fCool._get(); if(cool===undefined||isNaN(cool)){ formError("Connector cooldown is required and must be a number."); return; } obj.connector_cooldown_s=cool;
       var rc=fRecheck._get(); if(rc===undefined||isNaN(rc)){ formError("Connector down recheck is required and must be a number."); return; } obj.connector_down_recheck_s=rc;
       var pd=fPerDef._get(); if(pd===undefined) delete obj.per_model_concurrency_default; else if(isNaN(pd)){ formError("Per-model concurrency default must be a number."); return; } else obj.per_model_concurrency_default=pd;
+      // fKV yields a string for an edited row and the original value for an
+      // untouched one; the schema wants positive integers either way.
+      var pmRaw=fPerModel._get(); var pm={}; var pmBad=null;
+      Object.keys(pmRaw).forEach(function(k){ var n=Number(pmRaw[k]); if(pmRaw[k]===""||!isFinite(n)||n<1||n!==Math.floor(n)) pmBad=k; else pm[k]=n; });
+      if(pmBad){ formError("Per-model concurrency for '"+pmBad+"' must be a number."); return; }
+      if(Object.keys(pm).length) obj.per_model_concurrency=pm; else delete obj.per_model_concurrency;
       saveSettings("upstream", obj, function(ok,err){ if(ok) closeForm(); else formError(err); });
     });
   }
@@ -788,6 +938,41 @@ export const PANEL_HTML = `<!doctype html>
       var m=fMin._get(); if(m===undefined||isNaN(m)){ formError("Min panel success is required and must be a number."); return; } obj.min_panel_success=m;
       obj.promote_reasoning_to_content=fPromote._get();
       saveSettings("defaults", obj, function(ok,err){ if(ok) closeForm(); else formError(err); });
+    });
+  }
+  function pricingForm(pr){ var fRows;
+    openForm("Edit model pricing", function(body){
+      var note=el("div","hint"); note.style.margin="0 2px 14px";
+      note.textContent="Keyed by the REAL upstream model id (glm-5.2), not the virtual model name (fusion-coder). Prices are USD per million tokens and only feed the cost figures in logs and response headers — they never affect routing.";
+      body.appendChild(note);
+      fRows=fPricing("Prices","One row per model. Both columns are required; use 0 for a free model.", pr);
+      body.appendChild(fRows);
+    }, function(){
+      var out={}, rs=fRows._get();
+      for(var i=0;i<rs.length;i++){ var r=rs[i], k=r[0].trim(); if(!k) continue;
+        var vin=Number(r[1]), vout=Number(r[2]);
+        if(r[1].trim()===""||!isFinite(vin)||vin<0){ formError("Input price for '"+k+"' must be a number of 0 or more."); return; }
+        if(r[2].trim()===""||!isFinite(vout)||vout<0){ formError("Output price for '"+k+"' must be a number of 0 or more."); return; }
+        out[k]={ input_per_mtok:vin, output_per_mtok:vout }; }
+      saveSettings("pricing", out, function(ok,err){ if(ok) closeForm(); else formError(err); });
+    });
+  }
+  function overridesForm(ov){ var fRows;
+    openForm("Edit capability overrides", function(body){
+      var note=el("div","hint"); note.style.margin="0 2px 14px";
+      note.textContent="A FALLBACK, not a force: these values are used only when capability discovery (/api/show) fails for that model. While discovery works, the discovered capabilities win. Keyed by the REAL upstream model id. Leave a flag on 'unset' to fall through to the conservative default (tools: yes, vision: no, context: unknown).";
+      body.appendChild(note);
+      fRows=fOverrides("Overrides","One row per model. Context is the window in tokens; leave it blank to keep it unknown.", ov);
+      body.appendChild(fRows);
+    }, function(){
+      var out={}, rs=fRows._get();
+      for(var i=0;i<rs.length;i++){ var r=rs[i], k=r[0].trim(); if(!k) continue; var e={};
+        if(r[1]) e.tools=(r[1]==="on");
+        if(r[2]) e.vision=(r[2]==="on");
+        var cv=r[3].trim();
+        if(cv!==""){ var n=Number(cv); if(!isFinite(n)||n!==Math.floor(n)){ formError("Context for '"+k+"' must be a whole number of tokens."); return; } e.context=n; }
+        out[k]=e; }
+      saveSettings("overrides", out, function(ok,err){ if(ok) closeForm(); else formError(err); });
     });
   }
   document.getElementById("restart-btn").onclick=function(){

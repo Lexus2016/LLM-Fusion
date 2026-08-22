@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
+import type { TextEncoder as NodeTextEncoder } from "node:util";
 import type {
   ChatCompletionRequest,
   ChatCompletionResult,
@@ -2147,7 +2148,7 @@ async function runRecoveryWithKeepalive(
   opts: { native: boolean; fallbackSynth?: string | null },
   incomplete: SynthRetryReason,
   controller: TransformStreamDefaultController<Uint8Array>,
-  encoder: TextEncoder,
+  encoder: NodeTextEncoder,
 ): Promise<unknown | null> {
   // 5s default: comfortably under common intermediary idle timeouts (nginx 60s,
   // Cloudflare ~100s, undici bodyTimeout 300s) with margin for stricter setups.
