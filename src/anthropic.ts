@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
+import type { Transformer } from "node:stream/web";
 import type { Logger } from "pino";
 import type { Config } from "./config";
 import type {
