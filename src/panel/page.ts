@@ -670,6 +670,17 @@ export const PANEL_HTML = `<!doctype html>
           dyn.beThresh=fNum("Low-quality threshold","Overall score (0–1) below which the answer is flagged in the headers. Default 0.7.", be.threshold); bsub.appendChild(dyn.beThresh);
           dyn.beTimeout=fNum("Eval timeout (s)","Per-evaluation deadline. Blank = use the judge timeout.", be.timeout_s); bsub.appendChild(dyn.beTimeout);
           h.appendChild(bsub); bindReveal(dyn.bineval, bsub);
+          // Vision pre-stage. Each image_url block is described ONCE by a
+          // multimodal model and replaced in place with that text, so no panel
+          // member needs vision at all. All-or-nothing: any describer failure
+          // falls the whole request back to the legacy per-member vision gate.
+          var idc=(ex&&ex.image_describe)||{};
+          dyn.imgDesc=fToggle("Image description (vision pre-stage)","Describe every image once with a multimodal model and splice that text into the prompt, so text-only panel members can still answer. On any describer failure the whole request falls back to the per-member vision gate.", !!idc.enabled); h.appendChild(dyn.imgDesc);
+          var isub=subGroup();
+          dyn.idModel=fText("Describer model","A multimodal model that turns each image into text (e.g. minimax-m3). Required while this is on.", idc.model, true, up); isub.appendChild(dyn.idModel);
+          dyn.idChars=fNum("Max description chars","Cap on one image's description before it is truncated. Default 12000.", idc.max_chars); isub.appendChild(dyn.idChars);
+          dyn.idTimeout=fNum("Describe timeout (s)","Per-image deadline; must stay below 182. Default 60.", idc.timeout_s); isub.appendChild(dyn.idTimeout);
+          h.appendChild(isub); bindReveal(dyn.imgDesc, isub);
           // NO addOverrides() here: FusionModelSchema is .strict() and has no
           // request_overrides — the fusion strategy ignores it. The synth-only
           // control below is the real one.
@@ -729,6 +740,12 @@ export const PANEL_HTML = `<!doctype html>
           if(existing&&existing.bineval&&existing.bineval.dimensions) be.dimensions=existing.bineval.dimensions; // preserve custom questions
           obj.bineval=be; }
         else delete obj.bineval;
+        if(dyn.imgDesc._get()){ var idm=dyn.idModel._get(); if(!idm){ formError("A describer model is required when image description is on."); return; }
+          var idobj={ enabled:true, model:idm };
+          var idc2=dyn.idChars._get(); if(idc2!==undefined){ if(isNaN(idc2)){ formError("Max description chars must be a number."); return; } idobj.max_chars=idc2; }
+          var idt=dyn.idTimeout._get(); if(idt!==undefined){ if(isNaN(idt)){ formError("Describe timeout must be a number."); return; } idobj.timeout_s=idt; }
+          obj.image_describe=idobj; }
+        else delete obj.image_describe;
         if(dyn.synthOverrides){ var so=dyn.synthOverrides._get(); if(Object.keys(so).length) obj.synth_request_overrides=so; else delete obj.synth_request_overrides; }
         applyCommon(obj);
       }

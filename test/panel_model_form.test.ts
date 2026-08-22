@@ -8,6 +8,8 @@ import {
   setInput,
   clickToggle,
   hasField,
+  input,
+  formError,
   type Panel,
 } from "./panel_dom";
 
@@ -107,5 +109,41 @@ describe("model form round-trip", () => {
     await openModelForm(panel, "fusion-coder");
     setSelect("Strategy", "single");
     expect(hasField("Request overrides (optional)")).toBe(true);
+  });
+
+  it("edits image_describe through the form", async () => {
+    panel = await mountPanel(CFG);
+    await openModelForm(panel, "fusion-coder");
+    expect(input("Describer model").value).toBe("minimax-m3");
+    setInput("Max description chars", "8000");
+    saveForm();
+    await panel.flush();
+
+    expect(lastPut(panel).body).toMatchObject({
+      image_describe: { enabled: true, model: "minimax-m3", max_chars: 8000, timeout_s: 60 },
+    });
+  });
+
+  it("deletes image_describe when the toggle goes off", async () => {
+    panel = await mountPanel(CFG);
+    await openModelForm(panel, "fusion-coder");
+    clickToggle("Image description (vision pre-stage)");
+    saveForm();
+    await panel.flush();
+
+    expect(lastPut(panel).body).not.toHaveProperty("image_describe");
+  });
+
+  it("requires a describer model when enabled", async () => {
+    const noDesc = JSON.parse(JSON.stringify(CFG));
+    delete noDesc.models["fusion-coder"].image_describe;
+    panel = await mountPanel(noDesc);
+    await openModelForm(panel, "fusion-coder");
+    clickToggle("Image description (vision pre-stage)");
+    saveForm();
+    await panel.flush();
+
+    expect(formError()).toContain("describer model is required");
+    expect(panel.sent.filter((r) => r.method === "PUT")).toHaveLength(0);
   });
 });
