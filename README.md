@@ -524,7 +524,7 @@ Without `OLLAMA_API_KEY` the suite is **skipped**, so it never runs in CI or the
 
 ```bash
 npm test          # vitest run — fast, offline, no key, no network (live smoke is skipped)
-npm run typecheck # tsc --noEmit
+npm run typecheck # tsc --noEmit over src/ and test/ (two projects)
 ```
 
 The unit/integration suite uses a mock upstream (intercepted `fetch`); it covers config validation, routing, capability parsing, every strategy, the tool gate, the vision gate, and smart routing. The live smoke test is the only one that touches the network, and only with a key.

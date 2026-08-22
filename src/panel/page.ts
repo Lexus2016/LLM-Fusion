@@ -913,7 +913,8 @@ export const PANEL_HTML = `<!doctype html>
       var cool=fCool._get(); if(cool===undefined||isNaN(cool)){ formError("Connector cooldown is required and must be a number."); return; } obj.connector_cooldown_s=cool;
       var rc=fRecheck._get(); if(rc===undefined||isNaN(rc)){ formError("Connector down recheck is required and must be a number."); return; } obj.connector_down_recheck_s=rc;
       var pd=fPerDef._get(); if(pd===undefined) delete obj.per_model_concurrency_default; else if(isNaN(pd)){ formError("Per-model concurrency default must be a number."); return; } else obj.per_model_concurrency_default=pd;
-      // fKV yields strings; the schema wants positive integers.
+      // fKV yields a string for an edited row and the original value for an
+      // untouched one; the schema wants positive integers either way.
       var pmRaw=fPerModel._get(); var pm={}; var pmBad=null;
       Object.keys(pmRaw).forEach(function(k){ var n=Number(pmRaw[k]); if(pmRaw[k]===""||!isFinite(n)||n<1||n!==Math.floor(n)) pmBad=k; else pm[k]=n; });
       if(pmBad){ formError("Per-model concurrency for '"+pmBad+"' must be a number."); return; }
