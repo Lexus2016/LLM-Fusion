@@ -187,7 +187,7 @@ export const PANEL_HTML = `<!doctype html>
   .sw.on{background:var(--accent)} .sw.on:after{left:23px}
   .fld.toggle:focus-visible{outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-bg)}
   .rows{display:flex; flex-direction:column; gap:6px}
-  .kv{display:flex; gap:6px} .kv input{flex:1}
+  .kv{display:flex; gap:6px} .kv input, .kv select{flex:1} .kv .k1{flex:2}
   .tags{display:flex; flex-wrap:wrap; gap:6px; align-items:center}
   .tag{display:inline-flex; align-items:center; gap:6px; background:var(--panel-2); border:1px solid var(--line-2); border-radius:7px; padding:3px 4px 3px 9px; font-size:12.5px; font-family:var(--mono)}
   .tag button{border:none;background:none;color:var(--muted);cursor:pointer;font-size:14px;line-height:1;padding:0 2px}
@@ -490,6 +490,23 @@ export const PANEL_HTML = `<!doctype html>
       row.appendChild(k); row.appendChild(v); row.appendChild(x); wrap.appendChild(row); });
       var add=el("button","act",""); add.type="button"; add.textContent="+ Add mapping"; add.onclick=function(){ pairs.push(["",""]); draw(); }; wrap.appendChild(add); }
     draw(); f.appendChild(wrap); f._get=function(){ var o={}; pairs.forEach(function(p){ if(p[0].trim()) o[p[0].trim()]=p[1].trim(); }); return o; }; return f; }
+  // model id -> {input_per_mtok, output_per_mtok}. A three-column cousin of fKV;
+  // pricing is the only place that needs two values per key. _get() returns the
+  // RAW string rows so the caller can report which cell is bad by name.
+  function fPricing(label, hint, obj){ var f=fld(label,hint); var wrap=el("div","rows");
+    var rows=Object.keys(obj||{}).map(function(k){ var e=obj[k]||{};
+      return [k, e.input_per_mtok==null?"":String(e.input_per_mtok), e.output_per_mtok==null?"":String(e.output_per_mtok)]; });
+    function cell(p, idx, ph, aria, cls){ var n=el("input"); n.type="text"; n.className=cls; n.placeholder=ph; n.setAttribute("aria-label",aria); n.value=p[idx];
+      n.oninput=function(){ p[idx]=n.value; }; return n; }
+    function draw(){ wrap.textContent="";
+      rows.forEach(function(p,i){ var row=el("div","kv");
+        row.appendChild(cell(p,0,"upstream model id","Priced model","mono k1"));
+        row.appendChild(cell(p,1,"in $/Mtok","Input price per million tokens","mono num"));
+        row.appendChild(cell(p,2,"out $/Mtok","Output price per million tokens","mono num"));
+        var x=el("button","act",""); x.type="button"; x.textContent="×"; x.setAttribute("aria-label","Remove pricing row"); x.onclick=function(){ rows.splice(i,1); draw(); }; row.appendChild(x);
+        wrap.appendChild(row); });
+      var add=el("button","act",""); add.type="button"; add.textContent="+ Add model"; add.onclick=function(){ rows.push(["","",""]); draw(); }; wrap.appendChild(add); }
+    draw(); f.appendChild(wrap); f._get=function(){ return rows.slice(); }; return f; }
 
   // Reveal/hide a container of sub-fields as a toggle flips. Layers on top of
   // fToggle's own handlers (its onclick fires first, then this), so reading the
@@ -787,7 +804,7 @@ export const PANEL_HTML = `<!doctype html>
     var acts=el("div","eacts"); acts.appendChild(mkBtn("Edit","act",false,onEdit)); r.appendChild(acts); c.appendChild(r);
     c.appendChild(el("div","edesc",desc)); return c; }
   function renderSettings(){ var box=document.getElementById("settings-editor"); box.textContent=""; if(!cfg) return;
-    var sv=cfg.server||{}, up=cfg.upstream||{}, df=cfg.defaults||{};
+    var sv=cfg.server||{}, up=cfg.upstream||{}, df=cfg.defaults||{}, pr=cfg.pricing||{}, ov=cfg.overrides||{};
     box.appendChild(settingsCard("Server",
       "Listen on "+esc(sv.bind||"127.0.0.1")+":"+(sv.port||8080)+(sv.auth_token_env?(" · client auth "+esc(sv.auth_token_env)):" · no client auth")+(sv.admin_token_env?(" · admin token "+esc(sv.admin_token_env)):""),
       function(){ serverForm(sv); }, true));
@@ -797,6 +814,10 @@ export const PANEL_HTML = `<!doctype html>
     box.appendChild(settingsCard("Fusion defaults",
       "panel timeout "+(df.panel_member_timeout_s==null?90:df.panel_member_timeout_s)+"s · judge "+(df.judge_timeout_s==null?60:df.judge_timeout_s)+"s · min panel success "+(df.min_panel_success==null?1:df.min_panel_success),
       function(){ defaultsForm(df); }, false));
+    var prCount=Object.keys(pr).length;
+    box.appendChild(settingsCard("Model pricing",
+      prCount?(prCount+" model(s) priced · "+Object.keys(pr).slice(0,3).map(esc).join(", ")+(prCount>3?", …":"")):"no prices set — cost reporting shows 0",
+      function(){ pricingForm(pr); }, false));
   }
   function serverForm(sv){ var fBind,fPort,fAuth,fAdmin;
     openForm("Edit server settings", function(body){
@@ -856,6 +877,23 @@ export const PANEL_HTML = `<!doctype html>
       var m=fMin._get(); if(m===undefined||isNaN(m)){ formError("Min panel success is required and must be a number."); return; } obj.min_panel_success=m;
       obj.promote_reasoning_to_content=fPromote._get();
       saveSettings("defaults", obj, function(ok,err){ if(ok) closeForm(); else formError(err); });
+    });
+  }
+  function pricingForm(pr){ var fRows;
+    openForm("Edit model pricing", function(body){
+      var note=el("div","hint"); note.style.margin="0 2px 14px";
+      note.textContent="Keyed by the REAL upstream model id (glm-5.2), not the virtual model name (fusion-coder). Prices are USD per million tokens and only feed the cost figures in logs and response headers — they never affect routing.";
+      body.appendChild(note);
+      fRows=fPricing("Prices","One row per model. Both columns are required; use 0 for a free model.", pr);
+      body.appendChild(fRows);
+    }, function(){
+      var out={}, rs=fRows._get();
+      for(var i=0;i<rs.length;i++){ var r=rs[i], k=r[0].trim(); if(!k) continue;
+        var vin=Number(r[1]), vout=Number(r[2]);
+        if(r[1].trim()===""||!isFinite(vin)||vin<0){ formError("Input price for '"+k+"' must be a number of 0 or more."); return; }
+        if(r[2].trim()===""||!isFinite(vout)||vout<0){ formError("Output price for '"+k+"' must be a number of 0 or more."); return; }
+        out[k]={ input_per_mtok:vin, output_per_mtok:vout }; }
+      saveSettings("pricing", out, function(ok,err){ if(ok) closeForm(); else formError(err); });
     });
   }
   document.getElementById("restart-btn").onclick=function(){

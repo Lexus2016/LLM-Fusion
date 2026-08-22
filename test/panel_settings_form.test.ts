@@ -110,3 +110,44 @@ describe("upstream settings", () => {
     expect(put.body).not.toHaveProperty("per_model_concurrency");
   });
 });
+
+describe("pricing settings", () => {
+  it("creates a pricing entry", async () => {
+    panel = await mountPanel(CFG);
+    await openSettingsCard(panel, "Model pricing");
+    addRow("Prices");
+    setCell("Prices", 0, 0, "glm-5.2");
+    setCell("Prices", 0, 1, "0.6");
+    setCell("Prices", 0, 2, "2.2");
+    saveForm();
+    await panel.flush();
+
+    const put = lastPut(panel);
+    expect(put.path).toBe("admin/config/settings/pricing");
+    expect(put.body).toEqual({ "glm-5.2": { input_per_mtok: 0.6, output_per_mtok: 2.2 } });
+  });
+
+  it("round-trips an existing entry unchanged", async () => {
+    const priced = JSON.parse(JSON.stringify(CFG));
+    priced.pricing = { "minimax-m3": { input_per_mtok: 0.3, output_per_mtok: 1.1 } };
+    panel = await mountPanel(priced);
+    await openSettingsCard(panel, "Model pricing");
+    saveForm();
+    await panel.flush();
+
+    expect(lastPut(panel).body).toEqual({ "minimax-m3": { input_per_mtok: 0.3, output_per_mtok: 1.1 } });
+  });
+
+  it("rejects a blank price", async () => {
+    panel = await mountPanel(CFG);
+    await openSettingsCard(panel, "Model pricing");
+    addRow("Prices");
+    setCell("Prices", 0, 0, "glm-5.2");
+    setCell("Prices", 0, 1, "0.6");
+    saveForm();
+    await panel.flush();
+
+    expect(formError()).toContain("Output price");
+    expect(panel.sent.filter((r) => r.method === "PUT")).toHaveLength(0);
+  });
+});
