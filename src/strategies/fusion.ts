@@ -1189,6 +1189,7 @@ const JUDGE_SYSTEM_PROMPT =
   "Cross-reference the experts against each other: if only one expert mentions a specific API, function, " +
   "command, or factual claim and the others do not corroborate it, flag it as suspect. " +
   "Judge factual correctness and how well each answer actually serves the request; do not reward verbosity. " +
+  "Weight verifiability: between equally correct answers prefer the one whose load-bearing claims can be CHECKED against the request, provided context, or execution (tests, compiler); a confident claim that nothing available could confirm or refute belongs under fragile_claims. " +
   "Weigh CONCISION explicitly: between equally correct answers the tighter one is better, and padding or " +
   "repetition is a flaw worth naming under disagreements. Keep every JSON value telegraphic — facts, names, " +
   "and numbers, not essays; at most ~40 words per item. " +
@@ -2441,7 +2442,9 @@ function buildSynthContext(
       "expert that covered it — do not average partially covered aspects away. " +
       "Do not drop detail that only one expert provided unless it is wrong. " +
       "IMPORTANT: if the judge flagged hallucination_flags, treat those items as suspect — omit or explicitly " +
-      "caveat them rather than presenting fabricated information as fact. When experts disagree and you cannot " +
+      "caveat them rather than presenting fabricated information as fact. Halt at the first contradiction: do NOT " +
+      "build any conclusion on top of a claim you have flagged as suspect — resolve it first (verify, drop, or hedge), " +
+      "because a wrong premise poisons everything stacked on it. When experts disagree and you cannot " +
       "determine which side is correct, say so honestly instead of inventing an answer. " +
       "If the judge set \"confidence\" to \"low\" or listed \"fragile_claims\", do not present those claims as " +
       "settled fact — hedge them (\"may\", \"one expert held\", \"unverified\") or omit them, and where the " +
@@ -2460,7 +2463,8 @@ function buildSynthContext(
     UNTRUSTED_DATA_NOTICE +
     "A panel of expert models answered the user's request (a structured judge analysis was unavailable). " +
     "Synthesize the single best final answer from these expert answers; where they disagree, reconcile the " +
-    "conflict explicitly and prefer the better-supported answer over the more verbose one.\n\nEXPERT ANSWERS:\n" +
+    "conflict explicitly and prefer the better-supported answer over the more verbose one, and never stack a " +
+    "conclusion on an unsupported claim — resolve or drop the shaky premise first.\n\nEXPERT ANSWERS:\n" +
     experts +
     toolDirective +
     SYNTH_LACONISM_DIRECTIVE +

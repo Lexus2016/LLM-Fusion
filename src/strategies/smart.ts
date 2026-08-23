@@ -75,6 +75,8 @@ const ROUTER_SYSTEM_PROMPT = [
   "",
   "When in doubt, choose \"simple\" if the output is easily verified by running tests or a compiler, as the test runner serves as the correction gate.",
   "",
+  "Read the loop's momentum from the recent history: if the last few tool results show REPEATED failures or corrections of the same step (errors, failing tests, re-edits of the same file), the agent is stuck exploring — choose \"fusion\" to break the deadlock. If recent steps succeeded cleanly and only mechanical continuation remains, stay \"simple\".",
+  "",
   "Ground your reason in the LITERAL content of the latest message. Do NOT invent multimodal content: do NOT claim the user sent an image, screenshot, photo, or file unless an image/attachment is actually present in the message. If the latest message is plain text, treat it as plain text.",
   "Output the JSON object and nothing else.",
 ].join("\n");
