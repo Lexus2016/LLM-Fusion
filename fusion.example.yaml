@@ -21,6 +21,10 @@ upstream:
   connector_down_recheck_s: 900       # HARD failure (auth/payment/quota — "billing ended")
                                       # recheck window before an auto-probe; 0 = never
                                       # (manual reset only in the panel). (default: 900)
+                                      # If EVERY account is banned at once, one throttled
+                                      # last-resort probe (~1 per 5s) still runs — except
+                                      # for PARKED (down_recheck_s: 0) accounts, whose
+                                      # manual-reset-only contract always holds.
 
 # --- providers (optional) ---------------------------------------------------
 # Provider GROUPS the proxy fails over across. Each group is ONE upstream

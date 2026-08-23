@@ -259,10 +259,13 @@ models:
 `connector_cooldown_s` and the next account in the same provider takes over; the
 cooled account is auto-probed once the window elapses. A `401` (bad key), `402`
 (out of credits), or a body-matched quota exhaustion marks it **down** ("billing
-ended") — skipped until `connector_down_recheck_s` or a manual reset. When
-several accounts are throttled the proxy surfaces the most-recoverable error (a
-transient `429` beats a dead backup's `401`), so a passing request is never
-turned into a hard failure. It's transparent: every model/strategy (single,
+ended") — skipped until `connector_down_recheck_s` or a manual reset. If *every*
+account is banned at once, one throttled last-resort probe (about one per five
+seconds, never for parked accounts) still goes out with live traffic, so a
+recovered key is picked up without a restart. When several accounts are
+throttled the proxy surfaces the most-recoverable error (a transient `429` beats
+a dead backup's `401`), so a passing request is never turned into a hard
+failure. It's transparent: every model/strategy (single,
 failover, fusion, smart) rides its provider's pool with no config change.
 
 **Any OpenAI-compatible provider works by config alone.** The generic

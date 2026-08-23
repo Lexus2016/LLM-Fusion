@@ -14,7 +14,10 @@ import { bodyText, classifyStatus, classifyThrown, type ClassifyOptions } from "
  * Per call: walk connectors in selection order (pinned-first, then config order);
  * for each usable one (up, or a single probe of an elapsed cooling/down), map the
  * model via the connector's `model_map` and try it. Classify the outcome and
- * either return, advance, or surface. When every connector fails, surface the
+ * either return, advance, or surface. When EVERY connector was unusable (all
+ * cooling/down/parked/off), make ONE throttled last-resort attempt (`registry.
+ * acquireRescue`) so a fully-banned pool can still recover on live traffic
+ * without hammering the provider. When everything failed, surface the
  * MOST-RECOVERABLE failure by severity (so a primary's transient 429 beats a dead
  * backup's 401), and throw `NoConnectorAvailableError` only when nothing was even
  * attempted.
@@ -23,6 +26,17 @@ import { bodyText, classifyStatus, classifyThrown, type ClassifyOptions } from "
 type Best =
   | { severity: number; result: ChatCompletionResult }
   | { severity: number; thrown: unknown };
+
+/** Terminal result of one connector attempt; undefined = advance to the next. */
+type AttemptOutcome =
+  | { kind: "return"; result: ChatCompletionResult }
+  | { kind: "throw"; err: unknown };
+
+/** Failure bookkeeping shared across the loop's attempts. */
+interface AttemptAccumulator {
+  best?: Best;
+  notFound?: ChatCompletionResult;
+}
 
 export interface PooledClientOptions {
   logger?: Logger;
@@ -95,94 +109,126 @@ export class PooledUpstreamClient implements UpstreamClient {
     body: Record<string, unknown>,
     opts: { stream: boolean; signal?: AbortSignal },
   ): Promise<ChatCompletionResult> {
-    let best: Best | undefined;
-    let notFound: ChatCompletionResult | undefined;
+    const acc: AttemptAccumulator = {};
+    let outcome: AttemptOutcome | undefined;
+    let attemptedAny = false;
 
     for (const id of order) {
       const acq = this.registry.acquire(id);
       if (!acq.ok) continue;
+      attemptedAny = true;
+      outcome = await this.attempt(id, acq.epoch, call, body, opts, acc);
+      if (outcome) break;
+    }
 
-      const cfg = this.registry.cfgFor(id);
-      const client = this.registry.clientFor(id);
-      if (!cfg || !client) continue;
-
-      const mapped = mapModel(body, cfg.modelMap);
-      const startedAt = this.now();
-      let result: ChatCompletionResult;
-      try {
-        result = await call(client, mapped, opts);
-      } catch (err) {
-        // Client disconnect: not a connector health failure — release the probe
-        // and rethrow (the request is gone).
-        if (opts.signal?.aborted) {
-          this.registry.recordAbandoned(id, acq.epoch);
-          throw err;
-        }
-        const cls = classifyThrown(err);
-        if (cls.kind === "surface") {
-          // Capability / not-implemented / bad-request: not a health failure and
-          // deterministic across connectors — release the probe and surface it.
-          this.registry.recordAbandoned(id, acq.epoch);
-          throw err;
-        }
-        if (cls.kind === "failure") {
-          this.registry.recordFailure(id, acq.epoch, cls.reason, { error: errMessage(err) });
-          this.logger?.warn(
-            { connector: id, reason: cls.reason, err: errMessage(err) },
-            "connector call threw; advancing",
-          );
-          best = rank(best, { severity: cls.severity, thrown: err });
-        }
-        continue;
-      }
-
-      if (result.status < 400) {
-        this.registry.recordSuccess(id, acq.epoch, this.now() - startedAt);
-        return result;
-      }
-
-      const data = result.kind === "json" ? result.data : null;
-      const cls = classifyStatus(result.status, bodyText(data), classifyOptions(cfg));
-
-      if (cls.kind === "success" || cls.kind === "request_error") {
-        // The connector answered (a bad request or a passthrough 4xx): it is
-        // healthy, and retrying elsewhere won't help — surface immediately.
-        this.registry.recordSuccess(id, acq.epoch, this.now() - startedAt);
-        return result;
-      }
-
-      if (cls.kind === "not_found") {
-        // 404 / model-not-found: a model_map/routing issue on THIS connector.
-        // Advance without touching health; keep it as a last-resort fallback.
-        this.registry.recordAbandoned(id, acq.epoch);
-        notFound = result;
-        continue;
-      }
-
-      // cls.kind === "failure": mark the connector and advance. (classifyStatus
-      // never yields "surface" — that comes only from a thrown error above.)
-      if (cls.kind === "failure") {
-        const cooldownMs = result.kind === "json" ? result.retryAfterMs : undefined;
-        this.registry.recordFailure(id, acq.epoch, cls.reason, {
-          error: `HTTP ${result.status}`,
-          cooldownMs,
-        });
-        this.logger?.warn(
-          { connector: id, reason: cls.reason, status: result.status },
-          "connector failed; advancing",
-        );
-        best = rank(best, { severity: cls.severity, result });
+    // Whole pool unusable at loop time: one bounded last-resort attempt so a
+    // fully-banned pool can still be probed by real traffic.
+    if (!outcome && !attemptedAny) {
+      for (const id of order) {
+        const acq = this.registry.acquireRescue(id);
+        if (!acq.ok) continue;
+        outcome = await this.attempt(id, acq.epoch, call, body, opts, acc);
+        break;
       }
     }
 
-    if (best) {
-      if ("result" in best) return best.result;
-      throw best.thrown;
+    if (outcome?.kind === "throw") throw outcome.err;
+    if (outcome?.kind === "return") return outcome.result;
+    if (acc.best) {
+      if ("result" in acc.best) return acc.best.result;
+      throw acc.best.thrown;
     }
-    if (notFound) return notFound;
+    if (acc.notFound) return acc.notFound;
     throw new NoConnectorAvailableError(
       "no upstream connector is currently usable (all disabled, cooling, or down)",
     );
+  }
+
+  /** One mapped upstream attempt against connector `id`; mutates `acc`. */
+  private async attempt(
+    id: string,
+    epoch: number,
+    call: (
+      client: ConnectorClient,
+      body: Record<string, unknown>,
+      opts: { stream: boolean; signal?: AbortSignal },
+    ) => Promise<ChatCompletionResult>,
+    body: Record<string, unknown>,
+    opts: { stream: boolean; signal?: AbortSignal },
+    acc: AttemptAccumulator,
+  ): Promise<AttemptOutcome | undefined> {
+    const cfg = this.registry.cfgFor(id);
+    const client = this.registry.clientFor(id);
+    if (!cfg || !client) return undefined;
+
+    const mapped = mapModel(body, cfg.modelMap);
+    const startedAt = this.now();
+    let result: ChatCompletionResult;
+    try {
+      result = await call(client, mapped, opts);
+    } catch (err) {
+      // Client disconnect: not a connector health failure — release the probe
+      // and rethrow (the request is gone).
+      if (opts.signal?.aborted) {
+        this.registry.recordAbandoned(id, epoch);
+        return { kind: "throw", err };
+      }
+      const cls = classifyThrown(err);
+      if (cls.kind === "surface") {
+        // Capability / not-implemented / bad-request: not a health failure and
+        // deterministic across connectors — release the probe and surface it.
+        this.registry.recordAbandoned(id, epoch);
+        return { kind: "throw", err };
+      }
+      if (cls.kind === "failure") {
+        this.registry.recordFailure(id, epoch, cls.reason, { error: errMessage(err) });
+        this.logger?.warn(
+          { connector: id, reason: cls.reason, err: errMessage(err) },
+          "connector call threw; advancing",
+        );
+        acc.best = rank(acc.best, { severity: cls.severity, thrown: err });
+      }
+      return undefined;
+    }
+
+    if (result.status < 400) {
+      this.registry.recordSuccess(id, epoch, this.now() - startedAt);
+      return { kind: "return", result };
+    }
+
+    const data = result.kind === "json" ? result.data : null;
+    const cls = classifyStatus(result.status, bodyText(data), classifyOptions(cfg));
+
+    if (cls.kind === "success" || cls.kind === "request_error") {
+      // The connector answered (a bad request or a passthrough 4xx): it is
+      // healthy, and retrying elsewhere won't help — surface immediately.
+      this.registry.recordSuccess(id, epoch, this.now() - startedAt);
+      return { kind: "return", result };
+    }
+
+    if (cls.kind === "not_found") {
+      // 404 / model-not-found: a model_map/routing issue on THIS connector.
+      // Advance without touching health; keep it as a last-resort fallback.
+      this.registry.recordAbandoned(id, epoch);
+      acc.notFound = result;
+      return undefined;
+    }
+
+    // cls.kind === "failure": mark the connector and advance. (classifyStatus
+    // never yields "surface" — that comes only from a thrown error above.)
+    if (cls.kind === "failure") {
+      const cooldownMs = result.kind === "json" ? result.retryAfterMs : undefined;
+      this.registry.recordFailure(id, epoch, cls.reason, {
+        error: `HTTP ${result.status}`,
+        cooldownMs,
+      });
+      this.logger?.warn(
+        { connector: id, reason: cls.reason, status: result.status },
+        "connector failed; advancing",
+      );
+      acc.best = rank(acc.best, { severity: cls.severity, result });
+    }
+    return undefined;
   }
 }
 

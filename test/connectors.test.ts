@@ -340,6 +340,67 @@ describe("ConnectorRegistry", () => {
     reg.unpin();
     expect(reg.activeId()).toBe("a");
   });
+
+  it("a stale failure keeps observability counters but never touches health state", () => {
+    let t = 1000;
+    const reg = registry([{ id: "a", client: new FakeClient(() => jsonResult(200)) }], { now: () => t });
+    const first = reg.acquire("a"); // epoch 0
+    const second = reg.acquire("a"); // epoch 0
+    if (!first.ok || !second.ok) throw new Error("expected ok");
+    reg.recordSuccess("a", second.epoch, 5); // epoch -> 1, state up
+    t = 1500;
+    reg.recordFailure("a", first.epoch, "rate_limit", { error: "boom" }); // stale
+    expect(snap(reg)).toMatchObject({
+      state: "up",
+      cooldownUntil: null,
+      totalFailures: 1,
+      totalRequests: 2, // the successful attempt + the stale failed one
+      lastError: "boom",
+      lastFailureAt: 1500,
+    });
+  });
+
+  it("acquireRescue admits one mid-cooldown attempt per throttle window", () => {
+    let t = 1000;
+    const reg = registry(
+      [{ id: "a", client: new FakeClient(() => jsonResult(200)) }],
+      { now: () => t, cooldownMs: 60_000 },
+    );
+    const first = reg.acquire("a");
+    if (!first.ok) throw new Error("expected ok");
+    reg.recordFailure("a", first.epoch, "rate_limit"); // cooling until 61000
+    expect(reg.acquire("a").ok).toBe(false); // inside the window
+    const rescue = reg.acquireRescue("a");
+    expect(rescue.ok).toBe(true);
+    if (!rescue.ok) throw new Error("expected ok");
+    expect(rescue.probe).toBe(true);
+    expect(reg.acquireRescue("a").ok).toBe(false); // single-flight
+    reg.recordFailure("a", rescue.epoch, "rate_limit"); // frees the slot, re-extends the ban
+    t = 3000;
+    expect(reg.acquireRescue("a").ok).toBe(false); // throttled inside the window
+    t = 7000;
+    expect(reg.acquireRescue("a").ok).toBe(true); // next window admits again
+  });
+
+  it("acquireRescue respects off and parked connectors", () => {
+    let t = 1000;
+    const reg = registry([{ id: "a", client: new FakeClient(() => jsonResult(200)) }], {
+      now: () => t,
+      downRecheckMs: 0,
+    });
+    reg.disable("a");
+    expect(reg.acquireRescue("a").ok).toBe(false);
+    reg.enable("a");
+    const a = reg.acquire("a");
+    if (!a.ok) throw new Error("expected ok");
+    reg.recordFailure("a", a.epoch, "payment"); // parked hard down (down_recheck 0)
+    expect(snap(reg).parked).toBe(true);
+    expect(reg.acquireRescue("a").ok).toBe(false); // manual-reset contract holds
+    reg.reset("a");
+    // An operator revive (or a concurrent rescue's success) makes it admissible
+    // again — refusing an `up` here could strand a racing caller on a live pool.
+    expect(reg.acquireRescue("a").ok).toBe(true);
+  });
 });
 
 // --- pooled client failover ----------------------------------------------
@@ -497,5 +558,69 @@ describe("PooledUpstreamClient", () => {
     const pool = new PooledUpstreamClient(reg);
     const shown = await pool.show("some-model");
     expect(shown).toEqual({});
+  });
+
+  it("dead pool: a throttled last-resort attempt probes once, then surfaces the failure", async () => {
+    let t = 1000;
+    let callsA = 0;
+    const c1 = new FakeClient(() => {
+      callsA += 1;
+      return jsonResult(429);
+    });
+    const c2 = new FakeClient(() => jsonResult(429));
+    const reg = registry([{ id: "a", client: c1 }, { id: "b", client: c2 }], {
+      now: () => t,
+      cooldownMs: 60_000,
+    });
+    for (const id of ["a", "b"]) {
+      const acq = reg.acquire(id);
+      if (!acq.ok) throw new Error(`expected ok for ${id}`);
+      reg.recordFailure(id, acq.epoch, "rate_limit"); // both cooling
+    }
+    const pool = new PooledUpstreamClient(reg, { now: () => t });
+
+    const res = await pool.chatCompletions({ model: "m" }, opts);
+    expect(res.status).toBe(429); // rescue ran; the upstream really said 429
+    expect(callsA).toBe(1);
+    expect(c2.seenModels).toHaveLength(0); // stops at the first admissible connector
+    expect(snap(reg).cooldownRemainingMs).toBeGreaterThan(0);
+
+    await expect(pool.chatCompletions({ model: "m" }, opts)).rejects.toBeInstanceOf(
+      NoConnectorAvailableError,
+    );
+    expect(callsA).toBe(1); // throttled — no hammering a dead provider
+
+    t = 7_000;
+    const res2 = await pool.chatCompletions({ model: "m" }, opts);
+    expect(res2.status).toBe(429); // next window: probe again, surface again
+    expect(callsA).toBe(2);
+    expect(snap(reg).cooldownUntil).toBe(67_000); // ban monotonically re-extended
+  });
+
+  it("dead pool: a successful last-resort attempt revives the connector", async () => {
+    let t = 1000;
+    const c1 = new FakeClient(() => jsonResult(200));
+    const reg = registry([{ id: "a", client: c1 }], { now: () => t, cooldownMs: 60_000 });
+    const acq = reg.acquire("a");
+    if (!acq.ok) throw new Error("expected ok");
+    reg.recordFailure("a", acq.epoch, "server_error");
+    const pool = new PooledUpstreamClient(reg, { now: () => t });
+    const res = await pool.chatCompletions({ model: "m" }, opts);
+    expect(res.status).toBe(200);
+    expect(snap(reg)).toMatchObject({ state: "up", reason: null });
+  });
+
+  it("dead pool with only a parked connector still fails fast (manual-reset contract)", async () => {
+    let t = 1000;
+    const c1 = new FakeClient(() => jsonResult(200));
+    const reg = registry([{ id: "a", client: c1 }], { now: () => t, downRecheckMs: 0 });
+    const acq = reg.acquire("a");
+    if (!acq.ok) throw new Error("expected ok");
+    reg.recordFailure("a", acq.epoch, "payment"); // parked at Infinity
+    const pool = new PooledUpstreamClient(reg, { now: () => t });
+    await expect(pool.chatCompletions({ model: "m" }, opts)).rejects.toBeInstanceOf(
+      NoConnectorAvailableError,
+    );
+    expect(c1.seenModels).toHaveLength(0);
   });
 });

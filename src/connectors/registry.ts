@@ -15,12 +15,17 @@ import {
  *  - **epoch guard** — an attempt captures the connector's epoch at `acquire`;
  *    a failure is applied only if the epoch is unchanged. `recordSuccess` and
  *    every manual action bump the epoch, so a late failure from an attempt that
- *    started earlier cannot overwrite a newer success/decision.
+ *    started earlier cannot overwrite a newer success/decision — it only feeds
+ *    the observability counters.
  *  - **single-flight probe** — a `cooling`/`down` connector whose cooldown has
  *    elapsed admits exactly one probe (`probeInFlight`); concurrent callers skip
  *    it. Prevents a probe stampede.
  *  - **monotonic cooldown** — `cooldownUntil` only ever moves later, and a hard
  *    `down` is never downgraded to `cooling` by a subsequent soft failure.
+ *  - **dead-pool rescue** — when every connector is otherwise unusable,
+ *    `acquireRescue` admits ONE forced attempt (never for parked/off) at most
+ *    once per throttle window, so total unavailability still gets probed by
+ *    live traffic without hammering a dead provider.
  */
 
 /** A connector definition resolved from config (no secrets). One account of a
@@ -115,6 +120,8 @@ export interface ConnectorSnapshot {
 
 const DEFAULT_COOLDOWN_MS = 60_000;
 const DEFAULT_DOWN_RECHECK_MS = 900_000;
+/** Minimum spacing between dead-pool rescue admissions, per registry. */
+const RESCUE_MIN_INTERVAL_MS = 5_000;
 
 export class ConnectorRegistry {
   private readonly runtimes: ConnectorRuntime[];
@@ -124,6 +131,8 @@ export class ConnectorRegistry {
   private readonly now: () => number;
   /** Operator-pinned preferred connector; tried first when usable. */
   private pinnedId: string | undefined;
+  /** Wall-clock of the last dead-pool rescue admission (throttle anchor). */
+  private lastRescueAt: number;
 
   constructor(
     entries: Array<{ cfg: ResolvedConnector; client: ConnectorClient }>,
@@ -133,6 +142,7 @@ export class ConnectorRegistry {
     this.downRecheckMs = opts.downRecheckMs ?? DEFAULT_DOWN_RECHECK_MS;
     this.now = opts.now ?? Date.now;
     const started = this.now();
+    this.lastRescueAt = started - RESCUE_MIN_INTERVAL_MS;
     this.runtimes = entries.map(({ cfg, client }) => {
       const r: ConnectorRuntime = {
         cfg,
@@ -202,6 +212,31 @@ export class ConnectorRegistry {
     return { ok: false };
   }
 
+  /**
+   * Last-resort admission for the dead-pool rescue: admit ONE forced attempt of
+   * `id` even inside its cooldown window, when the pool's normal loop found
+   * nothing usable. Still respects `off` and the parked (`down_recheck_s: 0`,
+   * manual-reset-only) contract, keeps single-flight, and is throttled to one
+   * admission per registry per interval so sustained traffic cannot hammer a
+   * fully-dead provider. An `up` connector stays admissible on purpose: between
+   * the caller's failed loop and this call another attempt may have revived it,
+   * and refusing would strand the caller on a live pool. Terminal outcomes flow
+   * through the same recordSuccess / recordFailure paths as any other attempt —
+   * a success revives, a failure monotonically re-extends the ban.
+   */
+  acquireRescue(id: string): Acquire {
+    const r = this.byId.get(id);
+    if (!r) return { ok: false };
+    if (r.state === "off") return { ok: false };
+    if (r.cooldownUntil === Number.POSITIVE_INFINITY) return { ok: false }; // parked
+    if (r.probeInFlight) return { ok: false };
+    const now = this.now();
+    if (now - this.lastRescueAt < RESCUE_MIN_INTERVAL_MS) return { ok: false };
+    this.lastRescueAt = now;
+    r.probeInFlight = true;
+    return { ok: true, epoch: r.epoch, probe: true };
+  }
+
   /** A call succeeded: the connector is authoritative-up (unless manually off). */
   recordSuccess(id: string, _epoch: number, latencyMs: number): void {
     const r = this.byId.get(id);
@@ -236,7 +271,18 @@ export class ConnectorRegistry {
   ): void {
     const r = this.byId.get(id);
     if (!r) return;
-    if (r.epoch !== epoch) return; // stale attempt — a newer success/action won
+    if (r.epoch !== epoch) {
+      // Stale attempt — a newer success/action won, so state, cooldown and the
+      // probe slot stay exactly as the winner left them. The request DID hit
+      // the connector though: keep the observability counters honest without
+      // touching health.
+      r.totalRequests += 1;
+      r.totalFailures += 1;
+      r.consecutiveFailures += 1;
+      r.lastFailureAt = this.now();
+      r.lastError = opts.error ?? reason;
+      return;
+    }
     // The attempt belongs to the current epoch: it owns any probe slot, so the
     // slot is released here (and only here — a stale failure above must NOT
     // free a slot a newer probe is holding).
