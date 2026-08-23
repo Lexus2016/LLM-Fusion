@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.39] - 2026-08-23
+
+### Added
+- **Dead-pool rescue probe.** When every account of a provider is cooling/down
+  at once, requests no longer fail instantly: one throttled last-resort attempt
+  (~1 per 5 s per provider, single-flight, never for parked
+  (`down_recheck_s: 0`) or disabled accounts) still goes out with live traffic.
+  A success revives the connector; a failure monotonically re-extends the ban,
+  so a fully-banned pool recovers without a restart but a dead provider is
+  never hammered.
+
+### Changed
+- A late (stale) failure that lost to a newer success now still feeds the
+  observability counters (`totalRequests`, `totalFailures`, `lastError`,
+  `lastFailureAt`) instead of vanishing; health state and cooldown stay exactly
+  as the winner left them.
+
 ## [0.1.38] - 2026-08-22
 
 ### Fixed
