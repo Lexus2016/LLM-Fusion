@@ -1015,6 +1015,52 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(judgeSystem).toMatch(/shared.*lineage|training lineage/i);
   });
 
+  it("instructs the judge to weigh concision and keep its JSON telegraphic", async () => {
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req()));
+    expect(res.status).toBe(200);
+    const judgeBody = up.recorded.find((b) => b.model === "j");
+    const judgeSystem = systemContents(judgeBody!).join("\n");
+    expect(judgeSystem).toMatch(/weigh CONCISION/i);
+    expect(judgeSystem).toMatch(/telegraphic/i);
+  });
+
+  it("gives every panel member a compact-answer mandate before the mode directives", async () => {
+    const up = makeUpstream(defaultChat(true));
+    const res = await fusionStrategy.execute(ctx(up.client, req({ tools: TOOLS })));
+    expect(res.status).toBe(200);
+    const panelBodies = up.recorded.filter((b) => b.model.startsWith("m"));
+    expect(panelBodies.length).toBeGreaterThanOrEqual(3);
+    for (const b of panelBodies) {
+      const systems = systemContents(b);
+      const joined = systems.join("\n");
+      expect(joined).toContain("independent expert models");
+      expect(joined).toMatch(/compress only filler, never substance/);
+      // The deliberation-mode contract (when present) must come AFTER the mandate
+      // so it keeps winning on output format.
+      const idxMandate = joined.indexOf("independent expert models");
+      const idxDelib = joined.indexOf("DELIBERATION mode");
+      if (idxDelib !== -1) expect(idxDelib).toBeGreaterThan(idxMandate);
+    }
+  });
+
+  it("appends the laconism directive to the synth context with direct-answer still last", async () => {
+    for (const judgeOk of [true, false]) {
+      const up = makeUpstream(defaultChat(judgeOk));
+      const res = await fusionStrategy.execute(ctx(up.client, req()));
+      expect(res.status).toBe(200);
+      const synthBody = up.recorded.find((b) => b.model === "s");
+      const ctxText = systemContents(synthBody!).join("\n");
+      expect(ctxText).toContain("Be as brief as the task allows");
+      // The direct-answer directive is documented as always-last: the laconism
+      // text must precede it in the same context message.
+      const idxLaconism = ctxText.indexOf("Be as brief as the task allows");
+      const idxDirect = ctxText.indexOf("CRITICAL: respond to the user directly");
+      expect(idxLaconism).toBeGreaterThan(-1);
+      expect(idxDirect).toBeGreaterThan(idxLaconism);
+    }
+  });
+
   it("passes judge confidence + fragile_claims to synth and tells it to hedge them", async () => {
     const analysis = {
       consensus: "they agree",

@@ -1142,6 +1142,11 @@ function buildPanelBody(
     // same facts in a user turn make them answer. (glm/gpt-oss use either.)
     insertBeforeLastUser(msgs, { role: "user", content: opts.webContext });
   }
+  // Compact-answer mandate, first of the injected directives so every later mode
+  // contract (adversarial, deliberation) overrides it on output format. Without
+  // it each member answers in its native verbosity habits, and that filler is
+  // what the judge and synth then have to pay for.
+  msgs.push({ role: "system", content: PANEL_MEMBER_DIRECTIVE });
   if (opts.adversarial) {
     // This panel member runs with a contrarian mandate: find the flaw, not the
     // answer. It still deliberates in prose and gets no tools — the one-tool-call
@@ -1155,6 +1160,19 @@ function buildPanelBody(
   const body: Record<string, unknown> = { ...rest, model: member, messages: msgs, stream: false };
   return opts.native ? openAiBodyToNativeChat(body) : body;
 }
+
+/**
+ * The one quality mandate every panel member receives. Members otherwise answer
+ * in their native verbosity habits, and panel output is the RAW INPUT of both
+ * downstream stages: filler here becomes judge-context pressure (water-fill
+ * cuts) and synth noise. "Compress only filler, never substance" keeps the
+ * deliberation value — steps, API names, edge cases — while cutting the fat.
+ */
+const PANEL_MEMBER_DIRECTIVE =
+  "You are one of several independent expert models answering this request in parallel. " +
+  "Answer the user's latest request directly and completely, but COMPACTLY: lead with the working solution " +
+  "(code first for coding tasks), and cut greetings, restatement of the question, and summaries of your own answer. " +
+  "Keep every substantive step, API name, number, and edge case — compress only filler, never substance.";
 
 // --- Judge stage -----------------------------------------------------------
 
@@ -1171,6 +1189,9 @@ const JUDGE_SYSTEM_PROMPT =
   "Cross-reference the experts against each other: if only one expert mentions a specific API, function, " +
   "command, or factual claim and the others do not corroborate it, flag it as suspect. " +
   "Judge factual correctness and how well each answer actually serves the request; do not reward verbosity. " +
+  "Weigh CONCISION explicitly: between equally correct answers the tighter one is better, and padding or " +
+  "repetition is a flaw worth naming under disagreements. Keep every JSON value telegraphic — facts, names, " +
+  "and numbers, not essays; at most ~40 words per item. " +
   "Also produce two extra keys. \"confidence\": your overall confidence in the analysis — \"high\" ONLY when " +
   "multiple independent model lineages agree on concrete, verifiable facts with no unresolved contradictions; " +
   "\"medium\" when the broad direction is corroborated but some specifics are disputed or unverified; " +
@@ -2349,6 +2370,19 @@ const SYNTH_TOOL_ACTION_DIRECTIVE =
  * 26.67/30), so the synthesis mechanism itself is sound; this directive
  * targets specifically the narration failure, not the synthesis logic.
  */
+/**
+ * Laconism mandate for the synth, appended BEFORE the direct-answer directive
+ * (which stays last). The final answer inherits the panel's verbosity unless
+ * the synth is explicitly told otherwise; this sets the length contract while
+ * the direct-answer directive bans the meta-narration. Judge-mandated hedges
+ * are protected verbatim so concision can never eat calibrated uncertainty.
+ */
+const SYNTH_LACONISM_DIRECTIVE =
+  "\n\nBe as brief as the task allows: no preamble, no restating of the question, and no closing " +
+  "summary unless asked. Mirror the user's language. For coding tasks, output the code or diff first " +
+  "and keep prose only where it prevents misuse. Merge duplicate points from the experts into one " +
+  "statement; keep every hedge mandated by the judge analysis intact.";
+
 const SYNTH_DIRECT_ANSWER_DIRECTIVE =
   "\n\nCRITICAL: respond to the user directly, as if you are answering their question yourself. Never " +
   "mention \"the experts\", \"the panel\", \"the judge\", \"Expert 1\", \"Expert 2\", or your own synthesis " +
@@ -2418,6 +2452,7 @@ function buildSynthContext(
       "\n\nEXPERT ANSWERS:\n" +
       experts +
       toolDirective +
+      SYNTH_LACONISM_DIRECTIVE +
       SYNTH_DIRECT_ANSWER_DIRECTIVE
     );
   }
@@ -2428,6 +2463,7 @@ function buildSynthContext(
     "conflict explicitly and prefer the better-supported answer over the more verbose one.\n\nEXPERT ANSWERS:\n" +
     experts +
     toolDirective +
+    SYNTH_LACONISM_DIRECTIVE +
     SYNTH_DIRECT_ANSWER_DIRECTIVE
   );
 }
