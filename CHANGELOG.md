@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.40] - 2026-08-23
+
+### Added
+- **Laconic-precision prompts across the fusion pipeline.** Every panel member
+  now receives a compact-answer mandate (lead with the working solution, code
+  first; compress only filler, never substance) before the adversarial and
+  deliberation-mode directives, which keep winning on output format. The judge
+  gains an explicit CONCISION axis — the tighter of two equally correct
+  answers wins, padding is a flaw worth naming — plus a telegraphic JSON rule
+  (~40 words per value). The synth receives a briefness contract (no preamble,
+  no restating the question, no closing summary; mirror the user's language;
+  merge duplicate expert points) appended before the direct-answer directive,
+  which stays last; judge-mandated hedges are protected verbatim.
+
+### Verified
+- Blind two-scorer A/B on 4 tasks through the real proxy path: fusion answers
+  shrank by **−853 chars on average** (−25…−49% per task) while scoring
+  **+4.5/30** against the old prompts (3 of 4 tasks improved). The unchanged
+  control condition moved ±0.5, so the length gain is unambiguous and the
+  quality gain exceeds run noise.
+
 ## [0.1.39] - 2026-08-23
 
 ### Added
