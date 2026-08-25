@@ -181,9 +181,21 @@ export async function describeRequestImages(
     return null;
   }
 
+  // Describe every image IN PARALLEL. Sequential describes cost N * timeout_s in
+  // the worst case (default 60 s each), which a 4-image paste turns into a 4-min
+  // stall before the panel even starts. Fan-out is already bounded by the
+  // describer model's own gate in `limiterFor`, so this cannot blow past its
+  // per-model concurrency budget. The trade-off on failure is deliberate: when a
+  // describe fails, the siblings already in flight run to completion instead of
+  // being cut short — the contract is still all-or-nothing (we return `null`),
+  // and paying for N failed calls once is cheaper than N sequential timeouts on
+  // every success.
+  const raws = await Promise.all(
+    locations.map((loc) => describeOne(ctx, resilience, cfg, timer, ctx.client, loc.url)),
+  );
+
   const descriptions: string[] = [];
-  for (const loc of locations) {
-    const raw = await describeOne(ctx, resilience, cfg, timer, ctx.client, loc.url);
+  for (const raw of raws) {
     if (raw === null || raw.trim().length === 0) {
       ctx.logger.warn({ model: cfg.model }, "image_describe: empty/failed description; falling back");
       return null;

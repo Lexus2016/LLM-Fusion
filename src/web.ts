@@ -69,15 +69,37 @@ export function webGroundingEnabled(apiKey: string | undefined): apiKey is strin
 }
 
 /**
- * Run a single Tavily search. Returns `null` on any failure (network, non-2xx,
- * malformed body) so the caller degrades to an ungrounded panel — never throws
- * into the request path.
+ * Why a failure REASON and not just `null`: grounding degrades silently by
+ * design (an ungrounded panel still answers), so the only way an operator ever
+ * learns that their Tavily key is dead, expired, or rate-limited is the log
+ * line. A bare `null` makes "the key 401s on every call" indistinguishable from
+ * "the search legitimately found nothing" — the caller must be able to log the
+ * difference.
+ */
+export type WebSearchFailure =
+  /** fetch threw: DNS, TLS, connection reset, timeout/abort, or a refused redirect. */
+  | { reason: "network"; detail: string }
+  /** Tavily answered with a non-2xx — 401 = bad/expired key, 429 = plan limit. */
+  | { reason: "http_status"; status: number }
+  /** 2xx whose body is not JSON, or JSON without a `results` array. */
+  | { reason: "bad_body" }
+  /** A successful search that matched nothing. Benign — not an error. */
+  | { reason: "no_results" };
+
+export type WebSearchOutcome =
+  | { ok: true; results: WebSearchResult[] }
+  | { ok: false; failure: WebSearchFailure };
+
+/**
+ * Run a single Tavily search. Never throws into the request path: every failure
+ * comes back as `{ ok: false, failure }` so the caller can degrade to an
+ * ungrounded panel AND log why.
  */
 export async function tavilySearch(
   query: string,
   cfg: WebGroundingConfig,
   signal?: AbortSignal,
-): Promise<WebSearchResult[] | null> {
+): Promise<WebSearchOutcome> {
   const fetchFn = cfg.fetch ?? (globalThis.fetch as FetchFn);
   const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs);
   const combined = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
@@ -99,18 +121,18 @@ export async function tavilySearch(
       }),
       signal: combined,
     });
-  } catch {
-    return null;
+  } catch (err) {
+    return { ok: false, failure: { reason: "network", detail: err instanceof Error ? err.message : String(err) } };
   }
-  if (!res.ok) return null;
+  if (!res.ok) return { ok: false, failure: { reason: "http_status", status: res.status } };
   let data: unknown;
   try {
     data = await res.json();
   } catch {
-    return null;
+    return { ok: false, failure: { reason: "bad_body" } };
   }
   const payload = parseTavilyResponse(data);
-  if (payload === null) return null;
+  if (payload === null) return { ok: false, failure: { reason: "bad_body" } };
   const out: WebSearchResult[] = [];
   for (const r of payload.results) {
     const title = typeof r.title === "string" ? r.title : "";
@@ -118,7 +140,8 @@ export async function tavilySearch(
     const content = typeof r.content === "string" ? r.content : "";
     if (url) out.push({ title, url, content });
   }
-  return out;
+  if (out.length === 0) return { ok: false, failure: { reason: "no_results" } };
+  return { ok: true, results: out };
 }
 
 /**
@@ -154,16 +177,26 @@ export function formatWebContext(results: WebSearchResult[], maxContextChars: nu
   );
 }
 
+export type WebContextOutcome =
+  | { ok: true; context: string }
+  | { ok: false; failure: WebSearchFailure };
+
 /**
- * One-shot grounding: search the query and return a formatted context block, or
- * `null` when the search failed or returned nothing. Never throws.
+ * One-shot grounding: search the query and return a formatted context block.
+ * Never throws — a failure surfaces as `{ ok: false, failure }` carrying the
+ * reason, so the caller degrades to an ungrounded panel with a log line rather
+ * than in silence.
  */
 export async function buildWebContext(
   query: string,
   cfg: WebGroundingConfig,
   signal?: AbortSignal,
-): Promise<string | null> {
-  const results = await tavilySearch(query, cfg, signal);
-  if (results === null) return null;
-  return formatWebContext(results, cfg.maxContextChars);
+): Promise<WebContextOutcome> {
+  const outcome = await tavilySearch(query, cfg, signal);
+  if (!outcome.ok) return outcome;
+  const context = formatWebContext(outcome.results, cfg.maxContextChars);
+  // Results existed but every one of them was squeezed out by the char budget:
+  // nothing to inject, same practical effect as an empty search.
+  if (context === null) return { ok: false, failure: { reason: "no_results" } };
+  return { ok: true, context };
 }

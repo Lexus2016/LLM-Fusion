@@ -1,4 +1,5 @@
 import pLimit from "p-limit";
+import type { Logger } from "pino";
 import { CircuitOpenError } from "./errors";
 
 /**
@@ -35,6 +36,14 @@ export interface PerModelConcurrency {
 }
 
 /**
+ * Notified when a call has to WAIT at its own model gate — i.e. the model's
+ * per-model budget is fully spent and this call is queuing behind it. This is
+ * the ONLY externally visible signal that the gating is biting; without it a
+ * saturated budget looks exactly like a slow upstream from the outside.
+ */
+export type GateWaitObserver = (info: { model: string; budget: number; queued: number }) => void;
+
+/**
  * Keyed limiter: every real upstream model gets its own gate IN FRONT of the
  * global limiter. Acquisition order is strictly model-gate -> global-slot, so
  * a saturated model queues at its OWN gate and can occupy at most its budget
@@ -46,18 +55,39 @@ export function createKeyedLimiter(
   global: Limiter,
   maxConcurrency: number,
   perModel: PerModelConcurrency = {},
+  onGateWait?: GateWaitObserver,
 ): (model: string) => <T>(fn: () => Promise<T> | T) => Promise<T> {
-  const gates = new Map<string, Limiter>();
+  // `outstanding` is counted here rather than read off p-limit's
+  // `activeCount`/`pendingCount`: p-limit only starts a job on a microtask, so
+  // during a synchronous burst every call still sees `activeCount === 0` and the
+  // saturation signal would never fire. Counting at SUBMIT time is also the
+  // semantically right moment — a call holds its model budget from submit until
+  // it settles, including the stretch where it is waiting for a global slot.
+  interface Gate {
+    limiter: Limiter;
+    budget: number;
+    /** Submitted and not yet settled = slots claimed at this model's gate. */
+    outstanding: number;
+  }
+  const gates = new Map<string, Gate>();
   const sizeFor = (model: string): number =>
     Math.max(1, perModel.overrides?.[model] ?? perModel.defaultPerModel ?? maxConcurrency);
   return (model: string) => {
     let gate = gates.get(model);
     if (!gate) {
-      gate = pLimit(sizeFor(model));
+      const budget = sizeFor(model);
+      gate = { limiter: pLimit(budget), budget, outstanding: 0 };
       gates.set(model, gate);
     }
     const g = gate;
-    return <T>(fn: () => Promise<T> | T): Promise<T> => g(() => global(fn));
+    return <T>(fn: () => Promise<T> | T): Promise<T> => {
+      const willQueue = g.outstanding >= g.budget;
+      g.outstanding += 1;
+      if (willQueue) onGateWait?.({ model, budget: g.budget, queued: g.outstanding - g.budget });
+      return g.limiter(() => global(fn)).finally(() => {
+        g.outstanding -= 1;
+      });
+    };
   };
 }
 
@@ -269,6 +299,8 @@ export interface ResilienceOptions {
   sleep?: Sleeper;
   backoff?: BackoffOptions;
   policy?: Partial<FailoverPolicy>;
+  /** Notified when a call queues at its model gate (see GateWaitObserver). */
+  onGateWait?: GateWaitObserver;
 }
 
 /** Compose a `Resilience` bundle with sane defaults. */
@@ -276,7 +308,7 @@ export function createResilience(opts: ResilienceOptions): Resilience {
   const limiter = createLimiter(opts.maxConcurrency);
   return {
     limiter,
-    limiterFor: createKeyedLimiter(limiter, opts.maxConcurrency, opts.perModel),
+    limiterFor: createKeyedLimiter(limiter, opts.maxConcurrency, opts.perModel, opts.onGateWait),
     breaker: new CircuitBreaker({
       failureThreshold: opts.failureThreshold,
       cooldownMs: opts.cooldownMs,
@@ -292,22 +324,52 @@ export function createResilience(opts: ResilienceOptions): Resilience {
 }
 
 /**
+ * Throttled `GateWaitObserver` that logs at most one line per model per
+ * `intervalMs`. Throttling is the whole point: the observer fires on EVERY
+ * queued call, and a Claude-Code-style burst (80–130 calls/min) would otherwise
+ * turn a real diagnostic into log spam nobody reads.
+ */
+export function throttledGateWaitLogger(
+  logger: Logger,
+  opts: { intervalMs?: number; now?: Clock } = {},
+): GateWaitObserver {
+  const intervalMs = opts.intervalMs ?? 30_000;
+  const now = opts.now ?? Date.now;
+  const lastLogged = new Map<string, number>();
+  return ({ model, budget, queued }) => {
+    const t = now();
+    const prev = lastLogged.get(model);
+    if (prev !== undefined && t - prev < intervalMs) return;
+    lastLogged.set(model, t);
+    logger.warn(
+      { model, budget, queued },
+      "upstream: per-model concurrency budget saturated; calls are queuing at the model gate",
+    );
+  };
+}
+
+/**
  * Build a `Resilience` bundle straight from an `upstream` config block, so the
  * server and every strategy fallback wire the SAME per-model budgets — a
  * fallback that silently dropped them would disable the keyed gating on any
- * non-server call path.
+ * non-server call path. Pass a `logger` to get the throttled gate-saturation
+ * warning; without one the gating still works, it is just invisible.
  */
-export function resilienceForUpstream(upstream: {
-  max_concurrency: number;
-  per_model_concurrency?: Record<string, number>;
-  per_model_concurrency_default?: number;
-}): Resilience {
+export function resilienceForUpstream(
+  upstream: {
+    max_concurrency: number;
+    per_model_concurrency?: Record<string, number>;
+    per_model_concurrency_default?: number;
+  },
+  opts: { logger?: Logger } = {},
+): Resilience {
   return createResilience({
     maxConcurrency: upstream.max_concurrency,
     perModel: {
       defaultPerModel: upstream.per_model_concurrency_default,
       overrides: upstream.per_model_concurrency,
     },
+    ...(opts.logger ? { onGateWait: throttledGateWaitLogger(opts.logger) } : {}),
   });
 }
 

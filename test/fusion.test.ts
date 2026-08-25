@@ -698,6 +698,100 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(res.headers.get("X-Fusion-Degraded-Members")).toBe("2");
   });
 
+  it("a rate-limited (429) panel member is dropped, trips the breaker, and is NOT counted as permanently gated", async () => {
+    // 429 is the failure mode a fusion actually hits under load, and it must be
+    // classified differently from 403/404/410: a rate limit is TRANSIENT, so it
+    // counts against the full min_panel_success threshold (no effectiveMin
+    // relaxation, no X-Fusion-Degraded-Members header) while still tripping the
+    // breaker so a saturated model stops being dialed.
+    const cfg = parseConfig({
+      upstream: { base_url: "https://mock.test", api_key_env: "X" },
+      defaults: { min_panel_success: 2 },
+      models: { fz: { strategy: "fusion", panel: ["m1", "m2", "m3"], judge: "j", synth: "s" } },
+    });
+    const up = makeUpstream((body) => {
+      if (body.model === "m2") return jsonResponse({ error: "rate limit exceeded" }, 429);
+      if (body.model === "j") return jsonResponse({ choices: [{ message: { content: JSON.stringify({ consensus: "ok" }) } }] });
+      if (body.model === "s") return jsonResponse({ choices: [{ message: { content: "final" } }] });
+      return jsonResponse({ choices: [{ message: { content: "ans-" + body.model } }] });
+    });
+    // failureThreshold 1: a single recorded availability failure must open the
+    // breaker, which is what distinguishes 429 from a plain 4xx (the latter
+    // records a SUCCESS — the model answered, it is just the request that was bad).
+    const resilience = createResilience({ maxConcurrency: 4, failureThreshold: 1, sleep: async () => {} });
+    const capabilities = new CapabilityService({ client: up.client, getOverrides: () => cfg.overrides, logger });
+    const entry = cfg.models["fz"]!;
+    const context: StrategyContext = { request: { model: "fz", messages: [{ role: "user", content: "hi" }] }, config: cfg, client: up.client, capabilities, logger, modelConfig: entry, resilience };
+    const res = await fusionStrategy.execute(context);
+
+    // Two survivors meet the FULL threshold of 2 — no relaxation was needed.
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Fusion-Degraded-Members")).toBeNull();
+    const judgeInput = userContents(up.recorded.find((b) => b.model === "j")!).join("\n");
+    expect(judgeInput).toContain("ans-m1");
+    expect(judgeInput).toContain("ans-m3");
+    expect(judgeInput).not.toContain("ans-m2");
+    // The rate-limited member was charged an availability failure...
+    expect(resilience.breaker.getState("m2")).toBe("open");
+    // ...while the members that answered stay healthy.
+    expect(resilience.breaker.getState("m1")).toBe("closed");
+  });
+
+  it("fails the fusion (502) rather than answering thin when 429s drop the panel below min_panel_success", async () => {
+    // The complement of the case above: a rate limit must NOT quietly relax the
+    // threshold the way a permanent gate does. 2 of 3 members 429 with min 2 =>
+    // one survivor, which is below the (unrelaxed) threshold => hard failure.
+    const cfg = parseConfig({
+      upstream: { base_url: "https://mock.test", api_key_env: "X" },
+      defaults: { min_panel_success: 2 },
+      models: { fz: { strategy: "fusion", panel: ["m1", "m2", "m3"], judge: "j", synth: "s" } },
+    });
+    const up = makeUpstream((body) => {
+      if (body.model === "m1" || body.model === "m3") return jsonResponse({ error: "rate limit exceeded" }, 429);
+      if (body.model === "j") return jsonResponse({ choices: [{ message: { content: JSON.stringify({ consensus: "ok" }) } }] });
+      if (body.model === "s") return jsonResponse({ choices: [{ message: { content: "final" } }] });
+      return jsonResponse({ choices: [{ message: { content: "ans-" + body.model } }] });
+    });
+    const capabilities = new CapabilityService({ client: up.client, getOverrides: () => cfg.overrides, logger });
+    const entry = cfg.models["fz"]!;
+    const context: StrategyContext = { request: { model: "fz", messages: [{ role: "user", content: "hi" }] }, config: cfg, client: up.client, capabilities, logger, modelConfig: entry };
+    await expect(fusionStrategy.execute(context)).rejects.toMatchObject({ httpStatus: 502 });
+    // The synth never ran: no answer is better than one synthesized from a panel
+    // the operator explicitly said was too thin to trust.
+    expect(up.recorded.some((b) => b.model === "s")).toBe(false);
+  });
+
+  it("opens the breaker after repeated 429s so a saturated model stops being dialed", async () => {
+    // Under sustained rate limiting the panel would otherwise keep paying the
+    // full latency of a call it knows will 429. After `failureThreshold`
+    // consecutive rate limits the breaker fast-fails the member instead.
+    const cfg = parseConfig({
+      upstream: { base_url: "https://mock.test", api_key_env: "X" },
+      defaults: { min_panel_success: 1 },
+      models: { fz: { strategy: "fusion", panel: ["m1", "m2", "m3"], judge: "j", synth: "s" } },
+    });
+    const up = makeUpstream((body) => {
+      if (body.model === "m2") return jsonResponse({ error: "rate limit exceeded" }, 429);
+      if (body.model === "j") return jsonResponse({ choices: [{ message: { content: JSON.stringify({ consensus: "ok" }) } }] });
+      if (body.model === "s") return jsonResponse({ choices: [{ message: { content: "final" } }] });
+      return jsonResponse({ choices: [{ message: { content: "ans-" + body.model } }] });
+    });
+    const resilience = createResilience({ maxConcurrency: 4, failureThreshold: 2, sleep: async () => {} });
+    const capabilities = new CapabilityService({ client: up.client, getOverrides: () => cfg.overrides, logger });
+    const entry = cfg.models["fz"]!;
+    const run = () =>
+      fusionStrategy.execute({ request: { model: "fz", messages: [{ role: "user", content: "hi" }] }, config: cfg, client: up.client, capabilities, logger, modelConfig: entry, resilience });
+
+    await run();
+    await run();
+    expect(resilience.breaker.getState("m2")).toBe("open");
+    const before = up.recorded.filter((b) => b.model === "m2").length;
+    const res = await run();
+    expect(res.status).toBe(200); // survivors still answer
+    // The third run never reached the upstream for m2 — the breaker fast-failed it.
+    expect(up.recorded.filter((b) => b.model === "m2").length).toBe(before);
+  });
+
   it("runs the adversarial member with a contrarian prompt, others without it", async () => {
     const up = makeUpstream(defaultChat(true));
     const res = await fusionStrategy.execute(ctx(up.client, req(), "fusion-adv"));

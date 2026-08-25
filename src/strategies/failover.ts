@@ -57,7 +57,7 @@ export const failoverStrategy: Strategy = {
     const chain = ctx.modelConfig.chain;
     const stream = ctx.request.stream === true;
     const resilience =
-      ctx.resilience ?? resilienceForUpstream(ctx.config.upstream);
+      ctx.resilience ?? resilienceForUpstream(ctx.config.upstream, { logger: ctx.logger });
     // Reasoning->content promotion flag, threaded into the response builders so a
     // "thinking" chain member returning reasoning-only content is normalized too.
     const promote =

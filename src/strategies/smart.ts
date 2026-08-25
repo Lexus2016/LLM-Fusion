@@ -269,7 +269,7 @@ async function classify(ctx: StrategyContext, cfg: SmartModelConfig): Promise<"s
   const router = cfg.router;
   const fallback = cfg.default;
   const resilience: Resilience =
-    ctx.resilience ?? resilienceForUpstream(ctx.config.upstream);
+    ctx.resilience ?? resilienceForUpstream(ctx.config.upstream, { logger: ctx.logger });
 
   const body: Record<string, unknown> = {
     model: router,

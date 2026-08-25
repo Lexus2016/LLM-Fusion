@@ -131,6 +131,73 @@ describe("collectImageLocations", () => {
 });
 
 describe("describeRequestImages", () => {
+  it("describes multiple images CONCURRENTLY, not one round-trip at a time", async () => {
+    // Sequential describes cost N * timeout_s in the worst case; a 4-image paste
+    // would stall the whole fusion for minutes before the panel even starts.
+    // Gate every describer call on a barrier that only opens once ALL of them
+    // have arrived: this deadlocks (and the test times out) on a sequential loop.
+    const urls = ["data:a", "data:b", "data:c"];
+    let arrived = 0;
+    let openBarrier: () => void = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      openBarrier = resolve;
+    });
+    const client: UpstreamClient = {
+      chatCompletions: async () => {
+        arrived += 1;
+        if (arrived === urls.length) openBarrier();
+        await barrier;
+        return {
+          kind: "json",
+          status: 200,
+          data: { choices: [{ message: { role: "assistant", content: "described" } }] },
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        } satisfies ChatCompletionResult;
+      },
+      show: async () => ({}),
+      chatNative: async () => ({ kind: "json", status: 200, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }),
+    };
+    const ctx = makeCtx(imageRequest(urls), client);
+    const out = await describeRequestImages(ctx, resilience, cfg(), realTimer);
+    expect(out).not.toBeNull();
+    expect(arrived).toBe(urls.length);
+  });
+
+  it("keeps [IMAGE n] numbering aligned with source order under concurrency", async () => {
+    // Promise.all resolves in input order, but the calls COMPLETE out of order.
+    // Make the first image the slowest so a naive "append as they finish" would
+    // mislabel the blocks.
+    const urls = ["data:a", "data:b", "data:c"];
+    const delayFor: Record<string, number> = { "data:a": 20, "data:b": 5, "data:c": 0 };
+    const client: UpstreamClient = {
+      chatCompletions: async (body) => {
+        const messages = (body as { messages?: unknown[] }).messages ?? [];
+        const parts = (messages[0] as { content?: unknown[] } | undefined)?.content ?? [];
+        const imagePart = parts.find(
+          (p): p is { image_url: { url: string } } =>
+            typeof p === "object" && p !== null && (p as { type?: string }).type === "image_url",
+        );
+        const url = imagePart?.image_url.url ?? "";
+        await new Promise((r) => setTimeout(r, delayFor[url] ?? 0));
+        return {
+          kind: "json",
+          status: 200,
+          data: { choices: [{ message: { role: "assistant", content: `desc-of-${url}` } }] },
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        } satisfies ChatCompletionResult;
+      },
+      show: async () => ({}),
+      chatNative: async () => ({ kind: "json", status: 200, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }),
+    };
+    const ctx = makeCtx(imageRequest(urls), client);
+    const out = await describeRequestImages(ctx, resilience, cfg(), realTimer);
+    expect(out).not.toBeNull();
+    const parts = out!.messages![1]!.content as { type: string; text: string }[];
+    expect(parts[0]!.text).toBe("[IMAGE 1]\ndesc-of-data:a");
+    expect(parts[1]!.text).toBe("[IMAGE 2]\ndesc-of-data:b");
+    expect(parts[2]!.text).toBe("[IMAGE 3]\ndesc-of-data:c");
+  });
+
   it("returns null without touching the client when the request has no images", async () => {
     let calls = 0;
     const client: UpstreamClient = {

@@ -80,10 +80,12 @@ describe("web grounding — tavilySearch", () => {
       },
     ]);
     const out = await tavilySearch("query", cfg({ fetch: fetchFn }));
-    expect(out).toEqual([{ title: "T", url: "https://example.com", content: "hello world" }]);
+    expect(out).toEqual({ ok: true, results: [{ title: "T", url: "https://example.com", content: "hello world" }] });
   });
 
-  it("returns null on a non-2xx (degrades, never throws)", async () => {
+  // The reason matters: a dead key must be distinguishable from an empty search
+  // in the caller's log, otherwise grounding rots invisibly (see fusion.ts).
+  it("reports the STATUS on a non-2xx (degrades, never throws)", async () => {
     const fetchFn = mockFetch([
       {
         match: (url) => url === "https://api.tavily.com/search",
@@ -91,10 +93,10 @@ describe("web grounding — tavilySearch", () => {
       },
     ]);
     const out = await tavilySearch("query", cfg({ fetch: fetchFn }));
-    expect(out).toBeNull();
+    expect(out).toEqual({ ok: false, failure: { reason: "http_status", status: 401 } });
   });
 
-  it("returns null when the body is not a Tavily shape", async () => {
+  it("reports bad_body when the body is not a Tavily shape", async () => {
     const fetchFn = mockFetch([
       {
         match: (url) => url === "https://api.tavily.com/search",
@@ -102,15 +104,26 @@ describe("web grounding — tavilySearch", () => {
       },
     ]);
     const out = await tavilySearch("query", cfg({ fetch: fetchFn }));
-    expect(out).toBeNull();
+    expect(out).toEqual({ ok: false, failure: { reason: "bad_body" } });
   });
 
-  it("returns null when the network throws", async () => {
+  it("reports the network error message when fetch throws", async () => {
     const fetchFn: FetchFn = async () => {
       throw new Error("network down");
     };
     const out = await tavilySearch("query", cfg({ fetch: fetchFn }));
-    expect(out).toBeNull();
+    expect(out).toEqual({ ok: false, failure: { reason: "network", detail: "network down" } });
+  });
+
+  it("reports no_results (not an error) on an empty 200 result set", async () => {
+    const fetchFn = mockFetch([
+      {
+        match: (url) => url === "https://api.tavily.com/search",
+        respond: () => tavilyResponse([]),
+      },
+    ]);
+    const out = await tavilySearch("query", cfg({ fetch: fetchFn }));
+    expect(out).toEqual({ ok: false, failure: { reason: "no_results" } });
   });
 });
 
@@ -126,11 +139,11 @@ describe("web grounding — buildWebContext", () => {
       },
     ]);
     const out = await buildWebContext("query", cfg({ fetch: fetchFn }));
-    expect(out).not.toBeNull();
-    expect(out).toContain("fresh fact");
+    expect(out.ok).toBe(true);
+    expect(out.ok && out.context).toContain("fresh fact");
   });
 
-  it("returns null when the search yields nothing (no injection)", async () => {
+  it("reports no_results when the search yields nothing (no injection)", async () => {
     const fetchFn = mockFetch([
       {
         match: (url) => url === "https://api.tavily.com/search",
@@ -138,7 +151,18 @@ describe("web grounding — buildWebContext", () => {
       },
     ]);
     const out = await buildWebContext("query", cfg({ fetch: fetchFn }));
-    expect(out).toBeNull();
+    expect(out).toEqual({ ok: false, failure: { reason: "no_results" } });
+  });
+
+  it("propagates the search failure reason instead of flattening it to 'nothing'", async () => {
+    const fetchFn = mockFetch([
+      {
+        match: (url) => url === "https://api.tavily.com/search",
+        respond: () => jsonResponse({ error: "rate limited" }, 429),
+      },
+    ]);
+    const out = await buildWebContext("query", cfg({ fetch: fetchFn }));
+    expect(out).toEqual({ ok: false, failure: { reason: "http_status", status: 429 } });
   });
 
   it("sends redirect:'error' so the Tavily API key cannot leak via 307/308", async () => {

@@ -150,7 +150,7 @@ async function runFusion(
   const { request, logger } = ctx;
   const stream = request.stream === true;
   const resilience =
-    ctx.resilience ?? resilienceForUpstream(ctx.config.upstream);
+    ctx.resilience ?? resilienceForUpstream(ctx.config.upstream, { logger: ctx.logger });
   const defaults = ctx.config.defaults;
   let hasImages = requestHasImages(request);
   const hasTools = Array.isArray(request.tools) && request.tools.length > 0;
@@ -2830,8 +2830,9 @@ function webQuery(request: ChatCompletionRequest): string {
  * Resolve optional web grounding for a fusion call. Returns the formatted
  * context to inject into panel members, or `null` when the feature is gated off
  * (model did not opt in, no TAVILY_API_KEY, no usable query, or the search
- * failed/returned nothing). Never throws — a grounding failure degrades
- * silently to an ungrounded panel.
+ * failed/returned nothing). Never throws — a grounding failure degrades to an
+ * ungrounded panel, but never silently: every gate-off and every failure emits
+ * exactly one log line naming the reason.
  */
 async function buildPanelWebContext(
   ctx: StrategyContext,
@@ -2871,15 +2872,38 @@ async function buildPanelWebContext(
     maxContextChars: ws.max_context_chars,
   };
   try {
-    const context = await buildWebContext(query, gcfg, ctx.signal);
-    if (context === null) return null;
+    const outcome = await buildWebContext(query, gcfg, ctx.signal);
+    if (!outcome.ok) {
+      // Degrade to an ungrounded panel either way, but say WHY. A dead/expired
+      // key (401) or a plan limit (429) is otherwise indistinguishable in the
+      // logs from a search that legitimately matched nothing — the operator
+      // just sees the "grounding applied" line stop appearing.
+      const f = outcome.failure;
+      if (f.reason === "no_results") {
+        ctx.logger.info(
+          { model: ctx.request.model },
+          "fusion: web grounding found nothing; proceeding ungrounded",
+        );
+      } else {
+        ctx.logger.warn(
+          {
+            model: ctx.request.model,
+            reason: f.reason,
+            ...(f.reason === "http_status" ? { status: f.status } : {}),
+            ...(f.reason === "network" ? { detail: f.detail } : {}),
+          },
+          "fusion: web search FAILED; proceeding ungrounded",
+        );
+      }
+      return null;
+    }
     // Lead with the current date so models with a stale training cutoff do not
     // treat post-cutoff web results as "the future" and refuse. Models that don't
     // know today's date (e.g. kimi-k2.7-code) otherwise answer "that date is in
     // the future" even with the live facts in front of them. This is the single
     // line that makes post-cutoff research grounding actually usable.
     const today = new Date().toISOString().slice(0, 10);
-    return `CURRENT DATE: ${today}\n\n${context}`;
+    return `CURRENT DATE: ${today}\n\n${outcome.context}`;
   } catch (err) {
     ctx.logger.warn(
       { reason: err instanceof Error ? err.message : String(err) },

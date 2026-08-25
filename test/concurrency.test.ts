@@ -4,6 +4,7 @@ import {
   backoffDelay,
   createLimiter,
   createResilience,
+  throttledGateWaitLogger,
 } from "../src/concurrency";
 import { OllamaClient } from "../src/upstream/ollama";
 import type { FetchFn } from "../src/types";
@@ -215,5 +216,60 @@ describe("per-model keyed limiter (limiterFor)", () => {
       Array.from({ length: 6 }, () => r.limiterFor("any-model")(probe.job("any-model"))),
     );
     expect(probe.peak("any-model")).toBe(2);
+  });
+});
+
+describe("per-model gate saturation telemetry", () => {
+  it("reports a wait ONLY once the model's budget is spent, naming model/budget/queue", async () => {
+    const seen: { model: string; budget: number; queued: number }[] = [];
+    const r = createResilience({
+      maxConcurrency: 8,
+      perModel: { overrides: { hot: 2 } },
+      onGateWait: (info) => seen.push(info),
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((res) => (release = res));
+    // Two calls fill the budget without waiting; the next three must queue.
+    const jobs = Array.from({ length: 5 }, () => r.limiterFor("hot")(() => blocked));
+    expect(seen).toHaveLength(3);
+    expect(seen[0]).toEqual({ model: "hot", budget: 2, queued: 1 });
+    expect(seen[2]).toEqual({ model: "hot", budget: 2, queued: 3 });
+    release();
+    await Promise.all(jobs);
+  });
+
+  it("stays silent for a model that never saturates (no log spam on the happy path)", async () => {
+    const seen: string[] = [];
+    const r = createResilience({
+      maxConcurrency: 8,
+      perModel: { overrides: { cool: 4 } },
+      onGateWait: (info) => seen.push(info.model),
+    });
+    await Promise.all(Array.from({ length: 3 }, () => r.limiterFor("cool")(() => Promise.resolve())));
+    expect(seen).toEqual([]);
+  });
+
+  it("throttles the log to one line per model per interval, but never merges two models", () => {
+    const lines: { obj: unknown; msg: string }[] = [];
+    const logger = {
+      warn: (obj: unknown, msg: string) => lines.push({ obj, msg }),
+    } as unknown as Parameters<typeof throttledGateWaitLogger>[0];
+    let clock = 1_000;
+    const observe = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => clock });
+
+    observe({ model: "a", budget: 2, queued: 1 });
+    observe({ model: "a", budget: 2, queued: 2 }); // same model, inside the window
+    observe({ model: "b", budget: 2, queued: 1 }); // different model, own window
+    expect(lines).toHaveLength(2);
+
+    clock += 29_999;
+    observe({ model: "a", budget: 2, queued: 9 }); // still inside a's window
+    expect(lines).toHaveLength(2);
+
+    clock += 1;
+    observe({ model: "a", budget: 2, queued: 9 }); // window elapsed
+    expect(lines).toHaveLength(3);
+    expect(lines[2]!.obj).toEqual({ model: "a", budget: 2, queued: 9 });
+    expect(lines[2]!.msg).toContain("per-model concurrency budget saturated");
   });
 });
