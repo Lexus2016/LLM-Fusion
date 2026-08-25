@@ -2,6 +2,52 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.42] - 2026-08-25
+
+### Fixed
+- **The Anthropic surface ran with no shared limiter and no circuit breaker.**
+  `createApp` resolved the process-lifetime resilience bundle into a local
+  binding and then mounted `createAnthropicApp(deps)` with the raw deps, whose
+  `resilience` is undefined in the real entrypoint. Every `/v1/messages` request
+  therefore built a fresh bundle — a new `p-limit`, a breaker with no history —
+  while the `simple`/`single` route skipped the limiter and breaker outright. So
+  `upstream.max_concurrency` was never enforced across requests and no breaker
+  could accumulate toward its threshold, on precisely the surface
+  `bin/fusion-claude` points Claude Code at. Pre-existing; now covered by a test
+  that fails without the fix.
+- **Concurrent image describes could whitewash the describer's circuit breaker.**
+  With the batch running in parallel, each call wrote breaker state directly, so
+  a 200 on one image called `recordSuccess` and zeroed the `consecutiveFailures`
+  a sibling's 503 had just recorded — a describer failing on part of every batch
+  never tripped. The batch now yields ONE aggregated health signal (failure
+  wins), which also stops N images from tripping the breaker N times faster.
+- **A throwing gate-saturation observer could not break a request.** The
+  `outstanding` counter was incremented before the observer ran and decremented
+  in the limiter promise's `.finally`, so an observer that threw both leaked the
+  slot — permanently reporting a saturated gate — and propagated a synchronous
+  throw before the upstream call was ever submitted.
+- **Panel jsdom tests flaked under CPU load.** `test/panel_dom.ts` faked only
+  `setInterval`, so the panel's 400 ms `reloadConfigSoon` debounce outlived its
+  test and fired after `unmount()` had unstubbed fetch and cleared the body.
+  Measured against six competing CPU hogs: 1-4 failures per run before, 0 across
+  10 runs after.
+
+### Added
+- **Silent degradations are now observable.** Web grounding reports why it
+  degraded (`http_status` with the code, `network`, `bad_body`, `no_results`,
+  plus distinct lines for a missing query and a client disconnect) instead of a
+  bare `null`; a saturated per-model concurrency gate logs `model`, `budget`,
+  `queued` and `peak_queued`, throttled to one line per model per 30 s.
+- `upstream.per_model_concurrency_default` documented in the README (it was
+  implemented but appeared only as a commented line in `fusion.example.yaml`).
+
+### Changed
+- **Image describes run in parallel.** An N-image paste costs one describe
+  latency instead of N (default `timeout_s` is 60 s each). A half-open breaker
+  still probes with a single image first. Trade-off: a batch that fails now
+  bills every image, visible to the client in `x-fusion-usage`, where the old
+  sequential loop stopped at the first failure.
+
 ## [0.1.40] - 2026-08-23
 
 ### Added

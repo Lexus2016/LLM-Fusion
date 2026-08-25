@@ -6,6 +6,7 @@ import { parseConfig } from "../src/config";
 import { createLogger } from "../src/logging";
 import { mockFetch, jsonResponse, sseResponse } from "./helpers";
 import type { MockRoute } from "./helpers";
+import type { FetchFn } from "../src/types";
 import {
   anthropicToOpenAiRequest,
   openAiToAnthropicResponse,
@@ -71,6 +72,63 @@ function postMessages(app: ReturnType<typeof makeApp>, body: unknown, headers?: 
     body: JSON.stringify(body),
   });
 }
+
+describe("anthropic surface shares the server's resilience bundle", () => {
+  // Regression: createApp resolved `resilience` into a LOCAL const and then
+  // mounted createAnthropicApp(deps) with the RAW deps, whose `resilience` is
+  // undefined in the real entrypoint. Every /v1/messages request therefore built
+  // its own bundle (or, on the `single` route, skipped the limiter and breaker
+  // outright), so max_concurrency was unenforced across requests and the breaker
+  // could never accumulate toward its threshold — on exactly the surface
+  // bin/fusion-claude points Claude Code at.
+  const oneAtATime = parseConfig({
+    upstream: { base_url: "https://mock.test", api_key_env: "X", max_concurrency: 1 },
+    server: { bind: "127.0.0.1", port: 8080 },
+    models: { "anthropic-fast": { strategy: "single", target: "glm-5.2" } },
+  });
+
+  it("enforces max_concurrency ACROSS /v1/messages requests (single route)", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    // A raw fetchFn, not mockFetch: the concurrency peak can only be measured by
+    // holding the call open, and MockRoute.respond must return a Response
+    // synchronously.
+    const fetchFn: FetchFn = async (input) => {
+      const url = typeof input === "string" ? input : String(input);
+      if (url.endsWith("/api/show")) {
+        return jsonResponse({ capabilities: ["completion"], model_info: {} });
+      }
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 15));
+      inFlight -= 1;
+      return jsonResponse({
+        id: "up-1",
+        choices: [{ message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      });
+    };
+    const client = new OllamaClient({ baseUrl: "https://mock.test", apiKey: "k", fetchFn });
+    // NO `resilience` key — exactly how src/index.ts builds the real app.
+    const app = createApp({
+      getConfig: () => oneAtATime,
+      client,
+      capabilities: new CapabilityService({ client, getOverrides: () => oneAtATime.overrides, logger }),
+      getAuthToken: () => undefined,
+      logger,
+    });
+
+    const body = { model: "anthropic-fast", max_tokens: 16, messages: [{ role: "user", content: "hi" }] };
+    const results = await Promise.all([
+      postMessages(app, body),
+      postMessages(app, body),
+      postMessages(app, body),
+    ]);
+    for (const r of results) expect(r.status).toBe(200);
+    // max_concurrency: 1 — the three requests must serialize at the shared limiter.
+    expect(peak).toBe(1);
+  });
+});
 
 describe("anthropic abort propagation", () => {
   it("wires the client abort signal into upstream calls (/v1/messages)", async () => {

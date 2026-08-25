@@ -83,7 +83,19 @@ export function createKeyedLimiter(
     return <T>(fn: () => Promise<T> | T): Promise<T> => {
       const willQueue = g.outstanding >= g.budget;
       g.outstanding += 1;
-      if (willQueue) onGateWait?.({ model, budget: g.budget, queued: g.outstanding - g.budget });
+      if (willQueue && onGateWait !== undefined) {
+        // Telemetry must never be able to break the data path. The increment has
+        // already happened, and the limiter call (with its `.finally` decrement)
+        // has not — so an observer that throws would both leak `outstanding`,
+        // permanently reporting a saturated gate, AND propagate a SYNCHRONOUS
+        // throw out of `limiterFor(m)(fn)` before the upstream call was ever
+        // submitted. Swallow it: a broken logger is not a reason to drop a request.
+        try {
+          onGateWait({ model, budget: g.budget, queued: g.outstanding - g.budget });
+        } catch {
+          /* observer is best-effort */
+        }
+      }
       return g.limiter(() => global(fn)).finally(() => {
         g.outstanding -= 1;
       });
@@ -335,16 +347,32 @@ export function throttledGateWaitLogger(
 ): GateWaitObserver {
   const intervalMs = opts.intervalMs ?? 30_000;
   const now = opts.now ?? Date.now;
-  const lastLogged = new Map<string, number>();
+  interface ModelWindow {
+    /** When this model last emitted a line; `undefined` = never. */
+    lastLogged?: number;
+    /** Deepest queue seen since that line — the number that actually matters. */
+    peak: number;
+  }
+  const windows = new Map<string, ModelWindow>();
   return ({ model, budget, queued }) => {
+    let w = windows.get(model);
+    if (w === undefined) {
+      w = { peak: 0 };
+      windows.set(model, w);
+    }
+    // Track the peak on EVERY event, including the throttled ones. Reporting only
+    // `queued` would make the log actively misleading: a burst's first sample is
+    // always `queued: 1`, so a gate that went on to back up 80 deep would be
+    // recorded as "1 call queued" and then stay silent for the rest of the window.
+    w.peak = Math.max(w.peak, queued);
     const t = now();
-    const prev = lastLogged.get(model);
-    if (prev !== undefined && t - prev < intervalMs) return;
-    lastLogged.set(model, t);
+    if (w.lastLogged !== undefined && t - w.lastLogged < intervalMs) return;
     logger.warn(
-      { model, budget, queued },
+      { model, budget, queued, peak_queued: w.peak },
       "upstream: per-model concurrency budget saturated; calls are queuing at the model gate",
     );
+    w.lastLogged = t;
+    w.peak = 0;
   };
 }
 

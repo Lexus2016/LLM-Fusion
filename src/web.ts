@@ -195,8 +195,12 @@ export async function buildWebContext(
   const outcome = await tavilySearch(query, cfg, signal);
   if (!outcome.ok) return outcome;
   const context = formatWebContext(outcome.results, cfg.maxContextChars);
-  // Results existed but every one of them was squeezed out by the char budget:
-  // nothing to inject, same practical effect as an empty search.
+  // Defensive only, and deliberately not described as a live case: `tavilySearch`
+  // already reports an empty result set as `no_results`, and `formatWebContext`
+  // always admits its FIRST block regardless of the char budget (the budget check
+  // is guarded on `blocks.length > 0`). So a non-empty result set cannot render
+  // to null here — this branch exists so a future change to either function
+  // cannot turn into an unhandled null.
   if (context === null) return { ok: false, failure: { reason: "no_results" } };
   return { ok: true, context };
 }

@@ -269,7 +269,63 @@ describe("per-model gate saturation telemetry", () => {
     clock += 1;
     observe({ model: "a", budget: 2, queued: 9 }); // window elapsed
     expect(lines).toHaveLength(3);
-    expect(lines[2]!.obj).toEqual({ model: "a", budget: 2, queued: 9 });
     expect(lines[2]!.msg).toContain("per-model concurrency budget saturated");
+  });
+
+  it("reports the window's PEAK queue depth, not just the sample that happened to print", () => {
+    // A burst's first sample is always queued:1. Logging only that, then going
+    // quiet for 30 s, records "1 call queued" for a gate that went 80 deep.
+    const lines: { obj: Record<string, unknown>; msg: string }[] = [];
+    const logger = {
+      warn: (obj: Record<string, unknown>, msg: string) => lines.push({ obj, msg }),
+    } as unknown as Parameters<typeof throttledGateWaitLogger>[0];
+    let clock = 1_000;
+    const observe = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => clock });
+
+    observe({ model: "a", budget: 2, queued: 1 }); // prints immediately
+    expect(lines[0]!.obj).toMatchObject({ queued: 1, peak_queued: 1 });
+    for (const q of [7, 80, 12]) observe({ model: "a", budget: 2, queued: q }); // throttled
+    expect(lines).toHaveLength(1);
+
+    clock += 30_000;
+    observe({ model: "a", budget: 2, queued: 3 });
+    expect(lines).toHaveLength(2);
+    // The spike the throttle swallowed is still reported.
+    expect(lines[1]!.obj).toMatchObject({ queued: 3, peak_queued: 80 });
+
+    // The peak resets with the window — it must not sticky-report 80 forever.
+    clock += 30_000;
+    observe({ model: "a", budget: 2, queued: 2 });
+    expect(lines[2]!.obj).toMatchObject({ peak_queued: 2 });
+  });
+
+  it("a THROWING observer neither breaks the call nor leaks a gate slot", () => {
+    // Telemetry sits between the `outstanding` increment and the limiter call, so
+    // an observer that throws used to escape synchronously out of
+    // `limiterFor(m)(fn)` — the upstream call was never even submitted — and left
+    // the counter permanently inflated, so the gate reported saturation forever.
+    const seen: string[] = [];
+    const r = createResilience({
+      maxConcurrency: 8,
+      perModel: { overrides: { m: 1 } },
+      onGateWait: () => {
+        seen.push("fired");
+        throw new Error("logger blew up");
+      },
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((res) => (release = res));
+    const first = r.limiterFor("m")(() => blocked);
+    // Saturates the gate -> observer fires -> throws. Must not escape.
+    const second = r.limiterFor("m")(() => Promise.resolve("ok"));
+    expect(seen).toEqual(["fired"]);
+    release();
+    return Promise.all([first, second]).then(async () => {
+      // Counter recovered: with both calls settled the gate is empty again, so a
+      // fresh single call must NOT be reported as queued.
+      seen.length = 0;
+      await r.limiterFor("m")(() => Promise.resolve("ok"));
+      expect(seen).toEqual([]);
+    });
   });
 });

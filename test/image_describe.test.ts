@@ -163,6 +163,64 @@ describe("describeRequestImages", () => {
     expect(arrived).toBe(urls.length);
   });
 
+  it("a 503 on one image is NOT erased by a 200 on another (batch health is aggregated)", async () => {
+    // Parallel calls each used to write breaker state directly, so the outcome
+    // depended on which upstream answered LAST: recordSuccess zeroes
+    // consecutiveFailures, silently erasing a sibling's availability failure. A
+    // describer failing on part of every batch would then never trip its breaker.
+    const client: UpstreamClient = {
+      chatCompletions: async (body) => {
+        const messages = (body as { messages?: unknown[] }).messages ?? [];
+        const parts = (messages[0] as { content?: unknown[] } | undefined)?.content ?? [];
+        const img = parts.find(
+          (p): p is { image_url: { url: string } } =>
+            typeof p === "object" && p !== null && (p as { type?: string }).type === "image_url",
+        );
+        if (img?.image_url.url === "data:bad") {
+          return { kind: "json", status: 503, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } } satisfies ChatCompletionResult;
+        }
+        // The healthy image answers LAST, so completion order is failure-then-success.
+        await new Promise((r) => setTimeout(r, 20));
+        return { kind: "json", status: 200, data: { choices: [{ message: { role: "assistant", content: "ok" } }] }, usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } } satisfies ChatCompletionResult;
+      },
+      show: async () => ({}),
+      chatNative: async () => ({ kind: "json", status: 200, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }),
+    };
+    const r = createResilience({ maxConcurrency: 4, failureThreshold: 1 });
+    const ctx = makeCtx(imageRequest(["data:bad", "data:good"]), client);
+    await expect(describeRequestImages(ctx, r, cfg(), realTimer)).resolves.toBeNull();
+    expect(r.breaker.getState("vision-m")).toBe("open");
+  });
+
+  it("charges the batch ONE failure, so N images cannot trip the breaker N times faster", async () => {
+    // The flip side of aggregation: five failing images are five failed calls but
+    // one health verdict, so a 5-image paste must not open a threshold-5 breaker
+    // that a 1-image paste would leave closed.
+    const client: UpstreamClient = {
+      chatCompletions: async () => ({ kind: "json", status: 503, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } } satisfies ChatCompletionResult),
+      show: async () => ({}),
+      chatNative: async () => ({ kind: "json", status: 200, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }),
+    };
+    const r = createResilience({ maxConcurrency: 8, failureThreshold: 5 });
+    const ctx = makeCtx(imageRequest(["a", "b", "c", "d", "e"]), client);
+    await expect(describeRequestImages(ctx, r, cfg(), realTimer)).resolves.toBeNull();
+    expect(r.breaker.getState("vision-m")).toBe("closed"); // 1 failure recorded, not 5
+  });
+
+  it("an all-success batch closes the breaker exactly once", async () => {
+    const client: UpstreamClient = {
+      chatCompletions: async () => ({ kind: "json", status: 200, data: { choices: [{ message: { role: "assistant", content: "ok" } }] }, usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } } satisfies ChatCompletionResult),
+      show: async () => ({}),
+      chatNative: async () => ({ kind: "json", status: 200, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }),
+    };
+    const r = createResilience({ maxConcurrency: 8, failureThreshold: 2 });
+    r.breaker.recordFailure("vision-m"); // one prior failure on the books
+    const ctx = makeCtx(imageRequest(["a", "b", "c"]), client);
+    const out = await describeRequestImages(ctx, r, cfg(), realTimer);
+    expect(out).not.toBeNull();
+    expect(r.breaker.getState("vision-m")).toBe("closed");
+  });
+
   it("on a HALF-OPEN breaker probes with ONE image, not the whole fan-out", async () => {
     // The breaker contract is "half-open allows exactly one probe at a time".
     // Fanning N calls out at a model we already believe is sick spends N quota on
@@ -219,6 +277,88 @@ describe("describeRequestImages", () => {
     expect(out).not.toBeNull();
     expect(calls).toBe(urls.length); // probe recovered, the rest still got described
     expect(r.breaker.getState("vision-m")).toBe("closed");
+  });
+
+  it("a client disconnect is charged as ABANDONED, not as a describer failure", async () => {
+    // The model is not at fault when the user presses Esc. Recording a failure
+    // would walk a healthy describer toward its breaker threshold.
+    const abort = new AbortController();
+    const client: UpstreamClient = {
+      chatCompletions: async () => {
+        abort.abort();
+        throw new Error("aborted");
+      },
+      show: async () => ({}),
+      chatNative: async () => ({ kind: "json", status: 200, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }),
+    };
+    const r = createResilience({ maxConcurrency: 4, failureThreshold: 1 });
+    const ctx = { ...makeCtx(imageRequest(["a", "b"]), client), signal: abort.signal };
+    await expect(describeRequestImages(ctx, r, cfg(), realTimer)).resolves.toBeNull();
+    expect(r.breaker.getState("vision-m")).toBe("closed"); // NOT opened by a disconnect
+  });
+
+  it("a non-availability 4xx leaves the describer HEALTHY (the model answered)", async () => {
+    // 400/401/403/404 mean the request was wrong, not that the model is sick —
+    // isAvailabilityFailureStatus is 429 and 5xx only. The description is still
+    // unusable, so the request falls back, but the breaker must not move.
+    const client: UpstreamClient = {
+      chatCompletions: async () => ({ kind: "json", status: 400, data: { error: "bad shape" }, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } } satisfies ChatCompletionResult),
+      show: async () => ({}),
+      chatNative: async () => ({ kind: "json", status: 200, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }),
+    };
+    const r = createResilience({ maxConcurrency: 4, failureThreshold: 1 });
+    const ctx = makeCtx(imageRequest(["a", "b"]), client);
+    await expect(describeRequestImages(ctx, r, cfg(), realTimer)).resolves.toBeNull();
+    expect(r.breaker.getState("vision-m")).toBe("closed");
+  });
+
+  it("half-open: a probe that succeeds then a 503 in the rest re-opens the breaker", async () => {
+    // The two-write sequence on the half-open path: the probe closes the breaker,
+    // then the fan-out's own aggregated verdict applies like any closed batch.
+    let first = true;
+    const client: UpstreamClient = {
+      chatCompletions: async () => {
+        if (first) {
+          first = false;
+          return { kind: "json", status: 200, data: { choices: [{ message: { role: "assistant", content: "ok" } }] }, usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } } satisfies ChatCompletionResult;
+        }
+        return { kind: "json", status: 503, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } } satisfies ChatCompletionResult;
+      },
+      show: async () => ({}),
+      chatNative: async () => ({ kind: "json", status: 200, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }),
+    };
+    let clock = 0;
+    const r = createResilience({ maxConcurrency: 4, failureThreshold: 1, cooldownMs: 100, now: () => clock });
+    r.breaker.recordFailure("vision-m");
+    clock += 200;
+    expect(r.breaker.getState("vision-m")).toBe("half-open");
+
+    const ctx = makeCtx(imageRequest(["a", "b", "c"]), client);
+    await expect(describeRequestImages(ctx, r, cfg(), realTimer)).resolves.toBeNull();
+    expect(r.breaker.getState("vision-m")).toBe("open");
+  });
+
+  it("releases a reserved half-open probe when something throws mid-batch", async () => {
+    // The health write that frees `probeInFlight` runs after describeOne has
+    // logged. A throw in between must not wedge the breaker in half-open forever.
+    const client: UpstreamClient = {
+      chatCompletions: async () => {
+        throw new Error("boom");
+      },
+      show: async () => ({}),
+      chatNative: async () => ({ kind: "json", status: 200, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }),
+    };
+    let clock = 0;
+    const r = createResilience({ maxConcurrency: 4, failureThreshold: 1, cooldownMs: 100, now: () => clock });
+    r.breaker.recordFailure("vision-m");
+    clock += 200;
+    // A logger that throws is the realistic trigger; simulate it directly.
+    const boomLogger = { ...logger, warn: () => { throw new Error("logger blew up"); } };
+    const ctx = { ...makeCtx(imageRequest(["a", "b"]), client), logger: boomLogger as unknown as typeof logger };
+    await expect(describeRequestImages(ctx, r, cfg(), realTimer)).rejects.toThrow();
+    // Still half-open (not wedged): the next call may probe again.
+    expect(r.breaker.getState("vision-m")).toBe("half-open");
+    expect(r.breaker.canAttempt("vision-m")).toBe(true);
   });
 
   it("keeps [IMAGE n] numbering aligned with source order under concurrency", async () => {
