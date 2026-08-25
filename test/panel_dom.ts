@@ -11,7 +11,7 @@ export interface SentRequest {
 export interface Panel {
   /** Every non-GET request, in order. GETs are answered but not recorded. */
   sent: SentRequest[];
-  /** Drain the microtask queue so a fetch chain settles. */
+  /** Settle the panel's pending fetches and its 400ms reload debounce. */
   flush(): Promise<void>;
   unmount(): void;
 }
@@ -56,10 +56,17 @@ export async function mountPanelWithFailure(cfg: unknown, failRequest: FailReque
 }
 
 async function doMount(cfg: unknown, failRequest?: FailRequest): Promise<Panel> {
-  // Only setInterval is faked: the 3s monitor poll would otherwise fire for the
-  // whole test run. setTimeout stays REAL so `flush()` and the panel's own
-  // reloadConfigSoon(400ms) behave normally.
-  vi.useFakeTimers({ toFake: ["setInterval"] });
+  // BOTH timer kinds are faked. setInterval: the 3s monitor poll would otherwise
+  // fire for the whole test run. setTimeout: the panel debounces a config reload
+  // by 400 ms after every save (`reloadConfigSoon`), and with a REAL timer that
+  // callback outlives the test — it fires after `unmount()` has unstubbed fetch
+  // and cleared the body, so it hits the real fetch with the relative URL
+  // "admin/config" (unhandled rejection) and renders into the NEXT test's DOM.
+  // On an idle machine it landed harmlessly between tests; under CPU contention
+  // it landed inside one, which is the whole story behind the panel suite's
+  // intermittent "no PUT was sent" reds. Faking it makes `flush()` deterministic
+  // and lets `useRealTimers()` in `unmount` discard whatever is still pending.
+  vi.useFakeTimers({ toFake: ["setInterval", "setTimeout"] });
 
   const markup = extract(BODY_RE, "<body>");
   const script = extract(SCRIPT_RE, "<script>");
@@ -95,8 +102,16 @@ function fakeResponse(data: unknown, ok = true, status = 200): { ok: boolean; st
   return { ok, status, json: () => Promise.resolve(data) };
 }
 
-function flush(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 0));
+/**
+ * Settle everything the panel has in flight: the fetch promise chains AND its
+ * own 400 ms `reloadConfigSoon` debounce. `advanceTimersByTimeAsync` drains the
+ * microtask queue between timer firings, so one call covers a
+ * `fetch().then().then()` chain that crosses several timer boundaries — which a
+ * single real `setTimeout(0)` tick only ever did by luck on an idle machine.
+ * Stays under the 3 s monitor poll interval.
+ */
+async function flush(): Promise<void> {
+  await vi.advanceTimersByTimeAsync(500);
 }
 
 function unmount(): void {

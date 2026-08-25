@@ -176,6 +176,9 @@ export async function describeRequestImages(
   const locations = collectImageLocations(ctx.request);
   if (locations.length === 0) return null;
 
+  // Read the state BEFORE `canAttempt`, which RESERVES the half-open probe slot
+  // as a side effect and would report "half-open" as consumed.
+  const wasHalfOpen = resilience.breaker.getState(cfg.model) === "half-open";
   if (!resilience.breaker.canAttempt(cfg.model)) {
     ctx.logger.warn({ model: cfg.model }, "image_describe: skipped (circuit open)");
     return null;
@@ -185,14 +188,27 @@ export async function describeRequestImages(
   // the worst case (default 60 s each), which a 4-image paste turns into a 4-min
   // stall before the panel even starts. Fan-out is already bounded by the
   // describer model's own gate in `limiterFor`, so this cannot blow past its
-  // per-model concurrency budget. The trade-off on failure is deliberate: when a
-  // describe fails, the siblings already in flight run to completion instead of
-  // being cut short — the contract is still all-or-nothing (we return `null`),
-  // and paying for N failed calls once is cheaper than N sequential timeouts on
-  // every success.
-  const raws = await Promise.all(
-    locations.map((loc) => describeOne(ctx, resilience, cfg, timer, ctx.client, loc.url)),
-  );
+  // per-model concurrency budget. The trade-off on a mid-flight failure is
+  // deliberate: the siblings already in flight run to completion instead of being
+  // cut short — the contract is still all-or-nothing (we return `null`), and
+  // paying for N failed calls once is cheaper than N sequential timeouts on every
+  // success.
+  //
+  // EXCEPT on a half-open breaker, where the contract is "exactly one probe at a
+  // time": we hold ONE reserved probe slot, so firing N calls at a model we
+  // already believe is sick would spend N quota on a recovery guess and pile
+  // extra failures onto its cooldown. Describe image 1 alone as the probe; a
+  // success closes the breaker and the rest fan out normally.
+  const describeAll = (locs: typeof locations): Promise<(string | null)[]> =>
+    Promise.all(locs.map((loc) => describeOne(ctx, resilience, cfg, timer, ctx.client, loc.url)));
+
+  let raws: (string | null)[];
+  if (wasHalfOpen && locations.length > 1) {
+    const probe = await describeOne(ctx, resilience, cfg, timer, ctx.client, locations[0]!.url);
+    raws = probe === null ? [null] : [probe, ...(await describeAll(locations.slice(1)))];
+  } else {
+    raws = await describeAll(locations);
+  }
 
   const descriptions: string[] = [];
   for (const raw of raws) {

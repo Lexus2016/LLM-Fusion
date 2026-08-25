@@ -163,6 +163,64 @@ describe("describeRequestImages", () => {
     expect(arrived).toBe(urls.length);
   });
 
+  it("on a HALF-OPEN breaker probes with ONE image, not the whole fan-out", async () => {
+    // The breaker contract is "half-open allows exactly one probe at a time".
+    // Fanning N calls out at a model we already believe is sick spends N quota on
+    // a single recovery guess and piles extra failures onto its cooldown.
+    const urls = ["data:a", "data:b", "data:c"];
+    let calls = 0;
+    const client: UpstreamClient = {
+      chatCompletions: async () => {
+        calls += 1;
+        return {
+          kind: "json",
+          status: 503,
+          data: {},
+          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        } satisfies ChatCompletionResult;
+      },
+      show: async () => ({}),
+      chatNative: async () => ({ kind: "json", status: 200, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }),
+    };
+    let clock = 0;
+    const r = createResilience({ maxConcurrency: 4, failureThreshold: 1, cooldownMs: 100, now: () => clock });
+    r.breaker.recordFailure("vision-m"); // open it
+    clock += 200; // cooldown elapsed -> half-open
+    expect(r.breaker.getState("vision-m")).toBe("half-open");
+
+    const ctx = makeCtx(imageRequest(urls), client);
+    await expect(describeRequestImages(ctx, r, cfg(), realTimer)).resolves.toBeNull();
+    expect(calls).toBe(1); // the probe only — siblings never fired
+  });
+
+  it("fans the remaining images out once the half-open probe SUCCEEDS", async () => {
+    const urls = ["data:a", "data:b", "data:c"];
+    let calls = 0;
+    const client: UpstreamClient = {
+      chatCompletions: async () => {
+        calls += 1;
+        return {
+          kind: "json",
+          status: 200,
+          data: { choices: [{ message: { role: "assistant", content: "described" } }] },
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        } satisfies ChatCompletionResult;
+      },
+      show: async () => ({}),
+      chatNative: async () => ({ kind: "json", status: 200, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }),
+    };
+    let clock = 0;
+    const r = createResilience({ maxConcurrency: 4, failureThreshold: 1, cooldownMs: 100, now: () => clock });
+    r.breaker.recordFailure("vision-m");
+    clock += 200;
+
+    const ctx = makeCtx(imageRequest(urls), client);
+    const out = await describeRequestImages(ctx, r, cfg(), realTimer);
+    expect(out).not.toBeNull();
+    expect(calls).toBe(urls.length); // probe recovered, the rest still got described
+    expect(r.breaker.getState("vision-m")).toBe("closed");
+  });
+
   it("keeps [IMAGE n] numbering aligned with source order under concurrency", async () => {
     // Promise.all resolves in input order, but the calls COMPLETE out of order.
     // Make the first image the slowest so a naive "append as they finish" would
