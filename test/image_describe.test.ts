@@ -338,13 +338,13 @@ describe("describeRequestImages", () => {
     expect(r.breaker.getState("vision-m")).toBe("open");
   });
 
-  it("releases a reserved half-open probe when something throws mid-batch", async () => {
-    // The health write that frees `probeInFlight` runs after describeOne has
-    // logged. A throw in between must not wedge the breaker in half-open forever.
+  it("a logger that throws AFTER a known 503 still re-opens the breaker (verdict beats telemetry)", async () => {
+    // The outer catch can only ever report "abandoned". If instrumentation were
+    // allowed to reject describeOne, a KNOWN failure would be downgraded to an
+    // abandoned probe — a no-op on a closed breaker, and on a half-open one it
+    // frees the probe instead of re-opening. The verdict must survive its logs.
     const client: UpstreamClient = {
-      chatCompletions: async () => {
-        throw new Error("boom");
-      },
+      chatCompletions: async () => ({ kind: "json", status: 503, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } } satisfies ChatCompletionResult),
       show: async () => ({}),
       chatNative: async () => ({ kind: "json", status: 200, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }),
     };
@@ -352,10 +352,58 @@ describe("describeRequestImages", () => {
     const r = createResilience({ maxConcurrency: 4, failureThreshold: 1, cooldownMs: 100, now: () => clock });
     r.breaker.recordFailure("vision-m");
     clock += 200;
-    // A logger that throws is the realistic trigger; simulate it directly.
+    expect(r.breaker.getState("vision-m")).toBe("half-open");
+
     const boomLogger = { ...logger, warn: () => { throw new Error("logger blew up"); } };
     const ctx = { ...makeCtx(imageRequest(["a", "b"]), client), logger: boomLogger as unknown as typeof logger };
+    await expect(describeRequestImages(ctx, r, cfg(), realTimer)).resolves.toBeNull();
+    // The 503 is a KNOWN failure: the half-open probe must RE-OPEN, not be freed.
+    expect(r.breaker.getState("vision-m")).toBe("open");
+  });
+
+  it("a logger that throws AFTER a known 200 still records the success", async () => {
+    const client: UpstreamClient = {
+      chatCompletions: async () => ({ kind: "json", status: 200, data: { choices: [{ message: { role: "assistant", content: "ok" } }] }, usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } } satisfies ChatCompletionResult),
+      show: async () => ({}),
+      chatNative: async () => ({ kind: "json", status: 200, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }),
+    };
+    const r = createResilience({ maxConcurrency: 4, failureThreshold: 2 });
+    r.breaker.recordFailure("vision-m"); // stale failure on the books
+    const boomLogger = { ...logger, warn: () => { throw new Error("logger blew up") }, info: () => { throw new Error("logger blew up") } };
+    const ctx = { ...makeCtx(imageRequest(["a", "b"]), client), logger: boomLogger as unknown as typeof logger };
+    const out = await describeRequestImages(ctx, r, cfg(), realTimer);
+    expect(out).not.toBeNull();
+    // recordSuccess must have run, clearing the stale count: one more failure
+    // (threshold 2) must NOT open the breaker.
+    r.breaker.recordFailure("vision-m");
+    expect(r.breaker.getState("vision-m")).toBe("closed");
+  });
+
+  it("releases a reserved half-open probe when something throws mid-batch", async () => {
+    // The health write that frees `probeInFlight` runs after describeOne has
+    // logged. A throw in between must not wedge the breaker in half-open forever.
+    // A throw with NO established outcome — the collect/replace step blowing up,
+    // not instrumentation (which is best-effort and can no longer reject).
+    const client: UpstreamClient = {
+      chatCompletions: async () => ({ kind: "json", status: 200, data: { choices: [{ message: { role: "assistant", content: "ok" } }] }, usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } } satisfies ChatCompletionResult),
+      show: async () => ({}),
+      chatNative: async () => ({ kind: "json", status: 200, data: {}, usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }),
+    };
+    let clock = 0;
+    const r = createResilience({ maxConcurrency: 4, failureThreshold: 1, cooldownMs: 100, now: () => clock });
+    r.breaker.recordFailure("vision-m");
+    clock += 200;
+    const ctx = makeCtx(imageRequest(["a", "b"]), client);
+    // recordSuccess is what the probe path calls first; make THAT throw, so the
+    // batch aborts with no verdict applied and the reserved probe would stick.
+    const realSuccess = r.breaker.recordSuccess.bind(r.breaker);
+    let first = true;
+    r.breaker.recordSuccess = (m: string) => {
+      if (first) { first = false; throw new Error("boom"); }
+      realSuccess(m);
+    };
     await expect(describeRequestImages(ctx, r, cfg(), realTimer)).rejects.toThrow();
+    r.breaker.recordSuccess = realSuccess;
     // Still half-open (not wedged): the next call may probe again.
     expect(r.breaker.getState("vision-m")).toBe("half-open");
     expect(r.breaker.canAttempt("vision-m")).toBe(true);

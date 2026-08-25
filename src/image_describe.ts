@@ -101,6 +101,27 @@ function worstHealth(outcomes: DescribeOutcome[]): DescribeHealth {
   return "abandoned";
 }
 
+/**
+ * Run instrumentation (usage accounting, structured failure logs) without ever
+ * letting it destroy a health verdict we have ALREADY established.
+ *
+ * Without this, a logger or usage hook that threw AFTER the upstream answered
+ * made `describeOne` reject, which sent the batch to the outer catch — and that
+ * catch can only report "abandoned". A known 503 would then be recorded as an
+ * abandoned probe (a no-op on a closed breaker, so the failure never counts
+ * toward the threshold), and on a half-open breaker it would free the probe
+ * instead of re-opening. A known 200 would likewise lose its `recordSuccess`
+ * and leave stale `consecutiveFailures` on the books. Telemetry is best-effort;
+ * the verdict is not.
+ */
+function instrument(fn: () => void): void {
+  try {
+    fn();
+  } catch {
+    /* usage/logging is best-effort — never let it overwrite a known outcome */
+  }
+}
+
 /** Apply one aggregated health signal to the describer's breaker. */
 function applyHealth(resilience: Resilience, model: string, health: DescribeHealth): void {
   if (health === "failure") resilience.breaker.recordFailure(model);
@@ -154,33 +175,38 @@ async function describeOne(
     if (ctx.signal?.aborted) {
       return { text: null, health: "abandoned" };
     }
-    ctx.usage?.recordError(cfg.model);
-    logUpstreamFailure(ctx.logger, {
-      stage: "image_describe",
-      model: cfg.model,
-      kind: failureKindForError(err),
-      latencyMs: Date.now() - startedAt,
-      reason: err instanceof Error ? err.message : String(err),
-    });
-    ctx.logger.warn({ model: cfg.model }, "image_describe: describer call failed");
-    return { text: null, health: "failure" };
-  }
-  ctx.usage?.record(cfg.model, result);
-  if (result.kind !== "json" || result.status >= 400) {
-    const availability = result.kind !== "json" || isAvailabilityFailureStatus(result.status);
-    if (availability) {
+    instrument(() => {
+      ctx.usage?.recordError(cfg.model);
       logUpstreamFailure(ctx.logger, {
         stage: "image_describe",
         model: cfg.model,
-        kind: result.kind !== "json" ? "error" : failureKindForStatus(result.status),
-        ...(result.kind === "json" ? { status: result.status } : {}),
+        kind: failureKindForError(err),
         latencyMs: Date.now() - startedAt,
+        reason: err instanceof Error ? err.message : String(err),
       });
-    }
-    ctx.logger.warn(
-      { model: cfg.model, status: result.kind === "json" ? result.status : undefined },
-      "image_describe: describer returned a non-OK response",
-    );
+      ctx.logger.warn({ model: cfg.model }, "image_describe: describer call failed");
+    });
+    return { text: null, health: "failure" };
+  }
+  const settled = result;
+  instrument(() => ctx.usage?.record(cfg.model, settled));
+  if (result.kind !== "json" || result.status >= 400) {
+    const availability = result.kind !== "json" || isAvailabilityFailureStatus(result.status);
+    instrument(() => {
+      if (availability) {
+        logUpstreamFailure(ctx.logger, {
+          stage: "image_describe",
+          model: cfg.model,
+          kind: settled.kind !== "json" ? "error" : failureKindForStatus(settled.status),
+          ...(settled.kind === "json" ? { status: settled.status } : {}),
+          latencyMs: Date.now() - startedAt,
+        });
+      }
+      ctx.logger.warn(
+        { model: cfg.model, status: settled.kind === "json" ? settled.status : undefined },
+        "image_describe: describer returned a non-OK response",
+      );
+    });
     // A non-availability 4xx means the model ANSWERED — it is reachable and
     // healthy, the request shape was wrong — so it reports success even though
     // the description is unusable.
@@ -207,7 +233,7 @@ export async function describeRequestImages(
   // as a side effect and would report "half-open" as consumed.
   const wasHalfOpen = resilience.breaker.getState(cfg.model) === "half-open";
   if (!resilience.breaker.canAttempt(cfg.model)) {
-    ctx.logger.warn({ model: cfg.model }, "image_describe: skipped (circuit open)");
+    instrument(() => ctx.logger.warn({ model: cfg.model }, "image_describe: skipped (circuit open)"));
     return null;
   }
 
@@ -272,7 +298,7 @@ export async function describeRequestImages(
   for (const outcome of outcomes) {
     const raw = outcome.text;
     if (raw === null || raw.trim().length === 0) {
-      ctx.logger.warn({ model: cfg.model }, "image_describe: empty/failed description; falling back");
+      instrument(() => ctx.logger.warn({ model: cfg.model }, "image_describe: empty/failed description; falling back"));
       return null;
     }
     const capped =

@@ -164,6 +164,19 @@ describe("web grounding — tavilySearch", () => {
     expect(out).toEqual({ ok: false, failure: { reason: "bad_body" } });
   });
 
+  it("reports bad_body when the entries are not objects at all", async () => {
+    // Narrowing drops non-record entries, so the surviving array is empty — but
+    // the response DID carry results, so this is shape drift, not a null search.
+    const fetchFn = mockFetch([
+      {
+        match: (url) => url === "https://api.tavily.com/search",
+        respond: () => jsonResponse({ results: [null, "nope", 42] }),
+      },
+    ]);
+    const out = await tavilySearch("query", cfg({ fetch: fetchFn }));
+    expect(out).toEqual({ ok: false, failure: { reason: "bad_body" } });
+  });
+
   it("reports no_results (not an error) on an empty 200 result set", async () => {
     const fetchFn = mockFetch([
       {

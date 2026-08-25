@@ -36,8 +36,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-/** Narrow an unknown JSON payload to a Tavily `results` array, or null. */
-function parseTavilyResponse(data: unknown): { results: TavilyResult[] } | null {
+/**
+ * Narrow an unknown JSON payload to a Tavily `results` array, or null.
+ *
+ * `rawCount` is the length BEFORE non-record entries were dropped. Without it,
+ * `{ results: [null, null] }` narrows to `[]` and is indistinguishable from a
+ * genuinely empty search — so a response whose element shape moved would be
+ * reported as "found nothing" instead of `bad_body`.
+ */
+function parseTavilyResponse(data: unknown): { results: TavilyResult[]; rawCount: number } | null {
   if (!isRecord(data)) return null;
   const results = data.results;
   if (!Array.isArray(results)) return null;
@@ -45,7 +52,7 @@ function parseTavilyResponse(data: unknown): { results: TavilyResult[] } | null 
   for (const r of results) {
     if (isRecord(r)) narrowed.push(r);
   }
-  return { results: narrowed };
+  return { results: narrowed, rawCount: results.length };
 }
 
 export interface WebSearchResult {
@@ -146,7 +153,9 @@ export async function tavilySearch(
     // renaming or dropping `url`, say). Calling that "found nothing" would let
     // grounding die permanently while the log stayed reassuring — the exact
     // silent degradation this classifier exists to prevent.
-    return { ok: false, failure: { reason: payload.results.length === 0 ? "no_results" : "bad_body" } };
+    // `rawCount`, not the narrowed length: entries dropped for not being objects
+    // at all are shape drift just as much as entries missing `url`.
+    return { ok: false, failure: { reason: payload.rawCount === 0 ? "no_results" : "bad_body" } };
   }
   return { ok: true, results: out };
 }

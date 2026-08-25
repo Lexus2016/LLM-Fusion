@@ -26,6 +26,16 @@ All notable changes to this project will be documented in this file.
   in the limiter promise's `.finally`, so an observer that threw both leaked the
   slot — permanently reporting a saturated gate — and propagated a synchronous
   throw before the upstream call was ever submitted.
+- **Instrumentation could overwrite a known describer verdict.** Usage accounting
+  and failure logging ran before `describeOne` returned, so a logger that threw
+  after a real 503 rejected the batch into the outer catch — which can only
+  report "abandoned". A known failure was then a no-op on a closed breaker and
+  merely freed the probe on a half-open one instead of re-opening; a known 200
+  lost its `recordSuccess`. Telemetry is now best-effort; the verdict is not.
+- **A Tavily results array of non-objects read as an empty search.** Narrowing
+  drops non-record entries, so `{results:[null,null]}` reduced to `[]` and was
+  classified `no_results`. Classification now uses the array's ORIGINAL
+  cardinality, so element-shape drift is `bad_body` like any other shape drift.
 - **`web_search.max_context_chars` was unenforced for a single large result.**
   `formatWebContext` always admitted its first block regardless of the budget, so
   one oversized Tavily result blew straight through the cap — `max_context_chars:
