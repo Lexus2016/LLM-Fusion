@@ -256,7 +256,7 @@ describe("per-model gate saturation telemetry", () => {
       warn: (obj: unknown, msg: string) => lines.push({ obj, msg }),
     } as unknown as Parameters<typeof throttledGateWaitLogger>[0];
     let clock = 1_000;
-    const observe = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => clock }).onWait;
+    const observe = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => clock });
 
     observe({ model: "a", budget: 2, queued: 1, scope: "per_model" });
     observe({ model: "a", budget: 2, queued: 2, scope: "per_model" }); // same model, inside the window
@@ -271,33 +271,6 @@ describe("per-model gate saturation telemetry", () => {
     observe({ model: "a", budget: 2, queued: 9, scope: "per_model" }); // window elapsed
     expect(lines).toHaveLength(3);
     expect(lines[2]!.msg).toContain("per-model concurrency budget saturated");
-  });
-
-  it("reports the window's PEAK queue depth, not just the sample that happened to print", () => {
-    // A burst's first sample is always queued:1. Logging only that, then going
-    // quiet for 30 s, records "1 call queued" for a gate that went 80 deep.
-    const lines: { obj: Record<string, unknown>; msg: string }[] = [];
-    const logger = {
-      warn: (obj: Record<string, unknown>, msg: string) => lines.push({ obj, msg }),
-    } as unknown as Parameters<typeof throttledGateWaitLogger>[0];
-    let clock = 1_000;
-    const observe = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => clock }).onWait;
-
-    observe({ model: "a", budget: 2, queued: 1, scope: "per_model" }); // prints immediately
-    expect(lines[0]!.obj).toMatchObject({ queued: 1, peak_queued: 1 });
-    for (const q of [7, 80, 12]) observe({ model: "a", budget: 2, queued: q, scope: "per_model" }); // throttled
-    expect(lines).toHaveLength(1);
-
-    clock += 30_000;
-    observe({ model: "a", budget: 2, queued: 3, scope: "per_model" });
-    expect(lines).toHaveLength(2);
-    // The spike the throttle swallowed is still reported.
-    expect(lines[1]!.obj).toMatchObject({ queued: 3, peak_queued: 80 });
-
-    // The peak resets with the window — it must not sticky-report 80 forever.
-    clock += 30_000;
-    observe({ model: "a", budget: 2, queued: 2, scope: "per_model" });
-    expect(lines[2]!.obj).toMatchObject({ peak_queued: 2 });
   });
 
   it("names the GLOBAL cap when the model has no per-model budget of its own", async () => {
@@ -344,125 +317,13 @@ describe("per-model gate saturation telemetry", () => {
       warn: (obj: Record<string, unknown>, msg: string) => lines.push({ obj, msg }),
     } as unknown as Parameters<typeof throttledGateWaitLogger>[0];
     let clock = 0;
-    const observe = throttledGateWaitLogger(logger, { intervalMs: 10, now: () => clock }).onWait;
+    const observe = throttledGateWaitLogger(logger, { intervalMs: 10, now: () => clock });
     observe({ model: "a", budget: 2, queued: 1, scope: "per_model" });
     clock += 100;
     observe({ model: "b", budget: 8, queued: 1, scope: "global" });
     expect(lines[0]!.msg).toContain("per_model_concurrency");
     expect(lines[1]!.msg).toContain("max_concurrency");
     expect(lines[1]!.msg).not.toContain("per-model concurrency budget saturated");
-  });
-
-  it("reports GLOBAL saturation caused by OTHER models, not just a single model's own gate", async () => {
-    // Global cap 2 held by models a and b; a call to c waits at the global
-    // limiter while c's own gate shows one outstanding call. Watching only
-    // per-model gates, this — the commonest form of congestion — was invisible.
-    const seen: { model: string; scope: string; budget: number }[] = [];
-    const r = createResilience({
-      maxConcurrency: 2,
-      perModel: { overrides: { a: 1, b: 1, c: 1 } },
-      onGateWait: ({ model, scope, budget }) => seen.push({ model, scope, budget }),
-    });
-    let release!: () => void;
-    const blocked = new Promise<void>((res) => (release = res));
-    const jobs = [r.limiterFor("a")(() => blocked), r.limiterFor("b")(() => blocked)];
-    jobs.push(r.limiterFor("c")(() => blocked));
-    expect(seen).toEqual([]); // nothing at submit: no model exceeded its own budget of 1
-    // The cross-model verdict can only be reached once c clears its OWN gate and
-    // meets the global limiter, which p-limit does on a microtask.
-    await new Promise((res) => setTimeout(res, 0));
-    expect(seen).toEqual([{ model: "c", scope: "global", budget: 2 }]);
-    release();
-    await Promise.all(jobs);
-  });
-
-  it("flushes the true peak when a burst drains inside the throttle window", async () => {
-    const lines: Record<string, unknown>[] = [];
-    const logger = { warn: (obj: Record<string, unknown>) => lines.push(obj) } as unknown as Logger;
-    const obs = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => 1_000 });
-    const r = createResilience({
-      maxConcurrency: 8,
-      perModel: { overrides: { m: 1 } },
-      onGateWait: obs.onWait,
-      onGateDrain: obs.onDrain,
-    });
-    let release!: () => void;
-    const blocked = new Promise<void>((res) => (release = res));
-    // One running + five queued: depth reaches 5, then everything drains well
-    // inside the 30 s window, so no later wait event exists to carry the peak.
-    const jobs = [r.limiterFor("m")(() => blocked)];
-    for (let i = 0; i < 5; i++) jobs.push(r.limiterFor("m")(() => Promise.resolve()));
-    expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatchObject({ queued: 1, peak_queued: 1 }); // prompt, but shallow
-    release();
-    await Promise.all(jobs);
-    // The drain flush records what the burst actually reached.
-    expect(lines).toHaveLength(2);
-    expect(lines[1]).toMatchObject({ peak_queued: 5, drained: true });
-  });
-
-  it("does not emit a drain line when the peak was already reported", async () => {
-    const lines: Record<string, unknown>[] = [];
-    const logger = { warn: (obj: Record<string, unknown>) => lines.push(obj) } as unknown as Logger;
-    const obs = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => 1_000 });
-    const r = createResilience({
-      maxConcurrency: 8,
-      perModel: { overrides: { m: 1 } },
-      onGateWait: obs.onWait,
-      onGateDrain: obs.onDrain,
-    });
-    let release!: () => void;
-    const blocked = new Promise<void>((res) => (release = res));
-    const jobs = [r.limiterFor("m")(() => blocked), r.limiterFor("m")(() => Promise.resolve())];
-    expect(lines).toHaveLength(1); // queued:1, peak:1 — already the true peak
-    release();
-    await Promise.all(jobs);
-    expect(lines).toHaveLength(1); // nothing new to say
-  });
-
-  it("keeps per-model and global peaks in SEPARATE windows for the same model", () => {
-    // One model can report both kinds of wait. With a single window per model the
-    // later scope overwrites the earlier one, so a peak accumulated against the
-    // model's own budget gets flushed labelled `global` with the global cap as
-    // its budget — naming the wrong limit in the one line meant to be trusted.
-    const lines: Record<string, unknown>[] = [];
-    const logger = { warn: (obj: Record<string, unknown>) => lines.push(obj) } as unknown as Logger;
-    let clock = 1_000;
-    const obs = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => clock });
-
-    obs.onWait({ model: "m", budget: 2, queued: 1, scope: "per_model" }); // emits
-    obs.onWait({ model: "m", budget: 2, queued: 7, scope: "per_model" }); // throttled, peak 7
-    obs.onWait({ model: "m", budget: 8, queued: 2, scope: "global" }); // OWN window -> emits
-
-    expect(lines).toHaveLength(2);
-    expect(lines[0]).toMatchObject({ scope: "per_model", budget: 2 });
-    expect(lines[1]).toMatchObject({ scope: "global", budget: 8, queued: 2 });
-
-    obs.onDrain("m");
-    // The per-model peak of 7 is flushed as PER-MODEL, with the model's budget.
-    const drained = lines.filter((l) => l.drained === true);
-    expect(drained).toHaveLength(1);
-    expect(drained[0]).toMatchObject({ scope: "per_model", budget: 2, peak_queued: 7 });
-  });
-
-  it("does not resurrect a stale peak from an already-drained burst", () => {
-    // Drain used to return early when the peak had already been reported, WITHOUT
-    // clearing it — so that stale depth could still surface on the next wait once
-    // the throttle interval elapsed, describing a burst long finished.
-    const lines: Record<string, unknown>[] = [];
-    const logger = { warn: (obj: Record<string, unknown>) => lines.push(obj) } as unknown as Logger;
-    let clock = 1_000;
-    const obs = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => clock });
-
-    obs.onWait({ model: "m", budget: 2, queued: 9, scope: "per_model" }); // emits, reported = 9
-    obs.onWait({ model: "m", budget: 2, queued: 3, scope: "per_model" }); // throttled, peak = 3
-    obs.onDrain("m"); // 3 <= 9 so there is nothing new to say — but the window
-    //                   must still be cleared, or that 3 outlives its burst.
-    clock += 60_000;
-    obs.onWait({ model: "m", budget: 2, queued: 1, scope: "per_model" }); // a fresh, shallow burst
-
-    const last = lines[lines.length - 1]!;
-    expect(last).toMatchObject({ queued: 1, peak_queued: 1 }); // NOT 3, which is over
   });
 
   it("holds its invariants across 80 randomised interleavings (budgets, caps, failures)", async () => {
@@ -478,15 +339,11 @@ describe("per-model gate saturation telemetry", () => {
       const overrides: Record<string, number> = {};
       for (const m of models) if (rnd(2) === 0) overrides[m] = 1 + rnd(4);
 
-      // `running` is the ground truth the reports are judged against: a claim of
-      // GLOBAL saturation is only honest if the global limiter really is full.
-      let running = 0;
-      const waits: { model: string; scope: string; queued: number; runningAt: number }[] = [];
+      const waits: { model: string; scope: string; queued: number }[] = [];
       const r = createResilience({
         maxConcurrency,
         perModel: { overrides },
-        onGateWait: (i) => waits.push({ model: i.model, scope: i.scope, queued: i.queued, runningAt: running }),
-        onGateDrain: () => {},
+        onGateWait: (i) => waits.push({ model: i.model, scope: i.scope, queued: i.queued }),
       });
 
       const jobs: Promise<unknown>[] = [];
@@ -496,34 +353,17 @@ describe("per-model gate saturation telemetry", () => {
         jobs.push(
           r
             .limiterFor(m)(async () => {
-              running += 1;
-              try {
-                await new Promise((res) => setTimeout(res, rnd(2)));
-                if (fail) throw new Error("boom");
-                return 1;
-              } finally {
-                running -= 1;
-              }
+              await new Promise((res) => setTimeout(res, rnd(2)));
+              if (fail) throw new Error("boom");
+              return 1;
             })
             .catch(() => undefined),
         );
       }
       await Promise.all(jobs);
 
-      for (const w of waits) {
-        // A reported depth of zero or less means a counter drifted from its budget.
-        expect(w.queued, `trial=${trial} ${JSON.stringify(w)}`).toBeGreaterThan(0);
-        // TRUTHFULNESS, not just liveness: a cross-model global report claims the
-        // global limiter is full, so it must not fire while slots stand idle.
-        // (A per-model report is about the model's own gate and says nothing
-        // about global occupancy, so only `global` is checked here.)
-        if (w.scope === "global") {
-          expect(
-            w.runningAt <= maxConcurrency,
-            `trial=${trial} global report with ${w.runningAt} running vs cap ${maxConcurrency}`,
-          ).toBe(true);
-        }
-      }
+      // A reported depth of zero or less means the counter drifted from its budget.
+      for (const w of waits) expect(w.queued, `trial=${trial} ${JSON.stringify(w)}`).toBeGreaterThan(0);
 
       // Everything settled: a fresh single call on an idle limiter must be silent.
       waits.length = 0;

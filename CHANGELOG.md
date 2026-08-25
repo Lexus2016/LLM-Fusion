@@ -26,15 +26,6 @@ All notable changes to this project will be documented in this file.
   in the limiter promise's `.finally`, so an observer that threw both leaked the
   slot — permanently reporting a saturated gate — and propagated a synchronous
   throw before the upstream call was ever submitted.
-- **Global-cap contention between models was never logged.** The saturation
-  observer fired only when a single model exhausted its own gate, so the common
-  case — a cap of N held by several different models while a call to another one
-  waits — produced no line at all. The limiter now tracks cross-model
-  outstanding calls and reports that case at `scope: "global"`.
-- **A burst that drained inside the throttle window lost its depth.** The peak
-  was only carried out by the NEXT wait event, so a spike to 80 that finished
-  within 30 s left only its first line on the record, reading `queued: 1`. A
-  gate that empties now flushes a `drained: true` line with the real depth.
 - **Instrumentation could overwrite a known describer verdict.** Usage accounting
   and failure logging ran before `describeOne` returned, so a logger that threw
   after a real 503 rejected the batch into the outer catch — which can only
@@ -74,6 +65,13 @@ All notable changes to this project will be documented in this file.
   implemented but appeared only as a commented line in `fusion.example.yaml`).
 
 ### Changed
+- **The gate-saturation log stays a fact, not a metric.** Cross-model tracking,
+  per-window peak depth and a drain flush were built, then removed: between them
+  they produced four correctness defects (a counter that reported saturation
+  while slots stood idle, a false cross-model warning, windows mixing two scopes,
+  and a stale peak outliving its burst) for numbers that made an already
+  actionable line only marginally nicer. What ships is the saturation fact, the
+  budget, the queue depth and which knob to reach for.
 - **Image describes run in parallel.** An N-image paste costs one describe
   latency instead of N (default `timeout_s` is 60 s each). A half-open breaker
   still probes with a single image first. Trade-off: a batch that fails now

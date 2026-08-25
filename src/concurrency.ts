@@ -63,15 +63,11 @@ export type GateWaitObserver = (info: {
  * longer head-of-line-block interactive fusion turns. Uniform ordering across
  * all callers means no lock cycle is possible.
  */
-/** Called when a model's gate fully drains, so a finished burst can flush its peak. */
-export type GateDrainObserver = (model: string) => void;
-
 export function createKeyedLimiter(
   global: Limiter,
   maxConcurrency: number,
   perModel: PerModelConcurrency = {},
   onGateWait?: GateWaitObserver,
-  onGateDrain?: GateDrainObserver,
 ): (model: string) => <T>(fn: () => Promise<T> | T) => Promise<T> {
   // `outstanding` is counted here rather than read off p-limit's
   // `activeCount`/`pendingCount`: p-limit only starts a job on a microtask, so
@@ -86,11 +82,6 @@ export function createKeyedLimiter(
     outstanding: number;
   }
   const gates = new Map<string, Gate>();
-  // Submitted-and-unsettled across EVERY model. Without it, global-cap
-  // contention between DIFFERENT models is invisible: with a cap of 2 held by
-  // models A and B, a call to C waits at the global limiter while C's own gate
-  // shows a single outstanding call, so no per-model gate ever reports it.
-  let globalOutstanding = 0;
   const sizeFor = (model: string): number =>
     Math.max(1, perModel.overrides?.[model] ?? perModel.defaultPerModel ?? maxConcurrency);
   return (model: string) => {
@@ -117,11 +108,11 @@ export function createKeyedLimiter(
       }
     };
     return <T>(fn: () => Promise<T> | T): Promise<T> => {
-      // Verdict A — decided at SUBMIT, because that is the moment the call starts
-      // holding model budget and the model gate is what it will queue at. The
-      // scope depends on whether this model actually has a budget of its own: if
-      // it does not, `sizeFor` gave it the global cap, the gate and the cap are
-      // the same width, and the knob that would help is `max_concurrency`.
+      // Decided at SUBMIT: that is the moment the call starts holding model
+      // budget, and the model gate is what it will queue at. `scope` only picks
+      // which knob to name — when this model has no budget of its own, `sizeFor`
+      // gave it the global cap, so the gate and the cap are the same width and
+      // the knob that would help is `max_concurrency`.
       const queuedAtModel = g.outstanding >= g.budget;
       g.outstanding += 1;
       if (queuedAtModel) {
@@ -131,44 +122,9 @@ export function createKeyedLimiter(
             : { model, budget: maxConcurrency, queued: g.outstanding - g.budget, scope: "global" },
         );
       }
-      return g
-        .limiter(() => {
-          // GLOBAL verdict, decided HERE and not at submit. `globalOutstanding`
-          // must count calls that have reached the global limiter, not calls
-          // merely submitted: with a global cap of 4 and a model budget of 1,
-          // six submissions to that model occupy ONE global slot, yet a
-          // submit-time counter would read 6 and cry global saturation at the
-          // next model — a false warning with a fabricated depth.
-          const queuedGlobally = globalOutstanding >= maxConcurrency;
-          globalOutstanding += 1;
-          // Verdict B — CROSS-MODEL contention: this call cleared its own gate
-          // and still has to wait because other models hold every global slot.
-          // Suppressed when verdict A already fired for this call, so one wait
-          // never produces two lines.
-          if (queuedGlobally && !queuedAtModel) {
-            notify({
-              model,
-              budget: maxConcurrency,
-              queued: globalOutstanding - maxConcurrency,
-              scope: "global",
-            });
-          }
-          return Promise.resolve(global(fn)).finally(() => {
-            globalOutstanding -= 1;
-          });
-        })
-        .finally(() => {
-          g.outstanding -= 1;
-          // The gate emptied: a burst that ended inside the throttle window would
-          // otherwise never report the depth it actually reached.
-          if (g.outstanding === 0 && onGateDrain !== undefined) {
-            try {
-              onGateDrain(model);
-            } catch {
-              /* observer is best-effort */
-            }
-          }
-        });
+      return g.limiter(() => global(fn)).finally(() => {
+        g.outstanding -= 1;
+      });
     };
   };
 }
@@ -383,8 +339,6 @@ export interface ResilienceOptions {
   policy?: Partial<FailoverPolicy>;
   /** Notified when a call queues at its model gate (see GateWaitObserver). */
   onGateWait?: GateWaitObserver;
-  /** Notified when a model's gate drains (see GateDrainObserver). */
-  onGateDrain?: GateDrainObserver;
 }
 
 /** Compose a `Resilience` bundle with sane defaults. */
@@ -392,7 +346,7 @@ export function createResilience(opts: ResilienceOptions): Resilience {
   const limiter = createLimiter(opts.maxConcurrency);
   return {
     limiter,
-    limiterFor: createKeyedLimiter(limiter, opts.maxConcurrency, opts.perModel, opts.onGateWait, opts.onGateDrain),
+    limiterFor: createKeyedLimiter(limiter, opts.maxConcurrency, opts.perModel, opts.onGateWait),
     breaker: new CircuitBreaker({
       failureThreshold: opts.failureThreshold,
       cooldownMs: opts.cooldownMs,
@@ -408,95 +362,38 @@ export function createResilience(opts: ResilienceOptions): Resilience {
 }
 
 /**
- * Throttled `GateWaitObserver` that logs at most one line per model per
- * `intervalMs`. Throttling is the whole point: the observer fires on EVERY
- * queued call, and a Claude-Code-style burst (80–130 calls/min) would otherwise
- * turn a real diagnostic into log spam nobody reads.
+ * Throttled `GateWaitObserver`: at most one line per model per `intervalMs`.
+ * Throttling is the whole point — the observer fires on EVERY queued call, and a
+ * Claude-Code-style burst (80–130 calls/min) would turn a real diagnostic into
+ * spam nobody reads.
+ *
+ * Deliberately does no more than this. An earlier revision also tracked a
+ * per-window peak depth, kept a window per (model, scope), and flushed the peak
+ * when the gate drained. That is a nicer number, and it cost four separate
+ * correctness defects — a stale peak outliving its burst, windows mixing two
+ * scopes, a counter that reported saturation while slots stood idle, and a false
+ * cross-model warning — for a line that is already actionable without it. The
+ * saturation FACT is the signal; the exact depth is not worth the machinery.
  */
 export function throttledGateWaitLogger(
   logger: Logger,
   opts: { intervalMs?: number; now?: Clock } = {},
-): { onWait: GateWaitObserver; onDrain: GateDrainObserver } {
+): GateWaitObserver {
   const intervalMs = opts.intervalMs ?? 30_000;
   const now = opts.now ?? Date.now;
-  interface ModelWindow {
-    /** When this model last emitted a line; `undefined` = never. */
-    lastLogged?: number;
-    /** Deepest queue seen since that line — the number that actually matters. */
-    peak: number;
-    /** The peak value the last emitted line actually carried. */
-    reported: number;
-    budget: number;
-    scope: "per_model" | "global";
-  }
-  // Keyed by model AND scope. One model can report both kinds of wait — its own
-  // budget on one call, the global cap on the next — and a single per-model
-  // window would flush a peak accumulated under one scope while labelled with
-  // the other, naming the wrong limit and the wrong budget.
-  const SCOPES = ["per_model", "global"] as const;
-  const keyOf = (model: string, scope: "per_model" | "global"): string => `${model}\u0000${scope}`;
-  const windows = new Map<string, ModelWindow>();
-  const windowFor = (model: string, scope: "per_model" | "global"): ModelWindow => {
-    const k = keyOf(model, scope);
-    let w = windows.get(k);
-    if (w === undefined) {
-      w = { peak: 0, reported: 0, budget: 0, scope };
-      windows.set(k, w);
-    }
-    return w;
-  };
-  const onWait: GateWaitObserver = ({ model, budget, queued, scope }) => {
-    const w = windowFor(model, scope);
-    w.budget = budget;
-    // Track the peak on EVERY event, including the throttled ones. Reporting only
-    // `queued` would make the log actively misleading: a burst's first sample is
-    // always `queued: 1`, so a gate that went on to back up 80 deep would be
-    // recorded as "1 call queued" and then stay silent for the rest of the window.
-    w.peak = Math.max(w.peak, queued);
+  const lastLogged = new Map<string, number>();
+  return ({ model, budget, queued, scope }) => {
     const t = now();
-    if (w.lastLogged !== undefined && t - w.lastLogged < intervalMs) return;
-    emit(model, w, queued);
-    w.lastLogged = t;
-  };
-
-  function emit(model: string, w: ModelWindow, queued: number): void {
+    const prev = lastLogged.get(model);
+    if (prev !== undefined && t - prev < intervalMs) return;
+    lastLogged.set(model, t);
     logger.warn(
-      { model, budget: w.budget, queued, peak_queued: w.peak, scope: w.scope },
-      w.scope === "per_model"
+      { model, budget, queued, scope },
+      scope === "per_model"
         ? "upstream: per-model concurrency budget saturated; calls are queuing at the model gate (raise upstream.per_model_concurrency for this model)"
         : "upstream: concurrency saturated for this model, which has NO per-model budget — the binding limit is upstream.max_concurrency",
     );
-    w.reported = w.peak;
-    w.peak = 0;
-  }
-
-  /**
-   * The gate emptied. A burst that spiked to 80 and drained inside the throttle
-   * window would otherwise leave only its first line on the record — `queued: 1`
-   * — and the real depth would never be logged at all, because the peak is only
-   * carried out by the NEXT wait event. Flush it here instead.
-   */
-  const onDrain: GateDrainObserver = (model) => {
-    for (const scope of SCOPES) {
-      const w = windows.get(keyOf(model, scope));
-      if (w === undefined) continue;
-      // Reset unconditionally. Returning early on a peak that was already
-      // reported used to LEAVE it in place, so a stale depth belonging to a
-      // burst that finished long ago could still be emitted by the next wait
-      // once the throttle interval elapsed.
-      const unreported = w.peak > w.reported;
-      const peak = w.peak;
-      w.peak = 0;
-      if (!unreported) continue;
-      w.reported = peak;
-      logger.warn(
-        { model, budget: w.budget, peak_queued: peak, scope, drained: true },
-        "upstream: concurrency burst drained; this is the depth it actually reached",
-      );
-    }
   };
-
-  return { onWait, onDrain };
 }
 
 /**
@@ -520,12 +417,7 @@ export function resilienceForUpstream(
       defaultPerModel: upstream.per_model_concurrency_default,
       overrides: upstream.per_model_concurrency,
     },
-    ...(opts.logger
-      ? (() => {
-          const obs = throttledGateWaitLogger(opts.logger);
-          return { onGateWait: obs.onWait, onGateDrain: obs.onDrain };
-        })()
-      : {}),
+    ...(opts.logger ? { onGateWait: throttledGateWaitLogger(opts.logger) } : {}),
   });
 }
 
