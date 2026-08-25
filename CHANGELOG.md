@@ -26,6 +26,15 @@ All notable changes to this project will be documented in this file.
   in the limiter promise's `.finally`, so an observer that threw both leaked the
   slot — permanently reporting a saturated gate — and propagated a synchronous
   throw before the upstream call was ever submitted.
+- **Global-cap contention between models was never logged.** The saturation
+  observer fired only when a single model exhausted its own gate, so the common
+  case — a cap of N held by several different models while a call to another one
+  waits — produced no line at all. The limiter now tracks cross-model
+  outstanding calls and reports that case at `scope: "global"`.
+- **A burst that drained inside the throttle window lost its depth.** The peak
+  was only carried out by the NEXT wait event, so a spike to 80 that finished
+  within 30 s left only its first line on the record, reading `queued: 1`. A
+  gate that empties now flushes a `drained: true` line with the real depth.
 - **Instrumentation could overwrite a known describer verdict.** Usage accounting
   and failure logging ran before `describeOne` returned, so a logger that threw
   after a real 503 rejected the batch into the outer catch — which can only

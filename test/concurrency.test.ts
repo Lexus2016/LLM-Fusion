@@ -6,6 +6,7 @@ import {
   createResilience,
   throttledGateWaitLogger,
 } from "../src/concurrency";
+import type { Logger } from "pino";
 import { OllamaClient } from "../src/upstream/ollama";
 import type { FetchFn } from "../src/types";
 
@@ -255,7 +256,7 @@ describe("per-model gate saturation telemetry", () => {
       warn: (obj: unknown, msg: string) => lines.push({ obj, msg }),
     } as unknown as Parameters<typeof throttledGateWaitLogger>[0];
     let clock = 1_000;
-    const observe = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => clock });
+    const observe = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => clock }).onWait;
 
     observe({ model: "a", budget: 2, queued: 1, scope: "per_model" });
     observe({ model: "a", budget: 2, queued: 2, scope: "per_model" }); // same model, inside the window
@@ -280,7 +281,7 @@ describe("per-model gate saturation telemetry", () => {
       warn: (obj: Record<string, unknown>, msg: string) => lines.push({ obj, msg }),
     } as unknown as Parameters<typeof throttledGateWaitLogger>[0];
     let clock = 1_000;
-    const observe = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => clock });
+    const observe = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => clock }).onWait;
 
     observe({ model: "a", budget: 2, queued: 1, scope: "per_model" }); // prints immediately
     expect(lines[0]!.obj).toMatchObject({ queued: 1, peak_queued: 1 });
@@ -343,13 +344,77 @@ describe("per-model gate saturation telemetry", () => {
       warn: (obj: Record<string, unknown>, msg: string) => lines.push({ obj, msg }),
     } as unknown as Parameters<typeof throttledGateWaitLogger>[0];
     let clock = 0;
-    const observe = throttledGateWaitLogger(logger, { intervalMs: 10, now: () => clock });
+    const observe = throttledGateWaitLogger(logger, { intervalMs: 10, now: () => clock }).onWait;
     observe({ model: "a", budget: 2, queued: 1, scope: "per_model" });
     clock += 100;
     observe({ model: "b", budget: 8, queued: 1, scope: "global" });
     expect(lines[0]!.msg).toContain("per_model_concurrency");
     expect(lines[1]!.msg).toContain("max_concurrency");
     expect(lines[1]!.msg).not.toContain("per-model concurrency budget saturated");
+  });
+
+  it("reports GLOBAL saturation caused by OTHER models, not just a single model's own gate", async () => {
+    // Global cap 2 held by models a and b; a call to c waits at the global
+    // limiter while c's own gate shows one outstanding call. Watching only
+    // per-model gates, this — the commonest form of congestion — was invisible.
+    const seen: { model: string; scope: string; budget: number }[] = [];
+    const r = createResilience({
+      maxConcurrency: 2,
+      perModel: { overrides: { a: 1, b: 1, c: 1 } },
+      onGateWait: ({ model, scope, budget }) => seen.push({ model, scope, budget }),
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((res) => (release = res));
+    const jobs = [r.limiterFor("a")(() => blocked), r.limiterFor("b")(() => blocked)];
+    expect(seen).toEqual([]); // neither model saturated its own budget of 1
+    jobs.push(r.limiterFor("c")(() => blocked));
+    expect(seen).toEqual([{ model: "c", scope: "global", budget: 2 }]);
+    release();
+    await Promise.all(jobs);
+  });
+
+  it("flushes the true peak when a burst drains inside the throttle window", async () => {
+    const lines: Record<string, unknown>[] = [];
+    const logger = { warn: (obj: Record<string, unknown>) => lines.push(obj) } as unknown as Logger;
+    const obs = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => 1_000 });
+    const r = createResilience({
+      maxConcurrency: 8,
+      perModel: { overrides: { m: 1 } },
+      onGateWait: obs.onWait,
+      onGateDrain: obs.onDrain,
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((res) => (release = res));
+    // One running + five queued: depth reaches 5, then everything drains well
+    // inside the 30 s window, so no later wait event exists to carry the peak.
+    const jobs = [r.limiterFor("m")(() => blocked)];
+    for (let i = 0; i < 5; i++) jobs.push(r.limiterFor("m")(() => Promise.resolve()));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ queued: 1, peak_queued: 1 }); // prompt, but shallow
+    release();
+    await Promise.all(jobs);
+    // The drain flush records what the burst actually reached.
+    expect(lines).toHaveLength(2);
+    expect(lines[1]).toMatchObject({ peak_queued: 5, drained: true });
+  });
+
+  it("does not emit a drain line when the peak was already reported", async () => {
+    const lines: Record<string, unknown>[] = [];
+    const logger = { warn: (obj: Record<string, unknown>) => lines.push(obj) } as unknown as Logger;
+    const obs = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => 1_000 });
+    const r = createResilience({
+      maxConcurrency: 8,
+      perModel: { overrides: { m: 1 } },
+      onGateWait: obs.onWait,
+      onGateDrain: obs.onDrain,
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((res) => (release = res));
+    const jobs = [r.limiterFor("m")(() => blocked), r.limiterFor("m")(() => Promise.resolve())];
+    expect(lines).toHaveLength(1); // queued:1, peak:1 — already the true peak
+    release();
+    await Promise.all(jobs);
+    expect(lines).toHaveLength(1); // nothing new to say
   });
 
   it("a THROWING observer neither breaks the call nor leaks a gate slot", () => {
