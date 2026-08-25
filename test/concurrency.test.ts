@@ -417,6 +417,54 @@ describe("per-model gate saturation telemetry", () => {
     expect(lines).toHaveLength(1); // nothing new to say
   });
 
+  it("holds its invariants across 80 randomised interleavings (budgets, caps, failures)", async () => {
+    // Spot tests pin the cases you thought of. The counters here are mutated from
+    // two places (submit and settle) across two scopes, which is exactly the
+    // shape where an unimagined interleaving hides — so sweep instead.
+    let seed = 12345; // deterministic: a failure is reproducible
+    const rnd = (n: number) => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) % n);
+
+    for (let trial = 0; trial < 80; trial++) {
+      const maxConcurrency = 1 + rnd(4);
+      const models = ["a", "b", "c"];
+      const overrides: Record<string, number> = {};
+      for (const m of models) if (rnd(2) === 0) overrides[m] = 1 + rnd(4);
+
+      const waits: { model: string; scope: string; queued: number }[] = [];
+      const r = createResilience({
+        maxConcurrency,
+        perModel: { overrides },
+        onGateWait: (i) => waits.push({ model: i.model, scope: i.scope, queued: i.queued }),
+        onGateDrain: () => {},
+      });
+
+      const jobs: Promise<unknown>[] = [];
+      for (let i = 0, n = 1 + rnd(10); i < n; i++) {
+        const m = models[rnd(models.length)]!;
+        const fail = rnd(5) === 0; // rejections must release their slots too
+        jobs.push(
+          r
+            .limiterFor(m)(async () => {
+              await new Promise((res) => setTimeout(res, rnd(2)));
+              if (fail) throw new Error("boom");
+              return 1;
+            })
+            .catch(() => undefined),
+        );
+      }
+      await Promise.all(jobs);
+
+      // A reported depth of zero or less would mean a counter drifted from its budget.
+      for (const w of waits) expect(w.queued, `trial=${trial} ${JSON.stringify(w)}`).toBeGreaterThan(0);
+
+      // Everything settled: a fresh single call on an idle limiter must be silent.
+      waits.length = 0;
+      await r.limiterFor("a")(() => Promise.resolve());
+      await r.limiterFor("b")(() => Promise.resolve());
+      expect(waits, `trial=${trial} leaked with ${JSON.stringify({ maxConcurrency, overrides })}`).toEqual([]);
+    }
+  });
+
   it("a THROWING observer neither breaks the call nor leaks a gate slot", () => {
     // Telemetry sits between the `outstanding` increment and the limiter call, so
     // an observer that throws used to escape synchronously out of
