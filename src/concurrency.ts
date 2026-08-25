@@ -105,45 +105,70 @@ export function createKeyedLimiter(
     // for this model: its gate can never bind before the global limiter does, so
     // queueing there is really global-cap congestion.
     const perModelBinds = g.budget < maxConcurrency;
-    return <T>(fn: () => Promise<T> | T): Promise<T> => {
-      const queuedAtModel = g.outstanding >= g.budget;
-      const queuedGlobally = globalOutstanding >= maxConcurrency;
-      g.outstanding += 1;
-      globalOutstanding += 1;
-      // Prefer the per-model verdict when this model actually HAS its own budget
-      // — that is the specific, actionable knob. Otherwise fall through to the
-      // global cap, which now also catches cross-model contention.
-      const report: { scope: "per_model" | "global"; queued: number } | null = perModelBinds && queuedAtModel
-        ? { scope: "per_model", queued: g.outstanding - g.budget }
-        : queuedGlobally
-          ? { scope: "global", queued: globalOutstanding - maxConcurrency }
-          : null;
-      if (report !== null && onGateWait !== undefined) {
-        // Telemetry must never be able to break the data path. The increment has
-        // already happened, and the limiter call (with its `.finally` decrement)
-        // has not — so an observer that throws would both leak `outstanding`,
-        // permanently reporting a saturated gate, AND propagate a SYNCHRONOUS
-        // throw out of `limiterFor(m)(fn)` before the upstream call was ever
-        // submitted. Swallow it: a broken logger is not a reason to drop a request.
-        try {
-          onGateWait({ model, budget: report.scope === "global" ? maxConcurrency : g.budget, queued: report.queued, scope: report.scope });
-        } catch {
-          /* observer is best-effort */
-        }
+    // Telemetry must never break the data path: an observer that throws would
+    // otherwise escape synchronously out of `limiterFor(m)(fn)` — before the
+    // upstream call was ever submitted — and leave the counters inflated.
+    const notify = (info: Parameters<GateWaitObserver>[0]): void => {
+      if (onGateWait === undefined) return;
+      try {
+        onGateWait(info);
+      } catch {
+        /* observer is best-effort */
       }
-      return g.limiter(() => global(fn)).finally(() => {
-        g.outstanding -= 1;
-        globalOutstanding -= 1;
-        // The gate emptied: a burst that ended inside the throttle window would
-        // otherwise never report the depth it actually reached.
-        if (g.outstanding === 0 && onGateDrain !== undefined) {
-          try {
-            onGateDrain(model);
-          } catch {
-            /* observer is best-effort */
+    };
+    return <T>(fn: () => Promise<T> | T): Promise<T> => {
+      // Verdict A — decided at SUBMIT, because that is the moment the call starts
+      // holding model budget and the model gate is what it will queue at. The
+      // scope depends on whether this model actually has a budget of its own: if
+      // it does not, `sizeFor` gave it the global cap, the gate and the cap are
+      // the same width, and the knob that would help is `max_concurrency`.
+      const queuedAtModel = g.outstanding >= g.budget;
+      g.outstanding += 1;
+      if (queuedAtModel) {
+        notify(
+          perModelBinds
+            ? { model, budget: g.budget, queued: g.outstanding - g.budget, scope: "per_model" }
+            : { model, budget: maxConcurrency, queued: g.outstanding - g.budget, scope: "global" },
+        );
+      }
+      return g
+        .limiter(() => {
+          // GLOBAL verdict, decided HERE and not at submit. `globalOutstanding`
+          // must count calls that have reached the global limiter, not calls
+          // merely submitted: with a global cap of 4 and a model budget of 1,
+          // six submissions to that model occupy ONE global slot, yet a
+          // submit-time counter would read 6 and cry global saturation at the
+          // next model — a false warning with a fabricated depth.
+          const queuedGlobally = globalOutstanding >= maxConcurrency;
+          globalOutstanding += 1;
+          // Verdict B — CROSS-MODEL contention: this call cleared its own gate
+          // and still has to wait because other models hold every global slot.
+          // Suppressed when verdict A already fired for this call, so one wait
+          // never produces two lines.
+          if (queuedGlobally && !queuedAtModel) {
+            notify({
+              model,
+              budget: maxConcurrency,
+              queued: globalOutstanding - maxConcurrency,
+              scope: "global",
+            });
           }
-        }
-      });
+          return Promise.resolve(global(fn)).finally(() => {
+            globalOutstanding -= 1;
+          });
+        })
+        .finally(() => {
+          g.outstanding -= 1;
+          // The gate emptied: a burst that ended inside the throttle window would
+          // otherwise never report the depth it actually reached.
+          if (g.outstanding === 0 && onGateDrain !== undefined) {
+            try {
+              onGateDrain(model);
+            } catch {
+              /* observer is best-effort */
+            }
+          }
+        });
     };
   };
 }
@@ -404,19 +429,25 @@ export function throttledGateWaitLogger(
     budget: number;
     scope: "per_model" | "global";
   }
+  // Keyed by model AND scope. One model can report both kinds of wait — its own
+  // budget on one call, the global cap on the next — and a single per-model
+  // window would flush a peak accumulated under one scope while labelled with
+  // the other, naming the wrong limit and the wrong budget.
+  const SCOPES = ["per_model", "global"] as const;
+  const keyOf = (model: string, scope: "per_model" | "global"): string => `${model}\u0000${scope}`;
   const windows = new Map<string, ModelWindow>();
-  const windowFor = (model: string): ModelWindow => {
-    let w = windows.get(model);
+  const windowFor = (model: string, scope: "per_model" | "global"): ModelWindow => {
+    const k = keyOf(model, scope);
+    let w = windows.get(k);
     if (w === undefined) {
-      w = { peak: 0, reported: 0, budget: 0, scope: "global" };
-      windows.set(model, w);
+      w = { peak: 0, reported: 0, budget: 0, scope };
+      windows.set(k, w);
     }
     return w;
   };
   const onWait: GateWaitObserver = ({ model, budget, queued, scope }) => {
-    const w = windowFor(model);
+    const w = windowFor(model, scope);
     w.budget = budget;
-    w.scope = scope;
     // Track the peak on EVERY event, including the throttled ones. Reporting only
     // `queued` would make the log actively misleading: a burst's first sample is
     // always `queued: 1`, so a gate that went on to back up 80 deep would be
@@ -446,14 +477,23 @@ export function throttledGateWaitLogger(
    * carried out by the NEXT wait event. Flush it here instead.
    */
   const onDrain: GateDrainObserver = (model) => {
-    const w = windows.get(model);
-    if (w === undefined || w.peak <= w.reported) return;
-    logger.warn(
-      { model, budget: w.budget, peak_queued: w.peak, scope: w.scope, drained: true },
-      "upstream: concurrency burst drained; this is the depth it actually reached",
-    );
-    w.reported = w.peak;
-    w.peak = 0;
+    for (const scope of SCOPES) {
+      const w = windows.get(keyOf(model, scope));
+      if (w === undefined) continue;
+      // Reset unconditionally. Returning early on a peak that was already
+      // reported used to LEAVE it in place, so a stale depth belonging to a
+      // burst that finished long ago could still be emitted by the next wait
+      // once the throttle interval elapsed.
+      const unreported = w.peak > w.reported;
+      const peak = w.peak;
+      w.peak = 0;
+      if (!unreported) continue;
+      w.reported = peak;
+      logger.warn(
+        { model, budget: w.budget, peak_queued: peak, scope, drained: true },
+        "upstream: concurrency burst drained; this is the depth it actually reached",
+      );
+    }
   };
 
   return { onWait, onDrain };
