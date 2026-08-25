@@ -62,8 +62,32 @@ describe("web grounding — formatWebContext", () => {
     expect(out).not.toBeNull();
     // Blocks are capped; the fixed preamble is deliberately outside the budget.
     const blocksOnly = out!.slice(out!.indexOf("[1] "));
-    expect(blocksOnly.length).toBeLessThanOrEqual(201); // 200 + the ellipsis
+    // The ellipsis counts against the budget — never one char over what was asked.
+    expect(blocksOnly.length).toBeLessThanOrEqual(200);
     expect(blocksOnly).toContain("…");
+  });
+
+  it("holds the budget and surrogate-safety across every budget 0..300", () => {
+    // Boundary sweep rather than a spot check: the cap interacts with an
+    // ellipsis that counts against the budget AND with surrogate pairs, and an
+    // off-by-one in either shows up only at specific widths.
+    const content = "a😀b😀".repeat(200);
+    for (let budget = 0; budget <= 300; budget++) {
+      const out = formatWebContext([{ title: "t", url: "https://x", content }], budget);
+      if (out === null) continue;
+      const blocks = out.slice(out.indexOf("[1] "));
+      expect(blocks.length, `budget=${budget}`).toBeLessThanOrEqual(Math.max(budget, 1));
+      for (let i = 0; i < blocks.length; i++) {
+        const c = blocks.charCodeAt(i);
+        if (c >= 0xd800 && c <= 0xdbff) {
+          const next = blocks.charCodeAt(i + 1);
+          expect(next >= 0xdc00 && next <= 0xdfff, `lone high surrogate at ${i}, budget=${budget}`).toBe(true);
+          i++;
+        } else {
+          expect(c >= 0xdc00 && c <= 0xdfff, `lone low surrogate at ${i}, budget=${budget}`).toBe(false);
+        }
+      }
+    }
   });
 
   it("caps the block to maxContextChars, dropping later results", () => {

@@ -158,7 +158,13 @@ export async function tavilySearch(
 function capBlock(block: string, budget: number): string {
   if (budget <= 0) return "";
   if (block.length <= budget) return block;
-  const cut = block.charCodeAt(budget - 1) >= 0xd800 && block.charCodeAt(budget - 1) <= 0xdbff ? budget - 1 : budget;
+  // The ellipsis counts AGAINST the budget (the same rule `excerptMiddle` follows
+  // in the fusion renderer), so the result is never one char over the number the
+  // caller named.
+  const room = budget - 1;
+  if (room <= 0) return "…";
+  const high = block.charCodeAt(room - 1);
+  const cut = high >= 0xd800 && high <= 0xdbff ? room - 1 : room;
   return `${block.slice(0, cut)}…`;
 }
 
