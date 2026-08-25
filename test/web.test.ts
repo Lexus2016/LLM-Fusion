@@ -54,6 +54,18 @@ describe("web grounding — formatWebContext", () => {
     expect(out).toContain("[2] Lua scripting — https://redis.io/lua");
   });
 
+  it("BOUNDS a single oversized result instead of admitting it whole", () => {
+    // The first block is always admitted so a lone result is never dropped, but
+    // unbounded it blew straight through the cap and that text goes verbatim
+    // into every panel member's prompt.
+    const out = formatWebContext([{ title: "t", url: "https://x", content: "z".repeat(50_000) }], 200);
+    expect(out).not.toBeNull();
+    // Blocks are capped; the fixed preamble is deliberately outside the budget.
+    const blocksOnly = out!.slice(out!.indexOf("[1] "));
+    expect(blocksOnly.length).toBeLessThanOrEqual(201); // 200 + the ellipsis
+    expect(blocksOnly).toContain("…");
+  });
+
   it("caps the block to maxContextChars, dropping later results", () => {
     const results: WebSearchResult[] = [
       { title: "a", url: "https://a", content: "x".repeat(2000) },
@@ -113,6 +125,19 @@ describe("web grounding — tavilySearch", () => {
     };
     const out = await tavilySearch("query", cfg({ fetch: fetchFn }));
     expect(out).toEqual({ ok: false, failure: { reason: "network", detail: "network down" } });
+  });
+
+  it("reports bad_body when results exist but none is usable (shape drift, not an empty search)", async () => {
+    // If Tavily renames or drops `url`, every entry is filtered out. Calling that
+    // "found nothing" would let grounding die permanently behind a reassuring log.
+    const fetchFn = mockFetch([
+      {
+        match: (url) => url === "https://api.tavily.com/search",
+        respond: () => jsonResponse({ results: [{ title: "t", content: "c" }, { title: "t2", content: "c2" }] }),
+      },
+    ]);
+    const out = await tavilySearch("query", cfg({ fetch: fetchFn }));
+    expect(out).toEqual({ ok: false, failure: { reason: "bad_body" } });
   });
 
   it("reports no_results (not an error) on an empty 200 result set", async () => {

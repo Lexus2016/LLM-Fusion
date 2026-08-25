@@ -232,8 +232,8 @@ describe("per-model gate saturation telemetry", () => {
     // Two calls fill the budget without waiting; the next three must queue.
     const jobs = Array.from({ length: 5 }, () => r.limiterFor("hot")(() => blocked));
     expect(seen).toHaveLength(3);
-    expect(seen[0]).toEqual({ model: "hot", budget: 2, queued: 1 });
-    expect(seen[2]).toEqual({ model: "hot", budget: 2, queued: 3 });
+    expect(seen[0]).toEqual({ model: "hot", budget: 2, queued: 1, scope: "per_model" });
+    expect(seen[2]).toEqual({ model: "hot", budget: 2, queued: 3, scope: "per_model" });
     release();
     await Promise.all(jobs);
   });
@@ -257,17 +257,17 @@ describe("per-model gate saturation telemetry", () => {
     let clock = 1_000;
     const observe = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => clock });
 
-    observe({ model: "a", budget: 2, queued: 1 });
-    observe({ model: "a", budget: 2, queued: 2 }); // same model, inside the window
-    observe({ model: "b", budget: 2, queued: 1 }); // different model, own window
+    observe({ model: "a", budget: 2, queued: 1, scope: "per_model" });
+    observe({ model: "a", budget: 2, queued: 2, scope: "per_model" }); // same model, inside the window
+    observe({ model: "b", budget: 2, queued: 1, scope: "per_model" }); // different model, own window
     expect(lines).toHaveLength(2);
 
     clock += 29_999;
-    observe({ model: "a", budget: 2, queued: 9 }); // still inside a's window
+    observe({ model: "a", budget: 2, queued: 9, scope: "per_model" }); // still inside a's window
     expect(lines).toHaveLength(2);
 
     clock += 1;
-    observe({ model: "a", budget: 2, queued: 9 }); // window elapsed
+    observe({ model: "a", budget: 2, queued: 9, scope: "per_model" }); // window elapsed
     expect(lines).toHaveLength(3);
     expect(lines[2]!.msg).toContain("per-model concurrency budget saturated");
   });
@@ -282,21 +282,74 @@ describe("per-model gate saturation telemetry", () => {
     let clock = 1_000;
     const observe = throttledGateWaitLogger(logger, { intervalMs: 30_000, now: () => clock });
 
-    observe({ model: "a", budget: 2, queued: 1 }); // prints immediately
+    observe({ model: "a", budget: 2, queued: 1, scope: "per_model" }); // prints immediately
     expect(lines[0]!.obj).toMatchObject({ queued: 1, peak_queued: 1 });
-    for (const q of [7, 80, 12]) observe({ model: "a", budget: 2, queued: q }); // throttled
+    for (const q of [7, 80, 12]) observe({ model: "a", budget: 2, queued: q, scope: "per_model" }); // throttled
     expect(lines).toHaveLength(1);
 
     clock += 30_000;
-    observe({ model: "a", budget: 2, queued: 3 });
+    observe({ model: "a", budget: 2, queued: 3, scope: "per_model" });
     expect(lines).toHaveLength(2);
     // The spike the throttle swallowed is still reported.
     expect(lines[1]!.obj).toMatchObject({ queued: 3, peak_queued: 80 });
 
     // The peak resets with the window — it must not sticky-report 80 forever.
     clock += 30_000;
-    observe({ model: "a", budget: 2, queued: 2 });
+    observe({ model: "a", budget: 2, queued: 2, scope: "per_model" });
     expect(lines[2]!.obj).toMatchObject({ peak_queued: 2 });
+  });
+
+  it("names the GLOBAL cap when the model has no per-model budget of its own", async () => {
+    // sizeFor falls back to maxConcurrency, so an unconfigured model's gate can
+    // never bind before the global limiter does. Reporting that as a per-model
+    // problem sends the operator to `per_model_concurrency`, where raising the
+    // value changes nothing — the real knob is `max_concurrency`.
+    const seen: { scope: string; budget: number }[] = [];
+    const r = createResilience({
+      maxConcurrency: 2,
+      perModel: {}, // nothing configured
+      onGateWait: ({ scope, budget }) => seen.push({ scope, budget }),
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((res) => (release = res));
+    const jobs = [
+      r.limiterFor("m")(() => blocked),
+      r.limiterFor("m")(() => blocked),
+      r.limiterFor("m")(() => blocked), // third call queues
+    ];
+    expect(seen).toEqual([{ scope: "global", budget: 2 }]);
+    release();
+    await Promise.all(jobs);
+  });
+
+  it("still names the per-model budget when one is actually configured", async () => {
+    const seen: string[] = [];
+    const r = createResilience({
+      maxConcurrency: 8,
+      perModel: { overrides: { m: 2 } },
+      onGateWait: ({ scope }) => seen.push(scope),
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((res) => (release = res));
+    const jobs = [r.limiterFor("m")(() => blocked), r.limiterFor("m")(() => blocked), r.limiterFor("m")(() => blocked)];
+    expect(seen).toEqual(["per_model"]);
+    release();
+    await Promise.all(jobs);
+  });
+
+  it("the logger tells the operator WHICH knob to reach for", () => {
+    const lines: { obj: Record<string, unknown>; msg: string }[] = [];
+    const logger = {
+      warn: (obj: Record<string, unknown>, msg: string) => lines.push({ obj, msg }),
+    } as unknown as Parameters<typeof throttledGateWaitLogger>[0];
+    let clock = 0;
+    const observe = throttledGateWaitLogger(logger, { intervalMs: 10, now: () => clock });
+    observe({ model: "a", budget: 2, queued: 1, scope: "per_model" });
+    clock += 100;
+    observe({ model: "b", budget: 8, queued: 1, scope: "global" });
+    expect(lines[0]!.msg).toContain("per_model_concurrency");
+    expect(lines[1]!.msg).toContain("max_concurrency");
+    expect(lines[1]!.msg).not.toContain("per-model concurrency budget saturated");
   });
 
   it("a THROWING observer neither breaks the call nor leaks a gate slot", () => {

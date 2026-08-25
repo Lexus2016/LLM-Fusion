@@ -140,8 +140,26 @@ export async function tavilySearch(
     const content = typeof r.content === "string" ? r.content : "";
     if (url) out.push({ title, url, content });
   }
-  if (out.length === 0) return { ok: false, failure: { reason: "no_results" } };
+  if (out.length === 0) {
+    // An EMPTY results array is a genuinely empty search. A NON-empty array that
+    // produced nothing usable means the response shape moved under us (Tavily
+    // renaming or dropping `url`, say). Calling that "found nothing" would let
+    // grounding die permanently while the log stayed reassuring — the exact
+    // silent degradation this classifier exists to prevent.
+    return { ok: false, failure: { reason: payload.results.length === 0 ? "no_results" : "bad_body" } };
+  }
   return { ok: true, results: out };
+}
+
+/**
+ * Truncate one rendered result block to `budget` code units, never splitting a
+ * surrogate pair (search snippets carry emoji and CJK).
+ */
+function capBlock(block: string, budget: number): string {
+  if (budget <= 0) return "";
+  if (block.length <= budget) return block;
+  const cut = block.charCodeAt(budget - 1) >= 0xd800 && block.charCodeAt(budget - 1) <= 0xdbff ? budget - 1 : budget;
+  return `${block.slice(0, cut)}…`;
 }
 
 /**
@@ -159,8 +177,14 @@ export function formatWebContext(results: WebSearchResult[], maxContextChars: nu
     const body = r.content.trim();
     const block = `${head}\n${body}`;
     if (used + block.length + 2 > maxContextChars && blocks.length > 0) break;
-    blocks.push(block);
-    used += block.length + 2;
+    // The FIRST block is admitted unconditionally so a lone result is never
+    // dropped wholesale — but it still has to be BOUNDED. Without this, one
+    // oversized result blows straight through the cap (`maxContextChars: 10`
+    // returned a 50 000-char context) and that text goes verbatim into EVERY
+    // panel member's prompt, which is what the cap exists to prevent.
+    const admitted = blocks.length === 0 ? capBlock(block, maxContextChars) : block;
+    blocks.push(admitted);
+    used += admitted.length + 2;
     if (used >= maxContextChars) break;
   }
   if (blocks.length === 0) return null;

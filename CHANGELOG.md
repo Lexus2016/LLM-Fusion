@@ -26,6 +26,19 @@ All notable changes to this project will be documented in this file.
   in the limiter promise's `.finally`, so an observer that threw both leaked the
   slot — permanently reporting a saturated gate — and propagated a synchronous
   throw before the upstream call was ever submitted.
+- **`web_search.max_context_chars` was unenforced for a single large result.**
+  `formatWebContext` always admitted its first block regardless of the budget, so
+  one oversized Tavily result blew straight through the cap — `max_context_chars:
+  10` produced a 50 623-char context, which then went verbatim into every panel
+  member's prompt. The first block is now bounded (surrogate-safe).
+- **A Tavily response-shape change was reported as an empty search.** A results
+  array whose entries all lack `url` filtered down to nothing and was classified
+  `no_results`, so grounding could die permanently behind a reassuring INFO line.
+  A non-empty array that yields nothing usable is now `bad_body`.
+- **The gate-saturation warning pointed at the wrong knob.** With no per-model
+  budget configured, a model's gate equals the global cap and can never bind
+  first, yet the line still blamed `per_model_concurrency`. The event now carries
+  a `scope` and the message names the limit that is actually binding.
 - **Panel jsdom tests flaked under CPU load.** `test/panel_dom.ts` faked only
   `setInterval`, so the panel's 400 ms `reloadConfigSoon` debounce outlived its
   test and fired after `unmount()` had unstubbed fetch and cleared the body.

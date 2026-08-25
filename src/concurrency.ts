@@ -41,7 +41,19 @@ export interface PerModelConcurrency {
  * the ONLY externally visible signal that the gating is biting; without it a
  * saturated budget looks exactly like a slow upstream from the outside.
  */
-export type GateWaitObserver = (info: { model: string; budget: number; queued: number }) => void;
+export type GateWaitObserver = (info: {
+  model: string;
+  budget: number;
+  queued: number;
+  /**
+   * Which limit is actually binding. `sizeFor` falls back to the GLOBAL cap for
+   * any model without a per-model budget, so that model's gate is a no-op
+   * wrapper around the global limiter — reporting its saturation as a per-model
+   * problem would point the operator at `per_model_concurrency`, a knob that
+   * cannot help. `scope` lets the logger name the right one.
+   */
+  scope: "per_model" | "global";
+}) => void;
 
 /**
  * Keyed limiter: every real upstream model gets its own gate IN FRONT of the
@@ -80,6 +92,10 @@ export function createKeyedLimiter(
       gates.set(model, gate);
     }
     const g = gate;
+    // A budget at or above the global cap means no per-model budget is
+    // configured for this model: its gate can never bind before the global
+    // limiter does, so any queueing here is really global-cap congestion.
+    const scope: "per_model" | "global" = g.budget < maxConcurrency ? "per_model" : "global";
     return <T>(fn: () => Promise<T> | T): Promise<T> => {
       const willQueue = g.outstanding >= g.budget;
       g.outstanding += 1;
@@ -91,7 +107,7 @@ export function createKeyedLimiter(
         // throw out of `limiterFor(m)(fn)` before the upstream call was ever
         // submitted. Swallow it: a broken logger is not a reason to drop a request.
         try {
-          onGateWait({ model, budget: g.budget, queued: g.outstanding - g.budget });
+          onGateWait({ model, budget: g.budget, queued: g.outstanding - g.budget, scope });
         } catch {
           /* observer is best-effort */
         }
@@ -354,7 +370,7 @@ export function throttledGateWaitLogger(
     peak: number;
   }
   const windows = new Map<string, ModelWindow>();
-  return ({ model, budget, queued }) => {
+  return ({ model, budget, queued, scope }) => {
     let w = windows.get(model);
     if (w === undefined) {
       w = { peak: 0 };
@@ -368,8 +384,10 @@ export function throttledGateWaitLogger(
     const t = now();
     if (w.lastLogged !== undefined && t - w.lastLogged < intervalMs) return;
     logger.warn(
-      { model, budget, queued, peak_queued: w.peak },
-      "upstream: per-model concurrency budget saturated; calls are queuing at the model gate",
+      { model, budget, queued, peak_queued: w.peak, scope },
+      scope === "per_model"
+        ? "upstream: per-model concurrency budget saturated; calls are queuing at the model gate (raise upstream.per_model_concurrency for this model)"
+        : "upstream: concurrency saturated for this model, which has NO per-model budget — the binding limit is upstream.max_concurrency",
     );
     w.lastLogged = t;
     w.peak = 0;
