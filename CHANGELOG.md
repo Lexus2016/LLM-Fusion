@@ -78,6 +78,24 @@ All notable changes to this project will be documented in this file.
   bills every image, visible to the client in `x-fusion-usage`, where the old
   sequential loop stopped at the first failure.
 
+## [0.1.41] - 2026-08-23
+
+### Added
+- **Failure-momentum routing and falsifiable judge/synth discipline.** Three
+  prompt-level changes at zero added latency (same calls, sharper instructions),
+  adopted from the arc-skill result: the smart router reads the loop's momentum —
+  repeated failures or corrections of the same step route to `fusion`, a clean
+  success streak keeps mechanical continuation on `simple` — complementing the
+  existing single-failing-result escalation; the judge prefers claims that can be
+  checked against the request, the provided context or execution, and files
+  confident-but-unverifiable ones under `fragile_claims`; the synth halts at the
+  first contradiction, resolving a suspect premise before stacking any conclusion
+  on it.
+
+  (Entry reconstructed after the fact — 0.1.41 shipped without one, which is why
+  the file jumped from 0.1.40 to 0.1.42. Sourced from commit c6c153a and the
+  README section of the same name.)
+
 ## [0.1.40] - 2026-08-23
 
 ### Added
