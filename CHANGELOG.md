@@ -26,6 +26,13 @@ All notable changes to this project will be documented in this file.
   in the limiter promise's `.finally`, so an observer that threw both leaked the
   slot — permanently reporting a saturated gate — and propagated a synchronous
   throw before the upstream call was ever submitted.
+- **A per-model budget above `max_concurrency` was honoured literally.** The
+  schema accepts `per_model_concurrency: { m: 10 }` with `max_concurrency: 4`,
+  which built a gate wider than anything that can run: the surplus calls cleared
+  their model gate and piled into the GLOBAL queue — the head-of-line blocking
+  the keyed limiter exists to prevent — while the saturation line stayed silent
+  through the wait and then reported a depth measured at the wrong gate. The
+  budget is now clamped to the global cap, so the config means what it says.
 - **Instrumentation could overwrite a known describer verdict.** Usage accounting
   and failure logging ran before `describeOne` returned, so a logger that threw
   after a real 503 rejected the batch into the outer catch — which can only

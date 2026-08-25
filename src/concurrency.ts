@@ -82,8 +82,16 @@ export function createKeyedLimiter(
     outstanding: number;
   }
   const gates = new Map<string, Gate>();
+  // Clamped to the global cap on BOTH ends. A configured budget above
+  // `max_concurrency` describes a gate wider than anything that can actually
+  // run: the surplus calls clear their model gate and pile up in the GLOBAL
+  // queue instead — which is the head-of-line blocking the keyed limiter exists
+  // to prevent, and it also made the telemetry lie (silence while those calls
+  // waited, then a `queued` depth taken from the model gate rather than the
+  // global one). The schema allows such a value, so clamp it here and let the
+  // config mean what it says.
   const sizeFor = (model: string): number =>
-    Math.max(1, perModel.overrides?.[model] ?? perModel.defaultPerModel ?? maxConcurrency);
+    Math.min(maxConcurrency, Math.max(1, perModel.overrides?.[model] ?? perModel.defaultPerModel ?? maxConcurrency));
   return (model: string) => {
     let gate = gates.get(model);
     if (!gate) {

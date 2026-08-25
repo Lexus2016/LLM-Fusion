@@ -194,6 +194,30 @@ describe("per-model keyed limiter (limiterFor)", () => {
     await Promise.all(slowJobs);
   });
 
+  it("clamps a per-model budget configured ABOVE the global cap", async () => {
+    // The schema accepts `per_model_concurrency: { m: 10 }` with
+    // `max_concurrency: 4`. Unclamped, the model gate admits 10 and six calls
+    // pile up in the GLOBAL queue — the exact head-of-line blocking this gate
+    // exists to prevent — and the saturation line stays silent while they wait,
+    // then reports a depth measured at the wrong gate.
+    const seen: { scope: string; budget: number; queued: number }[] = [];
+    const r = createResilience({
+      maxConcurrency: 4,
+      perModel: { overrides: { m: 10 } },
+      onGateWait: ({ scope, budget, queued }) => seen.push({ scope, budget, queued }),
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((res) => (release = res));
+    const jobs = Array.from({ length: 6 }, () => r.limiterFor("m")(() => blocked));
+    // Calls 5 and 6 queue at a gate that is 4 wide, not 10, and say so.
+    expect(seen).toEqual([
+      { scope: "global", budget: 4, queued: 1 },
+      { scope: "global", budget: 4, queued: 2 },
+    ]);
+    release();
+    await Promise.all(jobs);
+  });
+
   it("defaults to the global budget when unconfigured (behavior unchanged)", async () => {
     const r = createResilience({ maxConcurrency: 3 });
     const probe = makeProbe();
