@@ -79,6 +79,56 @@ export function collectImageLocations(request: ChatCompletionRequest): ImageLoca
   return out;
 }
 
+/**
+ * What ONE describe call says about the describer's health. Deliberately NOT
+ * applied to the breaker here: the calls run concurrently, so letting each one
+ * write breaker state directly makes the outcome completion-order dependent —
+ * a 200 on image B calls `recordSuccess`, which zeroes `consecutiveFailures`
+ * and erases the 503 image A just recorded. The batch is ONE request against
+ * ONE model, so it must produce ONE health signal; see `worstHealth`.
+ */
+type DescribeHealth = "success" | "failure" | "abandoned";
+
+interface DescribeOutcome {
+  text: string | null;
+  health: DescribeHealth;
+}
+
+/** Failure wins over success; "abandoned" only when nothing else happened. */
+function worstHealth(outcomes: DescribeOutcome[]): DescribeHealth {
+  if (outcomes.some((o) => o.health === "failure")) return "failure";
+  if (outcomes.some((o) => o.health === "success")) return "success";
+  return "abandoned";
+}
+
+/**
+ * Run instrumentation (usage accounting, structured failure logs) without ever
+ * letting it destroy a health verdict we have ALREADY established.
+ *
+ * Without this, a logger or usage hook that threw AFTER the upstream answered
+ * made `describeOne` reject, which sent the batch to the outer catch — and that
+ * catch can only report "abandoned". A known 503 would then be recorded as an
+ * abandoned probe (a no-op on a closed breaker, so the failure never counts
+ * toward the threshold), and on a half-open breaker it would free the probe
+ * instead of re-opening. A known 200 would likewise lose its `recordSuccess`
+ * and leave stale `consecutiveFailures` on the books. Telemetry is best-effort;
+ * the verdict is not.
+ */
+function instrument(fn: () => void): void {
+  try {
+    fn();
+  } catch {
+    /* usage/logging is best-effort — never let it overwrite a known outcome */
+  }
+}
+
+/** Apply one aggregated health signal to the describer's breaker. */
+function applyHealth(resilience: Resilience, model: string, health: DescribeHealth): void {
+  if (health === "failure") resilience.breaker.recordFailure(model);
+  else if (health === "success") resilience.breaker.recordSuccess(model);
+  else resilience.breaker.recordProbeAbandoned(model);
+}
+
 async function describeOne(
   ctx: StrategyContext,
   resilience: Resilience,
@@ -86,7 +136,7 @@ async function describeOne(
   timer: TimerFactory,
   client: UpstreamClient,
   url: string,
-): Promise<string | null> {
+): Promise<DescribeOutcome> {
   const focus = latestUserText(ctx.request);
   const body: Record<string, unknown> = {
     model: cfg.model,
@@ -123,43 +173,46 @@ async function describeOne(
     );
   } catch (err) {
     if (ctx.signal?.aborted) {
-      resilience.breaker.recordProbeAbandoned(cfg.model);
-      return null;
+      return { text: null, health: "abandoned" };
     }
-    resilience.breaker.recordFailure(cfg.model);
-    ctx.usage?.recordError(cfg.model);
-    logUpstreamFailure(ctx.logger, {
-      stage: "image_describe",
-      model: cfg.model,
-      kind: failureKindForError(err),
-      latencyMs: Date.now() - startedAt,
-      reason: err instanceof Error ? err.message : String(err),
-    });
-    ctx.logger.warn({ model: cfg.model }, "image_describe: describer call failed");
-    return null;
-  }
-  ctx.usage?.record(cfg.model, result);
-  if (result.kind !== "json" || result.status >= 400) {
-    if (result.kind !== "json" || isAvailabilityFailureStatus(result.status)) {
-      resilience.breaker.recordFailure(cfg.model);
+    instrument(() => {
+      ctx.usage?.recordError(cfg.model);
       logUpstreamFailure(ctx.logger, {
         stage: "image_describe",
         model: cfg.model,
-        kind: result.kind !== "json" ? "error" : failureKindForStatus(result.status),
-        ...(result.kind === "json" ? { status: result.status } : {}),
+        kind: failureKindForError(err),
         latencyMs: Date.now() - startedAt,
+        reason: err instanceof Error ? err.message : String(err),
       });
-    } else {
-      resilience.breaker.recordSuccess(cfg.model);
-    }
-    ctx.logger.warn(
-      { model: cfg.model, status: result.kind === "json" ? result.status : undefined },
-      "image_describe: describer returned a non-OK response",
-    );
-    return null;
+      ctx.logger.warn({ model: cfg.model }, "image_describe: describer call failed");
+    });
+    return { text: null, health: "failure" };
   }
-  resilience.breaker.recordSuccess(cfg.model);
-  return extractAnswer(result.data);
+  const settled = result;
+  instrument(() => ctx.usage?.record(cfg.model, settled));
+  if (result.kind !== "json" || result.status >= 400) {
+    const availability = result.kind !== "json" || isAvailabilityFailureStatus(result.status);
+    instrument(() => {
+      if (availability) {
+        logUpstreamFailure(ctx.logger, {
+          stage: "image_describe",
+          model: cfg.model,
+          kind: settled.kind !== "json" ? "error" : failureKindForStatus(settled.status),
+          ...(settled.kind === "json" ? { status: settled.status } : {}),
+          latencyMs: Date.now() - startedAt,
+        });
+      }
+      ctx.logger.warn(
+        { model: cfg.model, status: settled.kind === "json" ? settled.status : undefined },
+        "image_describe: describer returned a non-OK response",
+      );
+    });
+    // A non-availability 4xx means the model ANSWERED — it is reachable and
+    // healthy, the request shape was wrong — so it reports success even though
+    // the description is unusable.
+    return { text: null, health: availability ? "failure" : "success" };
+  }
+  return { text: extractAnswer(result.data), health: "success" };
 }
 
 /**
@@ -180,40 +233,72 @@ export async function describeRequestImages(
   // as a side effect and would report "half-open" as consumed.
   const wasHalfOpen = resilience.breaker.getState(cfg.model) === "half-open";
   if (!resilience.breaker.canAttempt(cfg.model)) {
-    ctx.logger.warn({ model: cfg.model }, "image_describe: skipped (circuit open)");
+    instrument(() => ctx.logger.warn({ model: cfg.model }, "image_describe: skipped (circuit open)"));
     return null;
   }
 
   // Describe every image IN PARALLEL. Sequential describes cost N * timeout_s in
   // the worst case (default 60 s each), which a 4-image paste turns into a 4-min
-  // stall before the panel even starts. Fan-out is already bounded by the
-  // describer model's own gate in `limiterFor`, so this cannot blow past its
-  // per-model concurrency budget. The trade-off on a mid-flight failure is
-  // deliberate: the siblings already in flight run to completion instead of being
-  // cut short — the contract is still all-or-nothing (we return `null`), and
-  // paying for N failed calls once is cheaper than N sequential timeouts on every
-  // success.
+  // stall before the panel even starts. Fan-out is bounded by the describer
+  // model's own gate in `limiterFor` — set `per_model_concurrency` for it, or the
+  // gate defaults to the whole global budget and one big paste can occupy every
+  // slot.
+  //
+  // The cost of parallelism, stated plainly: a batch that fails still BILLS every
+  // image, where the old sequential loop stopped at the first failure. That is
+  // visible to the client in `x-fusion-usage`. Breaker health, by contrast, is
+  // NOT multiplied — the batch yields one aggregated signal (see `worstHealth`),
+  // so N images can neither trip the breaker N times faster nor let one success
+  // erase another image's failure.
   //
   // EXCEPT on a half-open breaker, where the contract is "exactly one probe at a
   // time": we hold ONE reserved probe slot, so firing N calls at a model we
   // already believe is sick would spend N quota on a recovery guess and pile
   // extra failures onto its cooldown. Describe image 1 alone as the probe; a
   // success closes the breaker and the rest fan out normally.
-  const describeAll = (locs: typeof locations): Promise<(string | null)[]> =>
+  const describeAll = (locs: typeof locations): Promise<DescribeOutcome[]> =>
     Promise.all(locs.map((loc) => describeOne(ctx, resilience, cfg, timer, ctx.client, loc.url)));
 
-  let raws: (string | null)[];
-  if (wasHalfOpen && locations.length > 1) {
-    const probe = await describeOne(ctx, resilience, cfg, timer, ctx.client, locations[0]!.url);
-    raws = probe === null ? [null] : [probe, ...(await describeAll(locations.slice(1)))];
-  } else {
-    raws = await describeAll(locations);
+  /** A description that is missing or blank is a failed description. */
+  const unusable = (o: DescribeOutcome): boolean => o.text === null || o.text.trim().length === 0;
+
+  let outcomes: DescribeOutcome[];
+  try {
+    if (wasHalfOpen && locations.length > 1) {
+      const probe = await describeOne(ctx, resilience, cfg, timer, ctx.client, locations[0]!.url);
+      // The probe's verdict lands on the breaker BEFORE any fan-out: that is what
+      // closes it (or re-opens it) and makes the siblings a normal closed-breaker
+      // batch rather than N calls riding one reserved probe slot.
+      applyHealth(resilience, cfg.model, probe.health);
+      if (unusable(probe)) {
+        outcomes = [probe];
+      } else {
+        const rest = await describeAll(locations.slice(1));
+        applyHealth(resilience, cfg.model, worstHealth(rest));
+        outcomes = [probe, ...rest];
+      }
+    } else {
+      outcomes = await describeAll(locations);
+      // ONE aggregated signal for the whole batch. Writing per call would make the
+      // breaker's state depend on which upstream answered last.
+      applyHealth(resilience, cfg.model, worstHealth(outcomes));
+    }
+  } catch (err) {
+    // `canAttempt` above may have RESERVED a half-open probe slot, and the health
+    // write that releases it now runs AFTER `describeOne` has logged. Should a
+    // logger throw in between, the promise rejects, no `applyHealth` runs, and the
+    // breaker sticks in half-open with `probeInFlight` set — wedged until restart,
+    // exactly the failure `recordProbeAbandoned` exists to prevent. Release the
+    // slot on any unexpected throw, then let the error surface unchanged.
+    resilience.breaker.recordProbeAbandoned(cfg.model);
+    throw err;
   }
 
   const descriptions: string[] = [];
-  for (const raw of raws) {
+  for (const outcome of outcomes) {
+    const raw = outcome.text;
     if (raw === null || raw.trim().length === 0) {
-      ctx.logger.warn({ model: cfg.model }, "image_describe: empty/failed description; falling back");
+      instrument(() => ctx.logger.warn({ model: cfg.model }, "image_describe: empty/failed description; falling back"));
       return null;
     }
     const capped =

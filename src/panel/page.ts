@@ -912,7 +912,7 @@ export const PANEL_HTML = `<!doctype html>
       var to=fTimeout._get(); if(to===undefined||isNaN(to)){ formError("Request timeout is required and must be a number."); return; } obj.request_timeout_s=to;
       var cool=fCool._get(); if(cool===undefined||isNaN(cool)){ formError("Connector cooldown is required and must be a number."); return; } obj.connector_cooldown_s=cool;
       var rc=fRecheck._get(); if(rc===undefined||isNaN(rc)){ formError("Connector down recheck is required and must be a number."); return; } obj.connector_down_recheck_s=rc;
-      var pd=fPerDef._get(); if(pd===undefined) delete obj.per_model_concurrency_default; else if(isNaN(pd)){ formError("Per-model concurrency default must be a number."); return; } else obj.per_model_concurrency_default=pd;
+      var pd=fPerDef._get(); if(pd===undefined) delete obj.per_model_concurrency_default; else if(isNaN(pd)||pd<1||pd!==Math.floor(pd)){ formError("Per-model concurrency default must be a whole number above 0."); return; } else obj.per_model_concurrency_default=pd;
       // fKV yields a string for an edited row and the original value for an
       // untouched one; the schema wants positive integers either way.
       var pmRaw=fPerModel._get(); var pm={}; var pmBad=null;

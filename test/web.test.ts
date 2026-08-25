@@ -54,6 +54,42 @@ describe("web grounding — formatWebContext", () => {
     expect(out).toContain("[2] Lua scripting — https://redis.io/lua");
   });
 
+  it("BOUNDS a single oversized result instead of admitting it whole", () => {
+    // The first block is always admitted so a lone result is never dropped, but
+    // unbounded it blew straight through the cap and that text goes verbatim
+    // into every panel member's prompt.
+    const out = formatWebContext([{ title: "t", url: "https://x", content: "z".repeat(50_000) }], 200);
+    expect(out).not.toBeNull();
+    // Blocks are capped; the fixed preamble is deliberately outside the budget.
+    const blocksOnly = out!.slice(out!.indexOf("[1] "));
+    // The ellipsis counts against the budget — never one char over what was asked.
+    expect(blocksOnly.length).toBeLessThanOrEqual(200);
+    expect(blocksOnly).toContain("…");
+  });
+
+  it("holds the budget and surrogate-safety across every budget 0..300", () => {
+    // Boundary sweep rather than a spot check: the cap interacts with an
+    // ellipsis that counts against the budget AND with surrogate pairs, and an
+    // off-by-one in either shows up only at specific widths.
+    const content = "a😀b😀".repeat(200);
+    for (let budget = 0; budget <= 300; budget++) {
+      const out = formatWebContext([{ title: "t", url: "https://x", content }], budget);
+      if (out === null) continue;
+      const blocks = out.slice(out.indexOf("[1] "));
+      expect(blocks.length, `budget=${budget}`).toBeLessThanOrEqual(Math.max(budget, 1));
+      for (let i = 0; i < blocks.length; i++) {
+        const c = blocks.charCodeAt(i);
+        if (c >= 0xd800 && c <= 0xdbff) {
+          const next = blocks.charCodeAt(i + 1);
+          expect(next >= 0xdc00 && next <= 0xdfff, `lone high surrogate at ${i}, budget=${budget}`).toBe(true);
+          i++;
+        } else {
+          expect(c >= 0xdc00 && c <= 0xdfff, `lone low surrogate at ${i}, budget=${budget}`).toBe(false);
+        }
+      }
+    }
+  });
+
   it("caps the block to maxContextChars, dropping later results", () => {
     const results: WebSearchResult[] = [
       { title: "a", url: "https://a", content: "x".repeat(2000) },
@@ -113,6 +149,32 @@ describe("web grounding — tavilySearch", () => {
     };
     const out = await tavilySearch("query", cfg({ fetch: fetchFn }));
     expect(out).toEqual({ ok: false, failure: { reason: "network", detail: "network down" } });
+  });
+
+  it("reports bad_body when results exist but none is usable (shape drift, not an empty search)", async () => {
+    // If Tavily renames or drops `url`, every entry is filtered out. Calling that
+    // "found nothing" would let grounding die permanently behind a reassuring log.
+    const fetchFn = mockFetch([
+      {
+        match: (url) => url === "https://api.tavily.com/search",
+        respond: () => jsonResponse({ results: [{ title: "t", content: "c" }, { title: "t2", content: "c2" }] }),
+      },
+    ]);
+    const out = await tavilySearch("query", cfg({ fetch: fetchFn }));
+    expect(out).toEqual({ ok: false, failure: { reason: "bad_body" } });
+  });
+
+  it("reports bad_body when the entries are not objects at all", async () => {
+    // Narrowing drops non-record entries, so the surviving array is empty — but
+    // the response DID carry results, so this is shape drift, not a null search.
+    const fetchFn = mockFetch([
+      {
+        match: (url) => url === "https://api.tavily.com/search",
+        respond: () => jsonResponse({ results: [null, "nope", 42] }),
+      },
+    ]);
+    const out = await tavilySearch("query", cfg({ fetch: fetchFn }));
+    expect(out).toEqual({ ok: false, failure: { reason: "bad_body" } });
   });
 
   it("reports no_results (not an error) on an empty 200 result set", async () => {

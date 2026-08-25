@@ -41,7 +41,19 @@ export interface PerModelConcurrency {
  * the ONLY externally visible signal that the gating is biting; without it a
  * saturated budget looks exactly like a slow upstream from the outside.
  */
-export type GateWaitObserver = (info: { model: string; budget: number; queued: number }) => void;
+export type GateWaitObserver = (info: {
+  model: string;
+  budget: number;
+  queued: number;
+  /**
+   * Which limit is actually binding. `sizeFor` falls back to the GLOBAL cap for
+   * any model without a per-model budget, so that model's gate is a no-op
+   * wrapper around the global limiter — reporting its saturation as a per-model
+   * problem would point the operator at `per_model_concurrency`, a knob that
+   * cannot help. `scope` lets the logger name the right one.
+   */
+  scope: "per_model" | "global";
+}) => void;
 
 /**
  * Keyed limiter: every real upstream model gets its own gate IN FRONT of the
@@ -70,8 +82,16 @@ export function createKeyedLimiter(
     outstanding: number;
   }
   const gates = new Map<string, Gate>();
+  // Clamped to the global cap on BOTH ends. A configured budget above
+  // `max_concurrency` describes a gate wider than anything that can actually
+  // run: the surplus calls clear their model gate and pile up in the GLOBAL
+  // queue instead — which is the head-of-line blocking the keyed limiter exists
+  // to prevent, and it also made the telemetry lie (silence while those calls
+  // waited, then a `queued` depth taken from the model gate rather than the
+  // global one). The schema allows such a value, so clamp it here and let the
+  // config mean what it says.
   const sizeFor = (model: string): number =>
-    Math.max(1, perModel.overrides?.[model] ?? perModel.defaultPerModel ?? maxConcurrency);
+    Math.min(maxConcurrency, Math.max(1, perModel.overrides?.[model] ?? perModel.defaultPerModel ?? maxConcurrency));
   return (model: string) => {
     let gate = gates.get(model);
     if (!gate) {
@@ -80,10 +100,36 @@ export function createKeyedLimiter(
       gates.set(model, gate);
     }
     const g = gate;
+    // A budget at or above the global cap means no per-model budget is configured
+    // for this model: its gate can never bind before the global limiter does, so
+    // queueing there is really global-cap congestion.
+    const perModelBinds = g.budget < maxConcurrency;
+    // Telemetry must never break the data path: an observer that throws would
+    // otherwise escape synchronously out of `limiterFor(m)(fn)` — before the
+    // upstream call was ever submitted — and leave the counters inflated.
+    const notify = (info: Parameters<GateWaitObserver>[0]): void => {
+      if (onGateWait === undefined) return;
+      try {
+        onGateWait(info);
+      } catch {
+        /* observer is best-effort */
+      }
+    };
     return <T>(fn: () => Promise<T> | T): Promise<T> => {
-      const willQueue = g.outstanding >= g.budget;
+      // Decided at SUBMIT: that is the moment the call starts holding model
+      // budget, and the model gate is what it will queue at. `scope` only picks
+      // which knob to name — when this model has no budget of its own, `sizeFor`
+      // gave it the global cap, so the gate and the cap are the same width and
+      // the knob that would help is `max_concurrency`.
+      const queuedAtModel = g.outstanding >= g.budget;
       g.outstanding += 1;
-      if (willQueue) onGateWait?.({ model, budget: g.budget, queued: g.outstanding - g.budget });
+      if (queuedAtModel) {
+        notify(
+          perModelBinds
+            ? { model, budget: g.budget, queued: g.outstanding - g.budget, scope: "per_model" }
+            : { model, budget: maxConcurrency, queued: g.outstanding - g.budget, scope: "global" },
+        );
+      }
       return g.limiter(() => global(fn)).finally(() => {
         g.outstanding -= 1;
       });
@@ -324,10 +370,18 @@ export function createResilience(opts: ResilienceOptions): Resilience {
 }
 
 /**
- * Throttled `GateWaitObserver` that logs at most one line per model per
- * `intervalMs`. Throttling is the whole point: the observer fires on EVERY
- * queued call, and a Claude-Code-style burst (80–130 calls/min) would otherwise
- * turn a real diagnostic into log spam nobody reads.
+ * Throttled `GateWaitObserver`: at most one line per model per `intervalMs`.
+ * Throttling is the whole point — the observer fires on EVERY queued call, and a
+ * Claude-Code-style burst (80–130 calls/min) would turn a real diagnostic into
+ * spam nobody reads.
+ *
+ * Deliberately does no more than this. An earlier revision also tracked a
+ * per-window peak depth, kept a window per (model, scope), and flushed the peak
+ * when the gate drained. That is a nicer number, and it cost four separate
+ * correctness defects — a stale peak outliving its burst, windows mixing two
+ * scopes, a counter that reported saturation while slots stood idle, and a false
+ * cross-model warning — for a line that is already actionable without it. The
+ * saturation FACT is the signal; the exact depth is not worth the machinery.
  */
 export function throttledGateWaitLogger(
   logger: Logger,
@@ -336,14 +390,16 @@ export function throttledGateWaitLogger(
   const intervalMs = opts.intervalMs ?? 30_000;
   const now = opts.now ?? Date.now;
   const lastLogged = new Map<string, number>();
-  return ({ model, budget, queued }) => {
+  return ({ model, budget, queued, scope }) => {
     const t = now();
     const prev = lastLogged.get(model);
     if (prev !== undefined && t - prev < intervalMs) return;
     lastLogged.set(model, t);
     logger.warn(
-      { model, budget, queued },
-      "upstream: per-model concurrency budget saturated; calls are queuing at the model gate",
+      { model, budget, queued, scope },
+      scope === "per_model"
+        ? "upstream: per-model concurrency budget saturated; calls are queuing at the model gate (raise upstream.per_model_concurrency for this model)"
+        : "upstream: concurrency saturated for this model, which has NO per-model budget — the binding limit is upstream.max_concurrency",
     );
   };
 }

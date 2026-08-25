@@ -2,6 +2,107 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.42] - 2026-08-25
+
+### Fixed
+- **The Anthropic surface ran with no shared limiter and no circuit breaker.**
+  `createApp` resolved the process-lifetime resilience bundle into a local
+  binding and then mounted `createAnthropicApp(deps)` with the raw deps, whose
+  `resilience` is undefined in the real entrypoint. Every `/v1/messages` request
+  therefore built a fresh bundle — a new `p-limit`, a breaker with no history —
+  while the `simple`/`single` route skipped the limiter and breaker outright. So
+  `upstream.max_concurrency` was never enforced across requests and no breaker
+  could accumulate toward its threshold, on precisely the surface
+  `bin/fusion-claude` points Claude Code at. Pre-existing; now covered by a test
+  that fails without the fix.
+- **Concurrent image describes could whitewash the describer's circuit breaker.**
+  With the batch running in parallel, each call wrote breaker state directly, so
+  a 200 on one image called `recordSuccess` and zeroed the `consecutiveFailures`
+  a sibling's 503 had just recorded — a describer failing on part of every batch
+  never tripped. The batch now yields ONE aggregated health signal (failure
+  wins), which also stops N images from tripping the breaker N times faster.
+- **A throwing gate-saturation observer could not break a request.** The
+  `outstanding` counter was incremented before the observer ran and decremented
+  in the limiter promise's `.finally`, so an observer that threw both leaked the
+  slot — permanently reporting a saturated gate — and propagated a synchronous
+  throw before the upstream call was ever submitted.
+- **A per-model budget above `max_concurrency` was honoured literally.** The
+  schema accepts `per_model_concurrency: { m: 10 }` with `max_concurrency: 4`,
+  which built a gate wider than anything that can run: the surplus calls cleared
+  their model gate and piled into the GLOBAL queue — the head-of-line blocking
+  the keyed limiter exists to prevent — while the saturation line stayed silent
+  through the wait and then reported a depth measured at the wrong gate. The
+  budget is now clamped to the global cap, so the config means what it says.
+- **Instrumentation could overwrite a known describer verdict.** Usage accounting
+  and failure logging ran before `describeOne` returned, so a logger that threw
+  after a real 503 rejected the batch into the outer catch — which can only
+  report "abandoned". A known failure was then a no-op on a closed breaker and
+  merely freed the probe on a half-open one instead of re-opening; a known 200
+  lost its `recordSuccess`. Telemetry is now best-effort; the verdict is not.
+- **A Tavily results array of non-objects read as an empty search.** Narrowing
+  drops non-record entries, so `{results:[null,null]}` reduced to `[]` and was
+  classified `no_results`. Classification now uses the array's ORIGINAL
+  cardinality, so element-shape drift is `bad_body` like any other shape drift.
+- **`web_search.max_context_chars` was unenforced for a single large result.**
+  `formatWebContext` always admitted its first block regardless of the budget, so
+  one oversized Tavily result blew straight through the cap — `max_context_chars:
+  10` produced a 50 623-char context, which then went verbatim into every panel
+  member's prompt. The first block is now bounded (surrogate-safe).
+- **A Tavily response-shape change was reported as an empty search.** A results
+  array whose entries all lack `url` filtered down to nothing and was classified
+  `no_results`, so grounding could die permanently behind a reassuring INFO line.
+  A non-empty array that yields nothing usable is now `bad_body`.
+- **The gate-saturation warning pointed at the wrong knob.** With no per-model
+  budget configured, a model's gate equals the global cap and can never bind
+  first, yet the line still blamed `per_model_concurrency`. The event now carries
+  a `scope` and the message names the limit that is actually binding.
+- **Panel jsdom tests flaked under CPU load.** `test/panel_dom.ts` faked only
+  `setInterval`, so the panel's 400 ms `reloadConfigSoon` debounce outlived its
+  test and fired after `unmount()` had unstubbed fetch and cleared the body.
+  Measured against six competing CPU hogs: 1-4 failures per run before, 0 across
+  10 runs after.
+
+### Added
+- **Silent degradations are now observable.** Web grounding reports why it
+  degraded (`http_status` with the code, `network`, `bad_body`, `no_results`,
+  plus distinct lines for a missing query and a client disconnect) instead of a
+  bare `null`; a saturated per-model concurrency gate logs `model`, `budget`,
+  `queued` and `peak_queued`, throttled to one line per model per 30 s.
+- `upstream.per_model_concurrency_default` documented in the README (it was
+  implemented but appeared only as a commented line in `fusion.example.yaml`).
+
+### Changed
+- **The gate-saturation log stays a fact, not a metric.** Cross-model tracking,
+  per-window peak depth and a drain flush were built, then removed: between them
+  they produced four correctness defects (a counter that reported saturation
+  while slots stood idle, a false cross-model warning, windows mixing two scopes,
+  and a stale peak outliving its burst) for numbers that made an already
+  actionable line only marginally nicer. What ships is the saturation fact, the
+  budget, the queue depth and which knob to reach for.
+- **Image describes run in parallel.** An N-image paste costs one describe
+  latency instead of N (default `timeout_s` is 60 s each). A half-open breaker
+  still probes with a single image first. Trade-off: a batch that fails now
+  bills every image, visible to the client in `x-fusion-usage`, where the old
+  sequential loop stopped at the first failure.
+
+## [0.1.41] - 2026-08-23
+
+### Added
+- **Failure-momentum routing and falsifiable judge/synth discipline.** Three
+  prompt-level changes at zero added latency (same calls, sharper instructions),
+  adopted from the arc-skill result: the smart router reads the loop's momentum —
+  repeated failures or corrections of the same step route to `fusion`, a clean
+  success streak keeps mechanical continuation on `simple` — complementing the
+  existing single-failing-result escalation; the judge prefers claims that can be
+  checked against the request, the provided context or execution, and files
+  confident-but-unverifiable ones under `fragile_claims`; the synth halts at the
+  first contradiction, resolving a suspect premise before stacking any conclusion
+  on it.
+
+  (Entry reconstructed after the fact — 0.1.41 shipped without one, which is why
+  the file jumped from 0.1.40 to 0.1.42. Sourced from commit c6c153a and the
+  README section of the same name.)
+
 ## [0.1.40] - 2026-08-23
 
 ### Added

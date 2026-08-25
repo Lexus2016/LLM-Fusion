@@ -159,7 +159,7 @@ models:
     # Gated TWO ways (both required, else fully OFF, no latency/cost):
     #   1. TAVILY_API_KEY must be set in the environment (.env).
     #   2. web_search.enabled must be true here.
-    # A failed search degrades silently to an ungrounded panel. Respects
+    # A failed search degrades to an ungrounded panel, logging the reason (http_status/network/bad_body/no_results). Respects
     # fusion_planning_turn_only (no web search on mid-loop tool-result turns).
     # web_search:
     #   enabled: true

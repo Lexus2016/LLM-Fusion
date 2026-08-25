@@ -2849,7 +2849,13 @@ async function buildPanelWebContext(
     return null;
   }
   const query = webQuery(ctx.request);
-  if (query.length === 0) return null;
+  if (query.length === 0) {
+    ctx.logger.info(
+      { model: ctx.request.model, reason: "no_query" },
+      "fusion: web grounding skipped (latest user turn has no searchable text)",
+    );
+    return null;
+  }
   // Size gate: web context is layered on top of the panel prompt, which in a long
   // agent loop already carries a large tool history. A smaller-context panel member
   // (gpt-oss:120b at 128k) can be pushed over its limit by the added context and
@@ -2879,7 +2885,16 @@ async function buildPanelWebContext(
       // logs from a search that legitimately matched nothing — the operator
       // just sees the "grounding applied" line stop appearing.
       const f = outcome.failure;
-      if (f.reason === "no_results") {
+      if (ctx.signal?.aborted) {
+        // The client hung up mid-search (Esc in an agent client). `tavilySearch`
+        // reports the resulting AbortError as `network`, but a disconnect is not
+        // an upstream fault and must not be dressed up as one — a warn here would
+        // make routine cancellations look like a broken Tavily key.
+        ctx.logger.info(
+          { model: ctx.request.model, reason: "client_aborted" },
+          "fusion: web grounding cancelled by client disconnect",
+        );
+      } else if (f.reason === "no_results") {
         ctx.logger.info(
           { model: ctx.request.model },
           "fusion: web grounding found nothing; proceeding ungrounded",

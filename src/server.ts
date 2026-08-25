@@ -195,7 +195,19 @@ export function createApp(deps: AppDeps): Hono {
   });
 
   // Anthropic Messages API compatibility on the same base URL.
-  app.route("/", createAnthropicApp(deps));
+  //
+  // `resilience`, NOT `deps` verbatim: `deps.resilience` is undefined in the
+  // real entrypoint (index.ts builds the app without one), so passing `deps`
+  // through handed `/v1/messages` an undefined bundle. Every strategy then fell
+  // back to `ctx.resilience ?? resilienceForUpstream(...)` and built a FRESH
+  // bundle per request — a new p-limit, a breaker with no history, gates with
+  // `outstanding` at zero — while `single` (`ctx.resilience` falsy) skipped the
+  // limiter and the breaker outright. So the whole Anthropic surface ran with
+  // `max_concurrency` unenforced across requests, a breaker that could never
+  // accumulate toward its threshold, and no gate-saturation telemetry. That is
+  // the surface `bin/fusion-claude` points Claude Code at, i.e. the burst
+  // traffic the per-model budgets exist for.
+  app.route("/", createAnthropicApp({ ...deps, resilience }));
 
   app.post("/v1/chat/completions", auth, async (c) => {
     // Per-request correlation id + latency. Prompt CONTENT is never logged

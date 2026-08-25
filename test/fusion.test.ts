@@ -698,6 +698,45 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(res.headers.get("X-Fusion-Degraded-Members")).toBe("2");
   });
 
+  it("logs a WARN naming the reason when the web search fails, and an INFO when it merely finds nothing", async () => {
+    // README promises a dead key is distinguishable from an empty search. Without
+    // this test that promise is unenforced: both paths return the same `null`.
+    const lines: { level: string; obj: Record<string, unknown> }[] = [];
+    const capture = {
+      warn: (obj: Record<string, unknown>) => lines.push({ level: "warn", obj }),
+      info: (obj: Record<string, unknown>) => lines.push({ level: "info", obj }),
+      error: () => {},
+      debug: () => {},
+      child: () => capture,
+    };
+
+    const run = async (tavily: () => Response) => {
+      lines.length = 0;
+      vi.stubEnv("TAVILY_API_KEY", "tvly-test-key");
+      vi.stubGlobal("fetch", mockFetch([{ match: (u) => u === "https://api.tavily.com/search", respond: tavily }]));
+      try {
+        const up = makeUpstream(defaultChat(true));
+        const base = ctx(up.client, req({ model: "fusion-web" }), "fusion-web");
+        await fusionStrategy.execute({ ...base, logger: capture as unknown as typeof base.logger });
+      } finally {
+        vi.unstubAllGlobals();
+        vi.unstubAllEnvs();
+      }
+      return lines.slice();
+    };
+
+    // 401 = dead/expired key -> WARN carrying the status.
+    const failed = await run(() => jsonResponse({ error: "bad key" }, 401));
+    const warn = failed.find((l) => l.level === "warn" && l.obj.reason === "http_status");
+    expect(warn).toBeDefined();
+    expect(warn!.obj.status).toBe(401);
+
+    // A successful but empty search is benign -> INFO, never a warn.
+    const empty = await run(() => jsonResponse({ results: [] }));
+    expect(empty.some((l) => l.level === "info" && l.obj.reason === undefined)).toBe(true);
+    expect(empty.some((l) => l.level === "warn" && l.obj.reason === "http_status")).toBe(false);
+  });
+
   it("a rate-limited (429) panel member is dropped, trips the breaker, and is NOT counted as permanently gated", async () => {
     // 429 is the failure mode a fusion actually hits under load, and it must be
     // classified differently from 403/404/410: a rate limit is TRANSIENT, so it
