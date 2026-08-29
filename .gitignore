@@ -10,5 +10,7 @@ AUDIT*
 fusion.yaml.bak-*
 .playwright-mcp/
 bench/aborted/
-start.sh
 panel-model-form-a11y.png
+
+# start.sh is the launchd entrypoint — it must ship with the repo, otherwise a
+# fresh clone has nothing for the supervisor to run.

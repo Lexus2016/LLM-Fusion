@@ -13,9 +13,10 @@
 #   3. launches claude with the remaining arguments.
 #
 # Env:
-#   FUSION_PROXY_URL           override proxy URL (default http://127.0.0.1:8080)
+#   FUSION_PROXY_URL           override proxy URL (default: 127.0.0.1 on the port in fusion.yaml)
+#   FUSION_CONFIG              config file to read the port from (default ./fusion.yaml)
 #   FUSION_PROXY_TOKEN         if your proxy requires client auth, used as ANTHROPIC_AUTH_TOKEN
-#   ANTHROPIC_SMALL_FAST_MODEL override the fast model Claude uses for light tasks (default fast-deepseek)
+#   ANTHROPIC_SMALL_FAST_MODEL override the fast model Claude uses for light tasks (default fast-background)
 set -euo pipefail
 
 # The first positional arg selects the model, but ONLY when it is not a flag.
@@ -39,7 +40,28 @@ while [ -L "$SOURCE" ]; do
   [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 REPO="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
-PROXY_URL="${FUSION_PROXY_URL:-http://127.0.0.1:8080}"
+# The proxy URL comes from the CONFIG, not a hardcoded port: fusion.yaml has
+# served 8081 since 2026-07 while this script still defaulted to 8080, so the
+# health probe missed a running proxy and started a second one. FUSION_PROXY_URL
+# still wins; FUSION_CONFIG selects the config (e.g. ./fusion.tuned.yaml).
+FUSION_CONFIG_PATH="${FUSION_CONFIG:-$REPO/fusion.yaml}"
+config_port() {
+  python3 - "$1" <<'PYEOF' 2>/dev/null || echo 8080
+import sys, re
+try:
+    text = open(sys.argv[1]).read()
+except OSError:
+    print(8080); raise SystemExit
+# Deliberately a regex, not a YAML parse: this script must not depend on a
+# python yaml module being installed. `port:` under `server:` at two-space indent.
+m = re.search(r"^server:\s*$(.*?)(?=^\S)", text, re.M | re.S)
+block = m.group(1) if m else text
+m = re.search(r"^\s{2}port:\s*(\d+)", block, re.M)
+print(m.group(1) if m else 8080)
+PYEOF
+}
+PROXY_PORT="$(config_port "$FUSION_CONFIG_PATH")"
+PROXY_URL="${FUSION_PROXY_URL:-http://127.0.0.1:$PROXY_PORT}"
 
 # 1. ensure the proxy is up ---------------------------------------------------
 if ! curl -fsS "$PROXY_URL/health" >/dev/null 2>&1; then
@@ -62,10 +84,12 @@ export ANTHROPIC_MODEL="$MODEL"
 # The small/fast model must NOT share a rate-limit bucket with anything the
 # main loop depends on: Claude Code fires background bursts of 80-130 small
 # calls/min, and on 2026-07-06 those bursts 429-starved kimi-k2.7-code — the
-# fusion-coder synth at the time (a panel member since v0.1.23) — killing
-# large-file generation mid-loop. deepseek-v4-pro is used by no panel, synth,
-# judge, router, or simple route, so its rate limit is free to burn.
-export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-fast-deepseek}"
+# fusion-coder synth at the time — killing large-file generation mid-loop.
+# `fast-deepseek` was the old default and is NO LONGER SAFE: its target
+# deepseek-v4-flash:0731-cloud holds a panel seat in both fusion models.
+# `fast-background` exists precisely for this role and holds no pipeline role;
+# the proxy warns at startup if the model you pick overlaps a panel.
+export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-fast-background}"
 export ANTHROPIC_AUTH_TOKEN="${FUSION_PROXY_TOKEN:-local-no-auth}"
 
 # A user-level ~/.claude/settings.json `env` block (e.g. a personal
