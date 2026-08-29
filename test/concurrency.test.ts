@@ -175,6 +175,45 @@ describe("per-model keyed limiter (limiterFor)", () => {
     expect(probe.peak("deepseek-v4-pro")).toBe(2);
   });
 
+  it("binds a family-name budget to every tagged id of that family", async () => {
+    // Ollama ids carry a tag (`deepseek-v4-flash:0731-cloud`) and every call site
+    // passes the full tagged id, but operators write the family in the config.
+    // Before the family fallback this key gated nothing and the model silently
+    // ran at the global cap.
+    const r = createResilience({
+      maxConcurrency: 8,
+      perModel: { overrides: { "deepseek-v4-flash": 2 } },
+    });
+    const probe = makeProbe();
+    const id = "deepseek-v4-flash:0731-cloud";
+    await Promise.all(Array.from({ length: 6 }, () => r.limiterFor(id)(probe.job(id))));
+    expect(probe.peak(id)).toBe(2);
+  });
+
+  it("prefers an exact tagged key over its family key", async () => {
+    const r = createResilience({
+      maxConcurrency: 8,
+      perModel: { overrides: { "glm-5.3": 1, "glm-5.3:cloud": 3 } },
+    });
+    const probe = makeProbe();
+    await Promise.all(
+      Array.from({ length: 6 }, () => r.limiterFor("glm-5.3:cloud")(probe.job("glm-5.3:cloud"))),
+    );
+    expect(probe.peak("glm-5.3:cloud")).toBe(3);
+  });
+
+  it("does not let a family key leak across different families", async () => {
+    const r = createResilience({
+      maxConcurrency: 6,
+      perModel: { overrides: { "deepseek-v4-flash": 1 } },
+    });
+    const probe = makeProbe();
+    // Same prefix STRING, different family — must not inherit the budget.
+    const other = "deepseek-v4-flash-turbo:cloud";
+    await Promise.all(Array.from({ length: 4 }, () => r.limiterFor(other)(probe.job(other))));
+    expect(probe.peak(other)).toBe(4);
+  });
+
   it("a saturated model queues at its own gate and does not block another model", async () => {
     const r = createResilience({ maxConcurrency: 8, perModel: { overrides: { slow: 1 } } });
     let release!: () => void;

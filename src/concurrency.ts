@@ -90,8 +90,24 @@ export function createKeyedLimiter(
   // waited, then a `queued` depth taken from the model gate rather than the
   // global one). The schema allows such a value, so clamp it here and let the
   // config mean what it says.
+  // Ollama model ids carry a TAG suffix (`deepseek-v4-flash:0731-cloud`,
+  // `glm-5.3-flash:cloud`), but an operator naturally writes the model FAMILY in
+  // `per_model_concurrency` — and every call site passes the full tagged id
+  // (`limiterFor(member)` / `limiterFor(target)`), so an exact-key lookup alone
+  // silently missed such an entry: the gate fell back to the global cap and the
+  // configured budget did nothing (observed 2026-08-29 on a config that had
+  // gated `deepseek-v4-flash` while traffic ran as `deepseek-v4-flash:0731-cloud`).
+  // Exact key still wins, so a per-TAG budget can override its family's.
+  const budgetFor = (model: string): number | undefined => {
+    const overrides = perModel.overrides;
+    if (!overrides) return undefined;
+    const exact = overrides[model];
+    if (exact !== undefined) return exact;
+    const tagAt = model.indexOf(":");
+    return tagAt > 0 ? overrides[model.slice(0, tagAt)] : undefined;
+  };
   const sizeFor = (model: string): number =>
-    Math.min(maxConcurrency, Math.max(1, perModel.overrides?.[model] ?? perModel.defaultPerModel ?? maxConcurrency));
+    Math.min(maxConcurrency, Math.max(1, budgetFor(model) ?? perModel.defaultPerModel ?? maxConcurrency));
   return (model: string) => {
     let gate = gates.get(model);
     if (!gate) {
