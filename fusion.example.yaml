@@ -1,282 +1,446 @@
-upstream:
-  # base_url / api_key_env describe the DEFAULT single connector. They are
-  # OPTIONAL when a `connectors:` list (below) is present; required otherwise.
-  base_url: https://ollama.com        # Ollama Cloud root
-  api_key_env: OLLAMA_API_KEY         # env var holding the Bearer key (never inline)
-  api_mode: auto                      # auto | openai | native   (default: auto)
-  max_concurrency: 4                  # global p-limit across all in-flight calls (default: 4)
-  # Per-model concurrency budgets (optional), keyed by REAL upstream model name.
-  # Each model gets its own gate IN FRONT of the global limiter, so a burst on
-  # one model (e.g. an agent client's background small-model calls) queues at
-  # its own gate instead of head-of-line blocking every other model. A model
-  # without an override may use the full global budget (identical to a single
-  # global limiter — the default behavior when both keys are unset).
-  # per_model_concurrency_default: 4  # budget for models without an override
-  # per_model_concurrency:
-  #   deepseek-v4-pro: 2              # cap a background-traffic carrier
-  request_timeout_s: 170              # per upstream call; MUST be < 182 (default: 170)
-  # Connector-pool failover tuning (see `connectors:` below and the /panel):
-  connector_cooldown_s: 60            # SOFT failure (rate_limit/5xx/network/timeout) cooldown
-                                      # before a connector is probed again (default: 60)
-  connector_down_recheck_s: 900       # HARD failure (auth/payment/quota — "billing ended")
-                                      # recheck window before an auto-probe; 0 = never
-                                      # (manual reset only in the panel). (default: 900)
-                                      # If EVERY account is banned at once, one throttled
-                                      # last-resort probe (~1 per 5s) still runs — except
-                                      # for PARKED (down_recheck_s: 0) accounts, whose
-                                      # manual-reset-only contract always holds.
+# llm-fusion — ANNOTATED REFERENCE CONFIG
+#
+# Every key the schema accepts appears here, with its type, its default, and the
+# reason it exists. Active keys show a working value; optional keys are shown
+# commented out with their default, so uncommenting one never changes behaviour
+# by accident.
+#
+# This file is validated in CI (test/example_config.test.ts): it must parse, it
+# must mention every key in the schema, and it must produce ZERO startup
+# warnings — no dead concurrency budgets, no small-fast model sharing a bucket
+# with a panel. Copy it to `fusion.yaml` and edit; the proxy loads `./fusion.yaml`
+# by default, or whatever `FUSION_CONFIG` points at.
+#
+# Model ids below are real Ollama Cloud ids as of 2026-08. Check yours against
+# `curl https://ollama.com/v1/models -H "Authorization: Bearer $OLLAMA_API_KEY"`
+# before copying — a retired id makes every panel fan-out pay for a 404 seat.
 
-# --- providers (optional) ---------------------------------------------------
-# Provider GROUPS the proxy fails over across. Each group is ONE upstream
-# provider (Ollama Cloud, OpenRouter, …) and its ordered ACCOUNTS. Failover
-# happens WITHIN a group, so every account of a group serves the SAME models — a
-# fusion built on this group stays consistent when one account degrades and the
-# next takes over. A virtual model is bound to ONE group via its `provider:`
-# field (see `models:`), so it never silently jumps to a provider with a
+# =============================================================================
+# upstream — pool-wide connection settings, shared by every provider group
+# =============================================================================
+upstream:
+  # LEGACY SINGLE-CONNECTOR FORM. `base_url` + `api_key_env` describe one default
+  # connector and synthesise a provider group named `default`. They are OPTIONAL
+  # when a `providers:` block is present (as it is below) and REQUIRED otherwise.
+  # Prefer `providers:` — it is the only form that supports account failover.
+  # base_url: https://ollama.com    # Ollama Cloud root
+  # api_key_env: OLLAMA_API_KEY     # env var holding the Bearer key (never inline the key)
+
+  api_mode: auto # auto | openai | native   (default: auto)
+    # auto  — probe /v1 once, fall back to the native /api endpoints
+    # openai — force the OpenAI-compatible surface (/v1/chat/completions)
+    # native — force Ollama's own /api/chat
+
+  max_concurrency: 4 # global p-limit across ALL in-flight upstream calls (default: 4)
+
+  # --- per-model concurrency budgets (optional) -------------------------------
+  # Each model gets its own gate IN FRONT of the global limiter, so a burst on
+  # one model (an agent client's background small-model calls, say) queues at its
+  # OWN gate instead of head-of-line blocking every other model.
+  #
+  # KEY FORM MATTERS. A key may be:
+  #   - the full tagged upstream id ...... deepseek-v4-flash:0731-cloud
+  #   - or the family before the `:` tag . deepseek-v4-flash   (covers every tag)
+  # An exact key wins over its family. A key matching NEITHER gates nothing — the
+  # proxy lists such dead keys at startup, because a budget that silently does not
+  # apply is worse than no budget at all.
+  #
+  # A budget above `max_concurrency` is clamped to it: a wider gate would just
+  # move the queue into the global limiter, which is the blocking this prevents.
+  per_model_concurrency:
+    gpt-oss:20b-cloud: 2 # background/small-fast traffic, deliberately capped
+  # per_model_concurrency_default: 4  # budget for every model without an explicit
+                                      # override. Unset (the default) = such models
+                                      # may use the full global budget.
+
+  request_timeout_s: 170 # per upstream call; MUST be < 182 (default: 170)
+    # A full fusion path (panel -> judge -> synth -> bineval) on a heavy prompt
+    # can exceed 120 s at the synth stage; raise this before blaming the models.
+
+  # --- connector-pool failover tuning (see `providers:` and the /panel) --------
+  connector_cooldown_s: 60 # SOFT failure (rate_limit / 5xx / network / timeout):
+                           # how long before the connector is probed again (default: 60)
+  connector_down_recheck_s: 900 # HARD failure (auth / payment / quota — "billing ended"):
+                                # recheck window before an auto-probe; 0 = never, i.e.
+                                # PARKED, manual reset in the panel only. (default: 900)
+                                # If EVERY account is banned at once, one throttled
+                                # last-resort probe (~1 per 5 s) still runs — except for
+                                # parked accounts, whose manual-reset contract always holds.
+
+# =============================================================================
+# providers (optional) — the groups the proxy fails over ACROSS
+# =============================================================================
+# Each group is ONE upstream provider (Ollama Cloud, OpenRouter, …) and its
+# ordered ACCOUNTS. Failover happens WITHIN a group, so every account of a group
+# must serve the SAME models — that is what keeps a fusion consistent when one
+# account degrades and the next takes over. A virtual model binds to ONE group
+# via its `provider:` field, so it never silently jumps to a provider with a
 # different model catalog.
 #
-# When ABSENT, a single `default` group is synthesised from `upstream.base_url` +
-# `upstream.api_key_env` above (fully backward compatible). Watch it all live at
-# http://127.0.0.1:8080/panel.
+# When this block is ABSENT, a single `default` group is synthesised from
+# `upstream.base_url` + `upstream.api_key_env` (fully backward compatible).
+# Watch it all live at http://127.0.0.1:8080/panel.
 #
-# providers:
-#   ollama-cloud:                     # provider group id (referenced by models)
-#     type: ollama                    # ollama | openai-compat
-#     base_url: https://ollama.com    # group default; an account may override it
-#     accounts:                       # failover across these (same models, diff keys)
-#       - { id: ollama-1, api_key_env: OLLAMA_API_KEY }
-#       - { id: ollama-2, api_key_env: OLLAMA_API_KEY_2 }
+# IMPORTANT: with ONE group, a model's `provider:` is optional. Add a SECOND
+# group and `provider:` becomes REQUIRED on every model — otherwise the config is
+# rejected as ambiguous, including on hot-reload.
 #
-#   openrouter:                       # any OpenAI-compatible provider = its own group
-#     type: openai-compat             # covers OpenRouter / DeepInfra / Together /
-#     base_url: https://openrouter.ai/api/v1   # Novita / Nebius / Groq / DeepSeek / …
-#     accounts:
-#       - id: openrouter-1
-#         api_key_env: OPENROUTER_API_KEY
-#         extra_headers: { HTTP-Referer: https://localhost, X-Title: llm-fusion }
-#         model_map:                  # this group's model ids (used in `models:`)
-#           "qwen3-coder:480b": "qwen/qwen3-coder"
-#         # treat_403_as: down        # some gateways use 403 for no-credits (default: passthrough)
-#         # quota_markers: ["insufficient"]  # opt-in: escalate a matching 429 to DOWN
-#
-# A model then binds to a group. With ONE group `provider:` is optional; with
-# several it is REQUIRED:
-#   models:
-#     fusion-coder: { strategy: fusion, provider: ollama-cloud, panel: [...], judge: ..., synth: ... }
+providers:
+  ollama-cloud: # group id, referenced by a model's `provider:`
+    type: ollama # ollama | openai-compat  (default: ollama)
+    base_url: https://ollama.com # group default; an account may override it
+    accounts: # failover order is the order written here
+      - id: ollama-1 # must be unique across ALL groups
+        api_key_env: OLLAMA_API_KEY
+        # base_url: https://…       # per-account override of the group base_url
+        # request_timeout_s: 120    # per-account override of upstream.request_timeout_s
+        treat_403_as: passthrough # passthrough | down  (default: passthrough)
+          # Some gateways answer 403 for "no credits"; `down` bans the account
+          # instead of forwarding the 403 to the client.
+        quota_markers: # lowercase phrases in a 429/402 BODY meaning the account is
+          - "weekly usage limit" #   OUT OF BUDGET (ban it for connector_down_recheck_s)
+          - "add extra usage" #   rather than briefly rate-limited (retry after
+          - "requires a subscription" #   connector_cooldown_s).
+          # THE DEFAULT IS AN EMPTY LIST, which means "never quota" — a spent
+          # account is then re-probed every cooldown, for hours. Set this. The
+          # three phrases above are what Ollama Cloud returns, verbatim.
+      - id: ollama-2
+        api_key_env: OLLAMA_API_KEY_2
+        quota_markers: ["weekly usage limit", "add extra usage", "requires a subscription"]
 
+  # Any OpenAI-compatible provider is its own group. Note that adding this second
+  # group makes `provider:` REQUIRED on every model.
+  # openrouter:
+  #   type: openai-compat             # covers OpenRouter / DeepInfra / Together /
+  #   base_url: https://openrouter.ai/api/v1   # Novita / Nebius / Groq / DeepSeek / …
+  #   accounts:
+  #     - id: openrouter-1
+  #       api_key_env: OPENROUTER_API_KEY
+  #       extra_headers: { HTTP-Referer: https://localhost, X-Title: llm-fusion }
+  #       model_map:                  # rewrite THIS group's ids: <id used in `models:`>: <provider id>
+  #         "qwen3-coder:480b": "qwen/qwen3-coder"
+  #       quota_markers: ["insufficient", "out of credit"]
+
+# =============================================================================
+# server — the local listener and its two independent tokens
+# =============================================================================
 server:
-  bind: 127.0.0.1                     # localhost only (default: 127.0.0.1)
-  port: 8080                          # (default: 8080)
-  auth_token_env: FUSION_PROXY_TOKEN  # optional; env var holding the shared client token.
-                                      # If unset, proxy runs unauthenticated and warns.
-                                      # Also gates the panel's /admin data + actions.
-  admin_token_env: AUTH_WEB_TOKEN
+  bind: 127.0.0.1 # localhost only (default: 127.0.0.1)
+    # Binding a non-loopback address with NO client token refuses to start.
+    # For Docker set 0.0.0.0 here (or FUSION_BIND=0.0.0.0) and either configure
+    # auth_token_env or set FUSION_ALLOW_OPEN=1 to accept an open proxy.
+  port: 8080 # (default: 8080)
+    # Clients derive their URL from this: OpenAI-compatible tools use
+    # http://<bind>:<port>/v1, Anthropic clients use http://<bind>:<port> (the
+    # root — they append /v1/messages themselves).
+  auth_token_env: FUSION_PROXY_TOKEN # optional; env var holding the shared CLIENT token.
+                                     # Unset = unauthenticated + a startup warning.
+  admin_token_env: AUTH_WEB_TOKEN # optional; SEPARATE token for the panel and /admin/*.
+    # Keep it separate: the client token gets copied into every tool's config,
+    # while the admin surface can rewrite models, providers and trigger a restart.
+    # Unset = the admin surface reuses the client token, or is loopback-only when
+    # neither resolves. Use a long random value, not a password.
 
-defaults:                             # applied to every model unless overridden per-model
-  panel_member_timeout_s: 90          # per panel member (default: 90)
-  judge_timeout_s: 60                 # judge stage (default: 60)
-  min_panel_success: 2                # min successful panel answers, else 502 (default: 1)
+# =============================================================================
+# defaults — applied to every model unless overridden per-model
+# =============================================================================
+defaults:
+  panel_member_timeout_s: 90 # per panel member (default: 90)
+  judge_timeout_s: 60 # judge stage (default: 60)
+  router_timeout_s: 30 # smart-strategy router classification call (default: 30).
+    # A router that hangs past this degrades to the model's `default` route
+    # instead of stalling the turn.
+  min_panel_success: 2 # minimum panel answers required, else 502 (default: 1)
+    # Weigh this against your panel width and account count: with 3 seats on ONE
+    # account, a single account-wide 429 can drop two at once. A 1-of-3 "panel",
+    # though, is just a single model paying a panel's latency.
+  promote_reasoning_to_content: true # (default: true)
+    # Some models return their chain-of-thought in a separate `reasoning` field.
+    # true surfaces it as visible content when the answer would otherwise be
+    # empty; set false to drop it. Overridable per model.
 
+# =============================================================================
+# models — the virtual models clients ask for by name
+# =============================================================================
 models:
-  # --- fusion strategy (Phase 3) ---
-  fusion-1:
-    strategy: fusion
-    panel: [glm-5.2, kimi-k2.7-code, deepseek-v4-flash]
-    judge: glm-5.2
-    synth: kimi-k2.7-code
-    # tool_mode — how requests that carry tools/function-calls are handled (fusion only):
-    #   deliberate (default): panel members deliberate in PROSE with the tools STRIPPED;
-    #     only the synth model is given the real tool schema and emits one canonical
-    #     tool_call. Keeps fusion's cross-check even on agentic/tool steps.
-    #   bypass: skip panel+judge, send straight to synth with the tools (1 call instead
-    #     of 5) — faster/cheaper, but no deliberation on tool decisions.
-    tool_mode: deliberate
-
-    # fusion_planning_turn_only — cost knob for fusion running inside an agent loop:
-    #   false (default): the full panel -> judge -> synth runs on EVERY request (5 calls),
-    #     including the mechanical tool-continuation steps.
-    #   true: full fusion runs on every PLANNING turn — any request whose LATEST message is a
-    #     fresh user/system instruction — and degrades to synth-only (5 calls -> 1) ONLY on
-    #     mid-loop continuations (latest message is a tool result: "read this output, pick the
-    #     next call"). A brand-new task/refinement deep in a multi-day session still gets the
-    #     full panel; only the mechanical in-between steps run cheap.
-    fusion_planning_turn_only: false
-
-    # Optional IMAGE DESCRIBE vision pre-stage. When the request carries
-    # image_url blocks, EACH image is described once by the multimodal `model`
-    # and replaced IN PLACE with a text block (`[IMAGE n]` + description), so
-    # panel/judge/synth run on pure text: no panel member or synth needs vision
-    # capability, and a vision request can never thin the panel below
-    # min_panel_success. All-or-nothing — if any description fails (describer
-    # error / timeout / non-OK / empty answer) the original request is kept and
-    # the legacy per-member vision gate applies unchanged. Descriptions are
-    # instructed to transcribe visible text verbatim; capped by max_chars.
-    # Verify the model id exists and reports `vision` on /api/show first.
-    # image_describe:
-    #   enabled: true
-    #   model: gemini-3-flash    # multimodal describer model
-    #   max_chars: 12000         # cap per injected description
-    #   timeout_s: 60            # per-image describer timeout (< 182)
-
-    # Optional BinEval post-synth quality evaluation (non-streaming responses only).
-    # Adds one extra evaluator call after the synth stage and returns per-dimension
-    # scores in response headers: X-Fusion-Bineval-Score, X-Fusion-Bineval-Dimensions,
-    # and X-Fusion-Bineval-Low-Score when the overall score is below threshold.
-    # When bineval is configured but the evaluation does NOT run, the proxy sets
-    # X-Fusion-Bineval-Skipped: <reason> (streaming | synth_error | eval_failed |
-    # empty_output | non_json_body | synth_only) so a client can tell "score is high"
-    # apart from "evaluation never ran". bineval is report-only — it does NOT trigger
-    # a re-deliberation loop.
-    # Useful for factual consistency checks on research / report outputs.
-    # bineval:
-    #   enabled: true
-    #   model: glm-5.2          # evaluator model; defaults to the fusion judge model
-    #   threshold: 0.7          # overall score below this marks the output as low-quality
-    #   timeout_s: 60           # per-evaluation timeout; defaults to defaults.judge_timeout_s
-    #   # Custom binary questions (optional; omit to use the built-in defaults):
-    #   dimensions:
-    #     - dimension: factual_consistency
-    #       question: "Does the answer contain only claims well-supported by the request and accepted facts?"
-
-    # Optional adversarial panel member: one of the panel models is instructed to
-    # steelman the OPPOSITE case and hunt for flaws, hidden assumptions, edge
-    # cases, and race conditions instead of agreeing with the consensus. This is
-    # role-based decorrelation on top of the lineage-based one: it forces the panel
-    # to contain a genuine dissenting voice, which the judge folds into
-    # `disagreements` and `blind_spots`. The value is "find the flaw", not
-    # "fabricate a flaw" — the adversarial member is allowed to say "I cannot find
-    # a real problem" when the consensus is actually solid.
-    # The value must be a model name ALREADY listed in this model's `panel`.
-    # The adversarial member is never early-cancelled, so it adds latency equal to
-    # the slowest panel member (the others are aborted once min_panel_success is
-    # met and it is still running).
-    # adversarial: kimi-k2.7-code
-
-    # Optional web grounding for the panel (research freshness). The proxy runs
-    # ONE Tavily search before the panel fans out and injects the cleaned results
-    # as prose context into every panel member — no member receives real tools,
-    # so the one-tool_calls-per-step invariant is preserved.
-    # Gated TWO ways (both required, else fully OFF, no latency/cost):
-    #   1. TAVILY_API_KEY must be set in the environment (.env).
-    #   2. web_search.enabled must be true here.
-    # A failed search degrades to an ungrounded panel, logging the reason (http_status/network/bad_body/no_results). Respects
-    # fusion_planning_turn_only (no web search on mid-loop tool-result turns).
-    # web_search:
-    #   enabled: true
-    #   max_results: 3           # Tavily results to fetch (1-10)
-    #   timeout_s: 20            # per-search timeout (< 60)
-    #   max_context_chars: 4000  # cap on the injected context block
-
-  # --- single strategy (Phase 1) ---
+  # ---------------------------------------------------------------------------
+  # single — 1:1 passthrough to one upstream model. No panel, no judge.
+  # ---------------------------------------------------------------------------
   fast-1:
     strategy: single
-    target: deepseek-v4-pro
-    # request_overrides:              # optional: extra request-body fields merged into every
-    #   reasoning_effort: "none"      #   upstream call for this model (e.g. suppress a thinking
-    #                                 #   model's deliberation on mechanical agent steps).
-    #                                 #   Core keys (model, messages, stream, tools, tool_choice)
-    #                                 #   are protected and cannot be overridden.
-    #                                 #   Measured on Ollama Cloud glm-5.2: reasoning_effort "none"
-    #                                 #   works (reasoning 1692->0 chars, 6s->2s, tool-calling
-    #                                 #   intact); think:false and "low" are ignored.
+    provider: ollama-cloud # optional with one provider group; REQUIRED with several
+    target: gpt-oss:20b-cloud
+    request_overrides: # optional: extra request-body fields merged into EVERY
+      reasoning_effort: "none" #   upstream call for this model. Core keys (model,
+                               #   messages, stream, tools, tool_choice) are protected
+                               #   and cannot be overridden.
+                               #   Measured on Ollama Cloud: reasoning_effort "none"
+                               #   works (reasoning 1692->0 chars, 6s->2s, tool-calling
+                               #   intact); think:false and "low" are ignored.
+    # promote_reasoning_to_content: true  # per-model override of the global default
+    # panel_contention_ack: false         # (default: false) Silence the startup warning
+                                          #   that fires when THIS model's target is also a
+                                          #   live fusion panel member. Set true only for a
+                                          #   deliberate, harmless overlap — e.g. a single
+                                          #   kept purely to query one panel voice by hand.
+                                          #   Never set it on the model you point
+                                          #   ANTHROPIC_SMALL_FAST_MODEL at: that warning is
+                                          #   the one that matters.
 
-  # --- failover strategy (Phase 2) ---
+  # ---------------------------------------------------------------------------
+  # failover — try each model in `chain` order until one answers.
+  # This is MODEL failover inside one account; ACCOUNT failover is `providers:`.
+  # ---------------------------------------------------------------------------
   resilient-1:
     strategy: failover
-    chain: [glm-5.2, kimi-k2.7-code, deepseek-v4-pro]
+    provider: ollama-cloud
+    chain: [gemma4:31b-cloud, nemotron-3-nano:30b-cloud, gpt-oss:20b-cloud]
+    # promote_reasoning_to_content: true
+    # panel_contention_ack: false         # same meaning as on `single`
 
-  # --- smart strategy (Phase 4) ---
+  # ---------------------------------------------------------------------------
+  # fusion — panel deliberates, judge scores, synth writes the single answer.
+  # ---------------------------------------------------------------------------
+  fusion-1:
+    strategy: fusion
+    provider: ollama-cloud
+    # MIX MODEL LINEAGES on purpose: three models from the same lab share training
+    # blind spots, which defeats the point of a panel. Below: Moonshot / DeepSeek /
+    # OpenAI-OSS. Keep the judge and the synth OFF the panel so nobody grades or
+    # assembles an answer they helped write.
+    panel: [kimi-k2.7-code, deepseek-v4-flash:0731-cloud, gpt-oss:120b-cloud]
+    judge: glm-5.3 # scores the panel; wants reliable structured JSON
+    synth: deepseek-v4-pro:0813-cloud # writes the answer the client actually sees
+
+    # tool_mode — how requests carrying tools/function-calls are handled:
+    #   deliberate (default): panel members deliberate in PROSE with the tools
+    #     STRIPPED; only the synth gets the real tool schema and emits one
+    #     canonical tool_call. Keeps the cross-check even on agentic steps.
+    #   bypass: skip panel+judge, go straight to synth with the tools (1 call
+    #     instead of 5) — faster and cheaper, but no deliberation on tool choices.
+    tool_mode: deliberate
+
+    # fusion_planning_turn_only — the main cost knob for fusion inside an agent loop:
+    #   false (default): full panel -> judge -> synth on EVERY request (5 calls),
+    #     including mechanical tool-continuation steps.
+    #   true: full fusion on every PLANNING turn (any request whose LATEST message
+    #     is a fresh user/system instruction), degrading to synth-only (5 calls -> 1)
+    #     on mid-loop continuations (latest message is a tool result). A brand-new
+    #     task deep in a multi-day session still gets the full panel.
+    fusion_planning_turn_only: false
+
+    # Extra request-body fields merged into the SYNTH call ONLY (panel and judge
+    # keep deliberating). Primary use: stop a "thinking" synth from streaming its
+    # chain-of-thought into the visible answer — the panel already deliberated.
+    synth_request_overrides:
+      reasoning_effort: "none"
+
+    # promote_reasoning_to_content: true  # per-model override of the global default
+
+    # Optional adversarial panel member: one panel model is instructed to steelman
+    # the OPPOSITE case and hunt for flaws, hidden assumptions, edge cases and race
+    # conditions instead of agreeing. Role-based decorrelation on top of the
+    # lineage-based kind: it forces a genuine dissenting voice, which the judge
+    # folds into `disagreements` and `blind_spots`. The goal is "find the flaw",
+    # not "fabricate one" — the member may answer "I cannot find a real problem".
+    # The value MUST be a model already listed in this model's `panel`.
+    # It is never early-cancelled, so it adds latency equal to the slowest member.
+    adversarial: gpt-oss:120b-cloud
+
+    # Optional IMAGE DESCRIBE vision pre-stage. When the request carries image_url
+    # blocks, EACH image is described once by the multimodal `model` and replaced
+    # IN PLACE with a text block (`[IMAGE n]` + description), so panel/judge/synth
+    # run on pure text: no member needs vision capability, and a vision request can
+    # never thin the panel below min_panel_success. All-or-nothing — if any
+    # description fails (error / timeout / non-OK / empty) the original request is
+    # kept and the legacy per-member vision gate applies unchanged. Descriptions
+    # transcribe visible text verbatim, capped by max_chars.
+    # Give the describer its own per_model_concurrency entry: with none, its gate
+    # is the whole global budget and a big multi-image paste occupies every slot.
+    # Verify the id exists and reports `vision` on /api/show first.
+    image_describe:
+      enabled: false # (default: false)
+      model: minimax-m3 # multimodal describer (REQUIRED when the block is present)
+      max_chars: 12000 # cap per injected description (default: 12000)
+      timeout_s: 60 # per-image describer timeout, < 182 (default: 60)
+
+    # Optional BinEval post-synth quality evaluation (NON-STREAMING responses only).
+    # One extra evaluator call after the synth stage; per-dimension scores come back
+    # in headers: X-Fusion-Bineval-Score, X-Fusion-Bineval-Dimensions, and
+    # X-Fusion-Bineval-Low-Score when the overall score is below threshold.
+    # When configured but not run, X-Fusion-Bineval-Skipped: <reason> is set
+    # (streaming | synth_error | eval_failed | empty_output | non_json_body |
+    # synth_only), so a client can tell "scored high" from "never evaluated".
+    # Report-only: it does NOT trigger a re-deliberation loop.
+    # Pick an evaluator that is NOT on the panel, the judge, or the synth.
+    bineval:
+      enabled: false # (default: false)
+      model: minimax-m3 # evaluator; defaults to the fusion judge model when omitted
+      threshold: 0.7 # below this the output is marked low-quality (default: 0.7)
+      timeout_s: 60 # per-evaluation timeout; defaults to defaults.judge_timeout_s
+      dimensions: # optional; omit to use the built-in defaults
+        - dimension: factual_consistency
+          question: "Does the answer contain only claims well-supported by the request and accepted facts?"
+
+    # Optional web grounding for the panel (research freshness). ONE Tavily search
+    # runs before the panel fans out and the cleaned results are injected as prose
+    # context into every member — no member receives real tools, so the
+    # one-tool_calls-per-step invariant holds.
+    # Gated TWO ways (both required, else fully OFF, no latency and no cost):
+    #   1. TAVILY_API_KEY set in the environment (.env)
+    #   2. web_search.enabled true here
+    # A failed search degrades to an ungrounded panel and logs the reason
+    # (http_status / network / bad_body / no_results). Respects
+    # fusion_planning_turn_only — no search on mid-loop tool-result turns.
+    web_search:
+      enabled: false # (default: false)
+      max_results: 3 # Tavily results to fetch, 1-10 (default: 3)
+      timeout_s: 20 # per-search timeout, < 60 (default: 20)
+      max_context_chars: 4000 # cap on the injected context block (default: 4000)
+      max_prompt_chars: 80000 # skip grounding when the request is already this large
+                              # (chars, ~4 chars/token), so added context cannot
+                              # overflow a smaller-context panel member mid-loop.
+                              # Short planning turns still ground. (default: 80000)
+
+  # ---------------------------------------------------------------------------
+  # smart — a cheap router decides per request: one call, or the whole panel.
+  # ---------------------------------------------------------------------------
   smart-1:
     strategy: smart
-    router: glm-5.2                   # fast classifier model (one non-streamed JSON call per request)
-    default: simple                   # route used when the router is unsure / errors (simple | fusion; default: simple)
-    escalate_on_tool_error: true      # agent-loop: a failing latest tool result (error / exception / non-zero exit / test failure)
-                                      #   skips the router and goes straight to fusion — re-deliberate on recovery (default: true)
-    simple: { target: deepseek-v4-pro }   # inline single-strategy block, OR a string naming another model (e.g. simple: fast-1).
-                                          #   The inline block also accepts request_overrides (see the single strategy above),
-                                          #   e.g. simple: { target: glm-5.2, request_overrides: { reasoning_effort: "none" } }
-    fusion:                           # inline fusion-strategy block, OR a string naming another model (e.g. fusion: fusion-1)
-      panel: [glm-5.2, kimi-k2.7-code, deepseek-v4-pro]
-      judge: glm-5.2
-      synth: deepseek-v4-pro
+    provider: ollama-cloud
+    router: glm-5.3-flash:cloud # fast classifier; ONE non-streamed JSON call per request
+    default: simple # route used when the router is unsure or errors (simple | fusion; default: simple)
+    escalate_on_tool_error: true # (default: true) A failing latest tool result (error /
+                                 # exception / non-zero exit / test failure) skips the
+                                 # router and goes straight to fusion: error recovery is
+                                 # exactly where multiple viewpoints earn their cost.
 
-  # =========================================================================
-  # Task-specialized presets — the recommended, ready-to-use models (this is
-  # what actually ships in fusion.yaml). Assembled from an empirical model
-  # shoot-out. Panels deliberately MIX MODEL
-  # LINEAGES — 3 models from the same lab share training blind spots, which
-  # defeats the point of a panel; each panel adds a Western decorrelator.
-  # =========================================================================
+    # `simple` and `fusion` each take EITHER a string naming another configured
+    # model, OR an inline block. Inline keeps a route private to this model;
+    # a string shares one definition (and its warnings) across models.
+    simple: { target: glm-5.3-flash:cloud, request_overrides: { reasoning_effort: "none" } }
+    # simple: fast-1                    # ← the string form
 
-  fusion-coder:                       # programming / planning / audit — fusion (multiple viewpoints)
+    fusion: fusion-1 # ← the string form; the inline form takes the SAME keys as a
+                     #   fusion model minus `strategy`/`provider`:
+                     #     fusion:
+                     #       panel: [kimi-k2.7-code, gpt-oss:120b-cloud]
+                     #       judge: glm-5.3
+                     #       synth: deepseek-v4-pro:0813-cloud
+                     #       synth_request_overrides: { reasoning_effort: "none" }
+                     #       promote_reasoning_to_content: true
+                     #       web_search: { enabled: false }
+                     #       image_describe: { enabled: false, model: minimax-m3 }
+                     #       bineval: { enabled: false, model: minimax-m3 }
+
+  # ---------------------------------------------------------------------------
+  # A worked, ready-to-use set. The shipped fusion.yaml is a variation on this;
+  # compare the two rather than assuming they are identical.
+  # ---------------------------------------------------------------------------
+
+  # The model an agent client should use for BACKGROUND work — Claude Code's
+  # ANTHROPIC_SMALL_FAST_MODEL, for instance, which fires 80-130 calls/min.
+  # It MUST hold no other role: if it shares an upstream with a panel member,
+  # judge, synth, router or simple route, those bursts 429-starve the model that
+  # writes your files. The proxy checks this at startup and warns per overlap.
+  fast-background:
+    strategy: single
+    provider: ollama-cloud
+    target: gpt-oss:20b-cloud
+    request_overrides:
+      reasoning_effort: "none"
+
+  fusion-coder: # programming / planning / audit
     strategy: fusion
-    panel: [kimi-k2.7-code, deepseek-v4-flash, gemini-3-flash-preview, qwen3-coder-next]
-                                      # since v0.1.28: 4-model panel; glm-5.2 dropped to judge+synth
-                                      # only (see CHANGELOG 0.1.28 bench — the fused answer beat every
-                                      # panel member on the 9/15 tasks unaffected by the since-fixed
-                                      # synth-narration bug). gemini-3-flash-preview is BACK as the
-                                      # Western decorrelator: it previously 400'd ("missing
-                                      # thought_signature in functionCall parts") on foreign tool-call
-                                      # history (v0.1.27), but a 2026-07-08 spot-check with synthetic
-                                      # multi-turn tool history (with and without an active tools
-                                      # schema) did NOT reproduce the 400 — watch the `tool-turn
-                                      # terminal state` log line in real agent-loop sessions.
-    judge: glm-5.2                    # most reliable structured-JSON of the field -> fewer judge-parse failures
-    synth: glm-5.2                    # since v0.1.23 (fusion-lift bench): as synth, kimi emitted draft-style
-                                      # output and dragged the composite below every solo; with glm-5.2 the
-                                      # fused model beats every member. kimi stays on the panel.
+    provider: ollama-cloud
+    panel: [kimi-k2.7-code, deepseek-v4-flash:0731-cloud, gpt-oss:120b-cloud]
+    adversarial: gpt-oss:120b-cloud
+    judge: glm-5.3
+    synth: deepseek-v4-pro:0813-cloud
     tool_mode: deliberate
-    fusion_planning_turn_only: false # full panel on every fresh user instruction; synth-only only
-                                     # on mid-loop tool-result continuations (this is what ships)
+    synth_request_overrides:
+      reasoning_effort: "none"
+    fusion_planning_turn_only: true # agent loops live here: deliberate on planning
+                                    # turns, run synth-only on tool continuations
+    web_search:
+      enabled: false # OFF for coding: grounding added ~12.7 s of a 28.7 s
+                     # time-to-first-byte while searching for things like
+                     # "create page.html" — pure latency, no value
 
-  fusion-researcher:                  # research / analysis / reports — fusion for breadth
+  fusion-researcher: # research / analysis / reports
     strategy: fusion
-    panel: [kimi-k2.7-code, glm-5.2, gpt-oss:120b]            # Moonshot + GLM + OpenAI-OSS (Western decorrelator)
-    judge: glm-5.2
-    synth: kimi-k2.7-code             # scored 15/15 on research; cleanest report-ready prose
+    provider: ollama-cloud
+    panel: [kimi-k2.7-code, deepseek-v4-flash:0731-cloud, gpt-oss:120b-cloud]
+    adversarial: gpt-oss:120b-cloud
+    judge: glm-5.3
+    synth: deepseek-v4-pro:0813-cloud
     tool_mode: deliberate
-    fusion_planning_turn_only: false  # research is not a mechanical loop — deliberate every step
+    fusion_planning_turn_only: false # research is not a mechanical loop —
+                                     # deliberate on every step
+    web_search:
+      enabled: false # flip to true once TAVILY_API_KEY is set: freshness is the
+                     # whole point for research
+      max_results: 10
+      timeout_s: 30
+      max_context_chars: 8000
 
-  fusion-agents:                      # autonomous agent loops — smart routing (cheap by default)
+  fusion-agents: # autonomous agent loops — cheap by default, escalate when it matters
     strategy: smart
-    router: glm-5.2                   # fast + reliable JSON classifier (router shoot-out winner)
+    provider: ollama-cloud
+    router: glm-5.3-flash:cloud
     default: simple
-    escalate_on_tool_error: true      # a failing tool result (test failure / error) -> straight to fusion;
-                                      # error-recovery is exactly where multiple viewpoints earn their cost
-    simple: { target: glm-5.2, request_overrides: { reasoning_effort: "none" } }
-                                      # mechanical steps (read / grep / run). Two constraints, in order:
-                                      # 1. MUST accept tool-call history from OTHER models in the loop:
-                                      #    gemini-3-flash-preview rejects it with 400 "Function call is
-                                      #    missing a thought_signature in functionCall parts" (a Gemini-only
-                                      #    requirement), which breaks the agent session.
-                                      # 2. MUST have a large context window: agent sessions grow past 200K
-                                      #    (a real session overflowed kimi's 262K -> 502). glm-5.2 (1M) is
-                                      #    the only context-safe choice; do NOT swap in kimi for speed.
-                                      # reasoning_effort:"none" stops glm deliberating for minutes on
-                                      # mechanical steps (measured: reasoning 1692->0 chars, 6s->2s,
-                                      # tool-calling intact — see the single strategy above).
-    fusion: fusion-coder              # substantive steps -> the coder panel. When the router routes a step to
-                                      # fusion, the FULL panel runs even mid-loop (planning_turn_only is overridden)
+    escalate_on_tool_error: true
+    simple: { target: glm-5.3-flash:cloud, request_overrides: { reasoning_effort: "none" } }
+      # The simple route carries the mechanical steps (read / grep / run). Two
+      # hard constraints, in order:
+      #   1. It MUST accept tool-call history produced by OTHER models in the loop.
+      #      Some providers reject foreign tool history outright (Gemini: 400
+      #      "Function call is missing a thought_signature in functionCall parts"),
+      #      which kills the session mid-task.
+      #   2. It MUST have a large context window: agent sessions routinely grow
+      #      past 200K tokens, and a member that overflows turns the turn into a 502.
+    fusion: fusion-coder # substantive steps -> the coder panel. When the router picks
+                         # fusion, the FULL panel runs even mid-loop
+                         # (fusion_planning_turn_only is overridden for that step).
 
-overrides:                            # used ONLY when /api/show discovery misses
-  kimi-k2.7-code:                     # illustrative shape; Phase 0 confirmed kimi-k2.7-code is vision-capable via /api/show
-    tools: true
-    vision: true
-    context: 262144
+# =============================================================================
+# overrides — capability hints, used ONLY when /api/show discovery misses
+# =============================================================================
+overrides:
+  kimi-k2.7-code:
+    tools: true # model can accept a tools schema
+    vision: true # model accepts image input
+    context: 262144 # context window in tokens; null = explicitly unknown, which
+                    # disables context-based guards for this model rather than
+                    # assuming a size
 
-pricing:                              # OPTIONAL cost accounting (USD per 1M tokens).
-                                      # Keyed by the REAL upstream model id (target/chain/panel/judge/synth/router),
-                                      # not the virtual model name. Omit entirely to leave cost_usd null (default).
-                                      # When present, the proxy logs cost_usd per request and sums per-call cost
-                                      # by each call's own model (so fusion mixes prices correctly).
-  glm-5.2:
-    input_per_mtok: 0.50              # USD charged per 1,000,000 prompt (input) tokens
-    output_per_mtok: 1.50             # USD charged per 1,000,000 completion (output) tokens
-  deepseek-v4-pro:
-    input_per_mtok: 0.80
-    output_per_mtok: 2.40
-  # The task-specialized presets above also use these models — add their real
-  # per-1M-token Ollama Cloud prices to get cost_usd on those requests:
-  # kimi-k2.7-code:          { input_per_mtok: 0.00, output_per_mtok: 0.00 }
-  # gemini-3-flash-preview:  { input_per_mtok: 0.00, output_per_mtok: 0.00 }
-  # "gpt-oss:120b":          { input_per_mtok: 0.00, output_per_mtok: 0.00 }   # quote keys containing ':'
+# =============================================================================
+# pricing (optional) — cost accounting, USD per 1M tokens
+# =============================================================================
+# Keyed by the REAL upstream model id (target / chain / panel / judge / synth /
+# router), never the virtual model name. Omit the whole block to leave cost_usd
+# null (the default). When present, the proxy logs cost_usd per request and sums
+# each call at its own model's price, so a fusion turn mixes prices correctly.
+# Quote any key containing a ':'.
+pricing:
+  "kimi-k2.7-code":
+    input_per_mtok: 0.00 # USD per 1,000,000 prompt (input) tokens
+    output_per_mtok: 0.00 # USD per 1,000,000 completion (output) tokens
+  "deepseek-v4-flash:0731-cloud":
+    input_per_mtok: 0.00
+    output_per_mtok: 0.00
+  "deepseek-v4-pro:0813-cloud":
+    input_per_mtok: 0.00
+    output_per_mtok: 0.00
+  "gpt-oss:120b-cloud":
+    input_per_mtok: 0.00
+    output_per_mtok: 0.00
+  "gpt-oss:20b-cloud":
+    input_per_mtok: 0.00
+    output_per_mtok: 0.00
+  "glm-5.3":
+    input_per_mtok: 0.00
+    output_per_mtok: 0.00
+  "glm-5.3-flash:cloud":
+    input_per_mtok: 0.00
+    output_per_mtok: 0.00

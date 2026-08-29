@@ -37,9 +37,9 @@ You can pass any extra arguments to Claude Code itself:
 If you prefer not to use the launcher, set these environment variables and then run `claude`:
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8080      # proxy root — do NOT add /v1
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8081      # proxy root — do NOT add /v1 (port comes from server.port in fusion.yaml)
 export ANTHROPIC_MODEL=fusion-agents                  # virtual model from fusion.yaml
-export ANTHROPIC_SMALL_FAST_MODEL=fast-deepseek       # cheap model for quick tasks (see note below)
+export ANTHROPIC_SMALL_FAST_MODEL=fast-background     # cheap model for quick tasks (see note below)
 export ANTHROPIC_AUTH_TOKEN=local-no-auth             # or your FUSION_PROXY_TOKEN
 claude
 ```
@@ -49,11 +49,11 @@ claude
 Claude Code appends `/v1/messages` to the base URL. llm-fusion serves the Anthropic endpoint at exactly that path, so the base URL must be the proxy root:
 
 ```
-ANTHROPIC_BASE_URL=http://127.0.0.1:8080
-                         └── Claude Code calls http://127.0.0.1:8080/v1/messages
+ANTHROPIC_BASE_URL=http://127.0.0.1:8081
+                         └── Claude Code calls http://127.0.0.1:8081/v1/messages
 ```
 
-OpenAI-compatible clients, by contrast, use `http://127.0.0.1:8080/v1` because they call `/v1/chat/completions`.
+OpenAI-compatible clients, by contrast, use `http://127.0.0.1:8081/v1` because they call `/v1/chat/completions`.
 
 ## Authentication
 
@@ -76,7 +76,16 @@ The value of `ANTHROPIC_MODEL` must be a **virtual model name** defined in `fusi
 | `fusion-researcher` | Research, analysis, reports | `fusion` |
 | `fusion-agents` | Autonomous agent loops (default) | `smart` |
 
-`ANTHROPIC_SMALL_FAST_MODEL` should point to a cheap `single` model — the launcher default is `fast-deepseek`. **Do not point it at a model that also serves as a fusion synth, judge, or panel member** (e.g. `fast-kimi` → kimi-k2.7-code, a fusion-coder panel member; `fast-glm` → glm-5.2, the fusion-coder judge and synth since v0.1.23): Claude Code fires background bursts of 80–130 small-model calls/min, and those bursts can rate-limit (429) the shared upstream model and kill the main loop mid-task. Claude Code uses this model for lightweight tasks like summarizing tool output or quick lookups. The shipped `fusion.yaml` already defines the fast singles.
+`ANTHROPIC_SMALL_FAST_MODEL` should point to a cheap `single` model that holds **no** pipeline role — the launcher default is `fast-background` (gpt-oss:20b-cloud). **Do not point it at a model that also serves as a fusion synth, judge, panel member, router, or `simple` route**: Claude Code fires background bursts of 80–130 small-model calls/min, and those bursts can rate-limit (429) the shared upstream model and kill the main loop mid-task.
+
+In the shipped `fusion.yaml` that rules out all three of `fast-glm`, `fast-kimi` and `fast-deepseek` — each of their targets holds a panel seat. The proxy checks this for you and warns at startup:
+
+```
+model 'fast-deepseek' (single/failover target 'deepseek-v4-flash:0731-cloud') overlaps
+fusion panel member of 'fusion-coder'; small-fast burst traffic can 429-starve the panel
+```
+
+If an overlap is deliberate (a single kept only for hand-comparing a panel voice), set `panel_contention_ack: true` on that model to silence its warning.
 
 ## What gets translated
 
@@ -95,13 +104,13 @@ Top-level Anthropic-only fields like `thinking` and `metadata` are currently dro
 After `fusion-claude` starts, you should see proxy logs like:
 
 ```
-llm-fusion listening on http://127.0.0.1:8080
+llm-fusion listening on http://127.0.0.1:8081
 request complete model=fusion-agents status=200 stream=true
 ```
 
 If Claude Code shows an API error, check:
 
-1. The proxy is running (`curl http://127.0.0.1:8080/health`).
+1. The proxy is running (`curl http://127.0.0.1:8081/health`) — the port is `server.port` in `fusion.yaml`, not a fixed 8080.
 2. `ANTHROPIC_BASE_URL` does **not** end in `/v1`.
 3. `ANTHROPIC_MODEL` matches a name in `fusion.yaml`.
 4. `ANTHROPIC_AUTH_TOKEN` matches `FUSION_PROXY_TOKEN` if client auth is enabled.

@@ -2,6 +2,90 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.43] - 2026-08-29
+
+Config-integrity release. Three knobs in the shipped config were inert or
+actively misleading, and nothing in the logs said so — every one of them was
+found by reading the config against the code, not by a failing request.
+
+### Fixed
+- **`per_model_concurrency` keys matched exactly, so family-named budgets gated
+  nothing.** Every call site passes the FULL tagged upstream id
+  (`limiterFor(member)` / `limiterFor(target)` -> `deepseek-v4-flash:0731-cloud`),
+  while operators naturally write the model family in the config. The lookup was
+  `overrides?.[model]`, so `deepseek-v4-flash: 5` never bound: the gate silently
+  fell back to the global cap and the burst it was meant to contain kept
+  head-of-line blocking interactive turns. The shipped `fusion.yaml` had TWO such
+  keys and neither had ever done anything. The limiter now falls back to the
+  family part before the `:` tag, with an exact key still winning over its
+  family, and a family key never leaking across a different family
+  (`deepseek-v4-flash` must not gate `deepseek-v4-flash-turbo:cloud`).
+- **A `per_model_concurrency` key that matches no model is now reported.** Such a
+  key is invisible in every log — the operator believes a budget is enforced
+  while the model runs at the global cap. `findUnmatchedConcurrencyKeys` walks
+  every upstream model a config can reach (panel/judge/synth, router,
+  single/failover targets, inline `smart` blocks, and the `image_describe` /
+  `bineval` side-stages) and the proxy warns at startup, naming the dead keys and
+  listing what it did find.
+- **Empty `quota_markers` turned a spent account into an infinite retry loop.**
+  `matchesQuota` returns false for an empty marker list, so a 429 was always
+  classified `rate_limit`, never `quota`: an account with no weekly allowance
+  left got a short cooldown and was re-probed roughly every 60 s for hours.
+  The shipped config now carries the exact phrases Ollama Cloud returns, and the
+  account parks (`state=down`, ~15 min) instead of being hammered.
+
+### Added
+- **`panel_contention_ack` on `single` / `failover` models.** The startup
+  panel-contention check is valuable and had become noise: a config that keeps
+  per-voice singles for hand-comparison emitted the same four warnings on every
+  start, which trains the operator to ignore the one that matters. Flag a
+  deliberate, harmless overlap and it drops out of the warning list; unflagged
+  overlaps still warn (the default is `false`). The live config went from 4
+  warnings to 2 — and both survivors are real.
+- **`fusion.tuned.yaml`** — an opt-in alternative panel composition
+  (`FUSION_CONFIG=./fusion.tuned.yaml`): one role per model, a Western
+  decorrelator (`gpt-oss:120b-cloud`) in the third panel seat instead of a third
+  Chinese-lab voice, that seat wired as the `adversarial` red-team member, and
+  judge + synth both off-panel. Not benched — staged for an A/B against the
+  deployed config.
+- **`settings-fusion.json`** — a Claude Code settings layer that wires
+  `claude --settings` to the proxy. Needed because a plain env export loses to
+  the user-level `~/.claude/settings.json` `env` block, and its `model` key
+  overrides `ANTHROPIC_MODEL`.
+- **`fusion.example.yaml` is now enforced by a test** (`test/example_config.test.ts`).
+  It must parse, produce ZERO startup warnings, keep every `adversarial` member on
+  its own panel, and MENTION every key in the schema — so a key cannot be added to
+  the schema without documenting it. The file had drifted badly: it was missing
+  nine schema keys (`router_timeout_s`, `promote_reasoning_to_content` at both
+  levels, `synth_request_overrides`, `panel_contention_ack`, `max_prompt_chars`,
+  per-account `base_url` / `request_timeout_s`, and the inline smart-fusion
+  sub-keys), its "this is what actually ships" preset section described a panel
+  and models that no longer exist (`glm-5.2`, `gemini-3-flash-preview`,
+  `qwen3-coder-next`), and its own `single` / `failover` demos pointed at models
+  that were panel members — five contention warnings, in the file users copy
+  from. Rewritten: `providers:` is now the live form (the legacy single-connector
+  keys are the commented alternative), `quota_markers` ships the real Ollama
+  phrases instead of an empty list, and every optional key appears commented out
+  with its default.
+
+### Changed
+- **`bin/fusion-claude` reads the port from the config** instead of hardcoding
+  `8080`. `fusion.yaml` has served `8081` since July, so the launcher's health
+  probe missed the running proxy and started a second one. `FUSION_PROXY_URL`
+  still wins; `FUSION_CONFIG` selects which config the port is read from.
+- **`ANTHROPIC_SMALL_FAST_MODEL` now defaults to `fast-background`.** The old
+  default `fast-deepseek` stopped being safe when `deepseek-v4-flash:0731-cloud`
+  took a panel seat — the background burst then shared a rate-limit bucket with
+  the model that writes files, which is the exact hazard the setting exists to
+  avoid. Documented in `docs/claude-code.md` and all three READMEs, which still
+  claimed the old guarantee.
+- **`start.sh` resolves the repo from its own location and rotates the log.** The
+  path was hardcoded as `_Projects/LLM-Fusion` while the directory is
+  `_Projects/llm-fusion` — it worked only because macOS APFS is case-insensitive
+  by default. `.launchd.log` had grown to ~6 MB with nothing to truncate it; it
+  now rotates at 32 MB keeping one generation. `start.sh` was also removed from
+  `.gitignore`: the launchd entrypoint must ship with the repo.
+
 ## [0.1.42] - 2026-08-25
 
 ### Fixed
