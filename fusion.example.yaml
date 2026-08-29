@@ -170,8 +170,11 @@ models:
     strategy: single
     provider: ollama-cloud # optional with one provider group; REQUIRED with several
     target: gpt-oss:20b-cloud
+    # gpt-oss IGNORES reasoning_effort:"none" (measured 2026-08-29: reasoning stays
+    # ~90 chars, same as with no parameter); "low" cuts it to ~9. glm honours
+    # "none" — the two are not interchangeable.
     request_overrides: # optional: extra request-body fields merged into EVERY
-      reasoning_effort: "none" #   upstream call for this model. Core keys (model,
+      reasoning_effort: "low" #   upstream call for this model. Core keys (model,
                                #   messages, stream, tools, tool_choice) are protected
                                #   and cannot be overridden.
                                #   Measured on Ollama Cloud: reasoning_effort "none"
@@ -348,7 +351,7 @@ models:
     provider: ollama-cloud
     target: gpt-oss:20b-cloud
     request_overrides:
-      reasoning_effort: "none"
+      reasoning_effort: "low"
 
   fusion-coder: # programming / planning / audit
     strategy: fusion

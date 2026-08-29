@@ -142,10 +142,18 @@ models:
     strategy: single
     provider: ollama-cloud
     target: gpt-oss:20b-cloud
-    # gpt-oss leaks its harmony `analysis` channel into visible output when it
-    # deliberates; background summarisation never needs it.
+    # gpt-oss deliberates in a harmony `analysis` channel, and with a small
+    # max_tokens that reasoning eats the budget — the proxy then promotes it into
+    # the visible answer (promote_reasoning_to_content) and the caller sees
+    # "The user says: ..." instead of a reply.
+    # MEASURED 2026-08-29 on gpt-oss:20b-cloud, same prompt:
+    #   no parameter          -> reasoning ~90 chars
+    #   reasoning_effort none -> reasoning ~90 chars  (IGNORED — it is a no-op here)
+    #   reasoning_effort low  -> reasoning "Print OK." (9 chars)
+    # "none" is honoured by glm (see fast-glm) but NOT by gpt-oss, so this entry
+    # must use "low". Do not "unify" the two.
     request_overrides:
-      reasoning_effort: "none"
+      reasoning_effort: "low"
 
   # =========================================================================
   # Task-specialized virtual models — assembled from an empirical model shoot-out

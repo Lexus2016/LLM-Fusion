@@ -107,8 +107,11 @@ models:
     strategy: single
     provider: ollama-cloud
     target: gpt-oss:20b-cloud
+    # gpt-oss IGNORES reasoning_effort:"none" (measured 2026-08-29: reasoning stays
+    # ~90 chars, same as with no parameter); "low" cuts it to ~9. glm honours
+    # "none" — the two are not interchangeable.
     request_overrides:
-      reasoning_effort: "none"
+      reasoning_effort: "low"
 
   # Direct access to individual panel voices, for comparing a fused answer
   # against its members by hand. Not referenced by any route.
