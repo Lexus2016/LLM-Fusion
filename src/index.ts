@@ -3,7 +3,12 @@ import { realpathSync } from "node:fs";
 import { isIP } from "node:net";
 import { resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createConfigManager, findPanelContentionOverlaps } from "./config";
+import {
+  collectUpstreamModels,
+  createConfigManager,
+  findPanelContentionOverlaps,
+  findUnmatchedConcurrencyKeys,
+} from "./config";
 import type { Config } from "./config";
 import { resolveProviders } from "./connectors/resolve";
 import { ProviderRouter } from "./connectors/provider_router";
@@ -287,6 +292,18 @@ async function main(): Promise<void> {
       { fastModel: overlap.fastModel, target: overlap.target, fusionModel: overlap.fusionModel },
       `model '${overlap.fastModel}' (single/failover target '${overlap.target}') overlaps fusion panel member of '${overlap.fusionModel}'; ` +
         "small-fast burst traffic can 429-starve the panel (see fusion-claude rate-limit note)",
+    );
+  }
+
+  // Dead-knob check (non-fatal): a `per_model_concurrency` key that matches no
+  // upstream model gates nothing — the limiter falls back to the global cap and
+  // the budget is silently inert. Nothing else in the logs would ever say so.
+  const unmatchedGates = findUnmatchedConcurrencyKeys(manager.config);
+  if (unmatchedGates.length > 0) {
+    logger.warn(
+      { keys: unmatchedGates, models: [...collectUpstreamModels(manager.config)].sort() },
+      `upstream.per_model_concurrency has ${unmatchedGates.length} key(s) matching no upstream model ` +
+        `(${unmatchedGates.join(", ")}); those budgets gate nothing — use the full model id or its family prefix`,
     );
   }
 

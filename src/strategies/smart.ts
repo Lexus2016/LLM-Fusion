@@ -482,7 +482,14 @@ async function classifyUncached(
 function resolveSimple(ctx: StrategyContext, cfg: SmartModelConfig): SingleModelConfig {
   const ref = cfg.simple;
   if (typeof ref !== "string") {
-    return { strategy: "single", target: ref.target, request_overrides: ref.request_overrides };
+    // An inline `simple` block is never a named model, so it can never be the
+    // subject of a panel-contention warning; the flag is inert here.
+    return {
+      strategy: "single",
+      target: ref.target,
+      request_overrides: ref.request_overrides,
+      panel_contention_ack: false,
+    };
   }
   const target = ctx.config.models[ref];
   if (!target || target.strategy !== "single") {

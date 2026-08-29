@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { parseConfig, createConfigManager, findPanelContentionOverlaps } from "../src/config";
+import {
+  parseConfig,
+  createConfigManager,
+  findPanelContentionOverlaps,
+  findUnmatchedConcurrencyKeys,
+  collectUpstreamModels,
+} from "../src/config";
 import { createLogger } from "../src/logging";
 import { mkdtempSync, writeFileSync, renameSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -355,4 +361,103 @@ describe("config hot-reload", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 25000);
+});
+
+describe("acknowledged panel contention", () => {
+  it("drops a flagged model from the warning list but keeps the others", () => {
+    const cfg = parseConfig({
+      ...minimal,
+      models: {
+        "fast-kimi": { strategy: "single", target: "kimi-k2.7-code", panel_contention_ack: true },
+        "fast-background": { strategy: "single", target: "kimi-k2.7-code" },
+        "fusion-coder": {
+          strategy: "fusion",
+          panel: ["kimi-k2.7-code", "glm-5.2"],
+          judge: "glm-5.2",
+          synth: "glm-5.2",
+        },
+      },
+    });
+    expect(findPanelContentionOverlaps(cfg)).toEqual([
+      { fastModel: "fast-background", target: "kimi-k2.7-code", fusionModel: "fusion-coder" },
+    ]);
+  });
+
+  it("defaults to false, so an unflagged overlap still warns", () => {
+    const cfg = parseConfig({
+      ...minimal,
+      models: {
+        f: { strategy: "single", target: "kimi-k2.7-code" },
+        x: { strategy: "fusion", panel: ["kimi-k2.7-code"], judge: "j", synth: "s" },
+      },
+    });
+    expect(cfg.models["f"]).toMatchObject({ panel_contention_ack: false });
+    expect(findPanelContentionOverlaps(cfg)).toHaveLength(1);
+  });
+});
+
+describe("dead per_model_concurrency keys (findUnmatchedConcurrencyKeys)", () => {
+  const gated = (per_model_concurrency: Record<string, number>, models: Record<string, unknown>) =>
+    parseConfig({
+      upstream: {
+        base_url: "https://ollama.com",
+        api_key_env: "OLLAMA_API_KEY",
+        per_model_concurrency,
+      },
+      server: { bind: "127.0.0.1", port: 8080 },
+      models,
+    });
+
+  it("flags a key that matches no upstream model at all", () => {
+    const cfg = gated({ "no-such-model": 2 }, { a: { strategy: "single", target: "glm-5.2" } });
+    expect(findUnmatchedConcurrencyKeys(cfg)).toEqual(["no-such-model"]);
+  });
+
+  it("accepts a family key that only matches through a tag suffix", () => {
+    // The real 2026-08-29 hazard inverted: `deepseek-v4-flash` DOES gate
+    // `deepseek-v4-flash:0731-cloud`, so it must not be reported as dead.
+    const cfg = gated(
+      { "deepseek-v4-flash": 5 },
+      { a: { strategy: "single", target: "deepseek-v4-flash:0731-cloud" } },
+    );
+    expect(findUnmatchedConcurrencyKeys(cfg)).toEqual([]);
+  });
+
+  it("accepts an exact tagged key", () => {
+    const cfg = gated(
+      { "glm-5.3-flash:cloud": 3 },
+      { a: { strategy: "single", target: "glm-5.3-flash:cloud" } },
+    );
+    expect(findUnmatchedConcurrencyKeys(cfg)).toEqual([]);
+  });
+
+  it("sees models reachable only through fusion side-stages and smart blocks", () => {
+    const cfg = gated(
+      { "minimax-m3": 2, "router-model": 1, "inline-target": 1 },
+      {
+        f: {
+          strategy: "fusion",
+          panel: ["kimi-k2.7-code"],
+          judge: "glm-5.3",
+          synth: "glm-5.3",
+          image_describe: { enabled: true, model: "minimax-m3" },
+        },
+        s: {
+          strategy: "smart",
+          router: "router-model",
+          simple: { target: "inline-target" },
+          fusion: "f",
+        },
+      },
+    );
+    expect(findUnmatchedConcurrencyKeys(cfg)).toEqual([]);
+    expect(collectUpstreamModels(cfg)).toEqual(
+      new Set(["kimi-k2.7-code", "glm-5.3", "minimax-m3", "router-model", "inline-target"]),
+    );
+  });
+
+  it("returns nothing when no budgets are configured", () => {
+    const cfg = parseConfig(minimal);
+    expect(findUnmatchedConcurrencyKeys(cfg)).toEqual([]);
+  });
 });

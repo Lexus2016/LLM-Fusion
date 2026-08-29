@@ -28,6 +28,13 @@ const SingleModelSchema = z
     // deliberation on mechanical agent steps). Core keys (model, messages,
     // stream, tools, tool_choice) are protected and cannot be overridden.
     request_overrides: z.record(z.string(), z.unknown()).optional(),
+    // Silence the startup panel-contention warning for THIS model. Set it only
+    // when the overlap is deliberate and harmless — e.g. a single kept purely so
+    // a panel voice can be queried by hand for comparison, never routed to and
+    // never used as ANTHROPIC_SMALL_FAST_MODEL. Without an opt-out, a config with
+    // such helpers emits the same warnings on every start and trains the operator
+    // to ignore the one that matters.
+    panel_contention_ack: z.boolean().default(false),
   })
   .strict();
 
@@ -38,6 +45,13 @@ const FailoverModelSchema = z
     chain: z.array(z.string().min(1)).min(1),
     // Per-model override of `defaults.promote_reasoning_to_content`.
     promote_reasoning_to_content: z.boolean().optional(),
+    // Silence the startup panel-contention warning for THIS model. Set it only
+    // when the overlap is deliberate and harmless — e.g. a single kept purely so
+    // a panel voice can be queried by hand for comparison, never routed to and
+    // never used as ANTHROPIC_SMALL_FAST_MODEL. Without an opt-out, a config with
+    // such helpers emits the same warnings on every start and trains the operator
+    // to ignore the one that matters.
+    panel_contention_ack: z.boolean().default(false),
   })
   .strict();
 
@@ -592,6 +606,9 @@ export function findPanelContentionOverlaps(cfg: Config): PanelContentionOverlap
     if (entry.strategy === "single") targets = [entry.target];
     else if (entry.strategy === "failover") targets = entry.chain;
     else continue;
+    // Deliberate, operator-acknowledged overlap: stays a real overlap, just not
+    // one worth a warning on every start.
+    if (entry.panel_contention_ack) continue;
     const fastGroup = groupOf(entry);
 
     for (const [fusionModel, other] of Object.entries(cfg.models)) {
@@ -605,6 +622,61 @@ export function findPanelContentionOverlaps(cfg: Config): PanelContentionOverlap
     }
   }
   return overlaps;
+}
+
+/**
+ * Every UPSTREAM model id a config can send traffic to, across all strategies
+ * and side-stages (panel/judge/synth, router, single/failover targets, the
+ * inline `smart` blocks, plus the image-describe and bineval evaluators).
+ */
+export function collectUpstreamModels(cfg: Config): Set<string> {
+  const found = new Set<string>();
+  const add = (m: string | undefined): void => {
+    if (m) found.add(m);
+  };
+  const addFusionish = (block: {
+    panel: readonly string[];
+    judge: string;
+    synth: string;
+    image_describe?: { model: string };
+    bineval?: { model?: string };
+  }): void => {
+    for (const p of block.panel) add(p);
+    add(block.judge);
+    add(block.synth);
+    add(block.image_describe?.model);
+    add(block.bineval?.model);
+  };
+  for (const entry of Object.values(cfg.models)) {
+    if (entry.strategy === "single") add(entry.target);
+    else if (entry.strategy === "failover") for (const c of entry.chain) add(c);
+    else if (entry.strategy === "fusion") addFusionish(entry);
+    else {
+      add(entry.router);
+      if (typeof entry.simple !== "string") add(entry.simple.target);
+      if (typeof entry.fusion !== "string") addFusionish(entry.fusion);
+    }
+  }
+  return found;
+}
+
+/**
+ * `per_model_concurrency` keys that gate nothing, because no upstream model in
+ * the config matches them under the limiter's own rule (exact id, else the
+ * family part before the `:` tag — see createKeyedLimiter). Such a key is
+ * invisible in every log: the gate silently falls back to the global cap and
+ * the operator believes a budget is enforced when it is not. Warn at startup.
+ */
+export function findUnmatchedConcurrencyKeys(cfg: Config): string[] {
+  const keys = Object.keys(cfg.upstream.per_model_concurrency ?? {});
+  if (keys.length === 0) return [];
+  const models = collectUpstreamModels(cfg);
+  const families = new Set<string>();
+  for (const m of models) {
+    const tagAt = m.indexOf(":");
+    if (tagAt > 0) families.add(m.slice(0, tagAt));
+  }
+  return keys.filter((k) => !models.has(k) && !families.has(k));
 }
 
 /** Validate an already-parsed object against the schema. Throws on invalid input. */
