@@ -1,0 +1,219 @@
+# llm-fusion — TUNED config (opt-in). Load with:
+#     FUSION_CONFIG=./fusion.tuned.yaml npm start
+# or point the launchd wrapper at it. `fusion.yaml` stays the default.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# fusion.yaml is the config that is actually deployed; every fix from the
+# 2026-08-29 audit is applied there, but its PANEL COMPOSITION was left exactly
+# as the operator set it, because panel quality cannot be judged from a config
+# file — it needs a bench run, and the account was over its weekly limit when
+# this was written. This file is the composition the audit argues for, staged so
+# it can be A/B'd against the deployed one the moment there is quota.
+#
+# WHAT DIFFERS FROM fusion.yaml (and why)
+# ---------------------------------------
+# 1. ONE ROLE PER MODEL. In fusion.yaml, glm-5.3-flash:cloud is the smart
+#    router, the `simple` route AND a panel seat in both fusion models — three
+#    of the hottest paths on one rate-limit bucket. Here the panel does not
+#    include it, so a panel fan-out and a routing decision never contend.
+# 2. A WESTERN VOICE ON THE PANEL. fusion.yaml's panel is kimi (Moonshot) +
+#    deepseek (DeepSeek) + glm (Zhipu) — three Chinese labs, which is exactly
+#    the shared-blind-spot case the file's own comment warns against.
+#    gpt-oss:120b-cloud (OpenAI lineage) takes the third seat here.
+# 3. AN ADVERSARIAL SEAT. `adversarial: gpt-oss:120b-cloud` makes that seat
+#    argue against the others (find flaws, hidden assumptions, edge cases)
+#    instead of producing a fourth agreeing answer. Fake consensus is the main
+#    way a panel silently degrades into an expensive single model.
+# 4. THE JUDGE AND THE SYNTH SIT OUTSIDE THE PANEL. Neither glm-5.3 (judge) nor
+#    deepseek-v4-pro:0813-cloud (synth) holds a panel seat, so nobody grades or
+#    assembles an answer they helped write.
+#
+# NOT BENCHED. gpt-oss:120b has a ~131K context (the smallest on the panel) and
+# historically was the fusion-agents context bottleneck; on very long agent
+# loops that ceiling, not quality, may decide. Run bench/fusion-bench.mjs
+# against both files before promoting this one.
+
+upstream:
+  api_mode: openai
+  max_concurrency: 8
+  per_model_concurrency:
+    # Keys name a REAL upstream model: the full tagged id, or the family part
+    # before the `:` tag. A key matching neither gates nothing — the proxy warns
+    # about such keys at startup.
+    glm-5.3-flash:cloud: 4 # router + simple route (short calls, high frequency)
+    kimi-k2.7-code: 3 # panel seat
+    deepseek-v4-flash:0731-cloud: 3 # panel seat
+    gpt-oss:120b-cloud: 3 # panel seat (adversarial)
+    deepseek-v4-pro:0813-cloud: 3 # synth
+    glm-5.3: 2 # judge — one structured-JSON call per fusion turn
+    gpt-oss:20b-cloud: 2 # ANTHROPIC_SMALL_FAST_MODEL burst budget
+    minimax-m3: 2 # bineval + image_describe side-stages
+  request_timeout_s: 180 # must stay < 182
+
+providers:
+  ollama-cloud:
+    accounts:
+      # quota_markers: phrases in a 429/402 body that mean the account is OUT OF
+      # BUDGET (park it) rather than briefly rate-limited. An empty list means
+      # "never quota", which re-probes a spent account every ~60s for hours.
+      - id: ollama-1
+        api_key_env: OLLAMA_API_KEY
+        treat_403_as: passthrough
+        quota_markers:
+          - "weekly usage limit"
+          - "add extra usage"
+          - "requires a subscription"
+      - id: ollama-lexus
+        api_key_env: OLLAMA_API_KEY_2
+        quota_markers:
+          - "weekly usage limit"
+          - "add extra usage"
+          - "requires a subscription"
+    type: ollama
+    base_url: https://ollama.com
+
+server:
+  bind: 127.0.0.1
+  port: 8081
+  admin_token_env: AUTH_WEB_TOKEN
+
+defaults:
+  panel_member_timeout_s: 90
+  judge_timeout_s: 120
+  # 2 of 3 panel voices must answer. All three seats run through the same
+  # provider group, so a single account-wide 429 can drop two at once and turn
+  # the turn into a 502 — the tradeoff is deliberate: a 1-of-3 "panel" is a
+  # single model wearing a panel's latency.
+  min_panel_success: 2
+
+models:
+  # --- singles ---------------------------------------------------------------
+
+  # The `simple` route of fusion-agents: mechanical agent steps (read a file, run
+  # a command, apply an edit). Reasoning is suppressed there — measured 1692->0
+  # reasoning chars and 6s->2s with tool-calling intact.
+  fast-glm:
+    strategy: single
+    provider: ollama-cloud
+    target: glm-5.3-flash:cloud
+    request_overrides:
+      reasoning_effort: "none"
+
+  # ANTHROPIC_SMALL_FAST_MODEL. Holds NO pipeline role, so Claude Code's 80-130
+  # background calls/min can never 429-starve the model that writes files.
+  # Verified 4/4 on a Claude-Code-shaped tool-calling harness and in live traffic.
+  fast-background:
+    strategy: single
+    provider: ollama-cloud
+    target: gpt-oss:20b-cloud
+    request_overrides:
+      reasoning_effort: "none"
+
+  # Direct access to individual panel voices, for comparing a fused answer
+  # against its members by hand. Not referenced by any route.
+  fast-kimi:
+    strategy: single
+    provider: ollama-cloud
+    target: kimi-k2.7-code
+    panel_contention_ack: true
+
+  fast-deepseek:
+    strategy: single
+    provider: ollama-cloud
+    target: deepseek-v4-flash:0731-cloud
+    panel_contention_ack: true
+
+  # --- fusion ----------------------------------------------------------------
+
+  # fusion-coder — programming, planning, audit.
+  #   Panel lineages: Moonshot (kimi) / DeepSeek / OpenAI (gpt-oss) — three
+  #   distinct training corpora, which is the whole point of a panel.
+  #   Judge and synth are off-panel, so no seat grades its own work.
+  fusion-coder:
+    strategy: fusion
+    provider: ollama-cloud
+    panel: [kimi-k2.7-code, deepseek-v4-flash:0731-cloud, gpt-oss:120b-cloud]
+    # One seat argues AGAINST the others instead of adding a third agreeing
+    # answer. The Western voice takes it: its priors differ most from the rest.
+    adversarial: gpt-oss:120b-cloud
+    judge: glm-5.3
+    synth: deepseek-v4-pro:0813-cloud
+    tool_mode: deliberate
+    # The synth only ASSEMBLES the deliberation; its own chain-of-thought is
+    # redundant, leaks English CoT into the agent's chat, and adds latency.
+    synth_request_overrides:
+      reasoning_effort: "none"
+    # Full panel on every fresh instruction; synth-only on mid-loop tool-result
+    # continuations. This is the main cost knob for agent loops.
+    fusion_planning_turn_only: true
+    image_describe:
+      enabled: true
+      model: minimax-m3
+      max_chars: 12000
+      timeout_s: 60
+    bineval:
+      enabled: true
+      # Holds no deliberating role, so it never grades an answer it shaped.
+      model: minimax-m3
+      threshold: 0.7
+      timeout_s: 60
+      dimensions:
+        - dimension: factual_consistency
+          question: "Does the answer contain only claims well-supported by the request and accepted facts?"
+    web_search:
+      # OFF for the coder: agent tool-loops route here and grounding added ~12.7s
+      # of a 28.7s time-to-first-byte while searching for things like
+      # "create page.html" — pure latency, no value.
+      enabled: false
+      max_results: 5
+      timeout_s: 10
+      max_context_chars: 4000
+
+  # fusion-researcher — research, analysis, reports. Same panel, full
+  # deliberation on every step, and web grounding ON (freshness is the value).
+  fusion-researcher:
+    strategy: fusion
+    provider: ollama-cloud
+    panel: [kimi-k2.7-code, deepseek-v4-flash:0731-cloud, gpt-oss:120b-cloud]
+    adversarial: gpt-oss:120b-cloud
+    judge: glm-5.3
+    synth: deepseek-v4-pro:0813-cloud
+    tool_mode: deliberate
+    synth_request_overrides:
+      reasoning_effort: "none"
+    fusion_planning_turn_only: false # research isn't a mechanical loop
+    image_describe:
+      enabled: true
+      model: minimax-m3
+      max_chars: 12000
+      timeout_s: 60
+    bineval:
+      enabled: true
+      model: minimax-m3
+      threshold: 0.7
+      timeout_s: 60
+      dimensions:
+        - dimension: factual_consistency
+          question: "Does the answer contain only claims well-supported by the request and accepted facts?"
+    web_search:
+      enabled: true # requires TAVILY_API_KEY in .env
+      max_results: 10
+      timeout_s: 30
+      max_context_chars: 8000
+
+  # --- smart -----------------------------------------------------------------
+
+  # fusion-agents — autonomous agent loops. Keep the cheap 80% cheap, escalate
+  # the hard 20%. The router is off-panel, so a routing decision never queues
+  # behind a panel fan-out.
+  fusion-agents:
+    strategy: smart
+    provider: ollama-cloud
+    router: glm-5.3-flash:cloud
+    default: simple
+    # A failed tool result is the step that benefits most from deliberation, so
+    # it skips the router round-trip and goes straight to the panel.
+    escalate_on_tool_error: true
+    simple: fast-glm
+    fusion: fusion-coder

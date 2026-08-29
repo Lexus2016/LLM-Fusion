@@ -8,16 +8,28 @@ upstream:
   api_mode: openai # Phase 0 confirmed: /v1 chat + SSE + tool_calls all work (auto | openai | native)
   max_concurrency: 8 # global p-limit across all in-flight calls (default: 4)
   per_model_concurrency:
-    # per-model gates INSIDE the global limit: a burst on one
-    deepseek-v4-pro: 5
-    deepseek-v4-flash: 5
-      # model queues at its own gate instead of head-of-line
-      # blocking interactive turns. deepseek-v4-pro carries the
-      # Claude Code background small-model bursts (80-130/min);
-      # 2 slots keep them flowing without occupying the queue.
+    # Per-model gates INSIDE the global limit: a burst on one model queues at its
+    # OWN gate instead of head-of-line blocking interactive turns.
+    # KEYS MUST NAME A REAL UPSTREAM MODEL — the full tagged id, or the family
+    # part before the `:` tag. Until 2026-08-29 this block read `deepseek-v4-pro`
+    # / `deepseek-v4-flash` while traffic ran as `deepseek-v4-pro:0813-cloud` /
+    # `deepseek-v4-flash:0731-cloud`; the lookup was exact-match only, so BOTH
+    # budgets gated nothing and every model silently ran at the global cap.
+    # The limiter now also accepts the family prefix, and the proxy warns at
+    # startup about any key that still matches no model.
+    glm-5.3-flash:cloud: 6
+      # hottest model in the config: the smart router, the `simple` route via
+      # fast-glm, AND a panel seat in both fusion models.
+    deepseek-v4-flash:0731-cloud: 4 # panel seat in both fusion models
+    deepseek-v4-pro:0813-cloud: 3 # synth of both fusion models
+    kimi-k2.7-code: 3 # panel seat in both fusion models
+    gpt-oss:20b-cloud: 2
+      # ANTHROPIC_SMALL_FAST_MODEL via fast-background. Claude Code fires 80-130
+      # background calls/min; 2 slots keep them flowing without ever occupying
+      # more of the global queue than that.
   request_timeout_s: 180
     # per upstream call; MUST be < 182 (default: 170).
-    # Raised from 120 -> 170: a full fusion-coder/researcher path
+    # Raised 120 -> 170 -> 180: a full fusion-coder/researcher path
     # (panel -> judge -> synth -> bineval) on a heavy prompt can
     # exceed 120s at the synth stage and 504 before bineval attaches
     # its headers. 170 leaves a safety margin under the ~182s upstream
@@ -27,18 +39,32 @@ upstream:
 # provider (same models), so a fusion stays consistent when an account degrades.
 # A virtual model binds to a group via `provider:`; with a single group it is
 # optional, so every model below auto-binds to this one. Manage it all live at
-# http://127.0.0.1:8080/panel
+# http://127.0.0.1:8081/panel
 providers:
   ollama-cloud:
     accounts:
+      # quota_markers: lowercase phrases in a 429/402 body that mean the account
+      # is OUT OF BUDGET (park it on a long cooldown) rather than briefly
+      # rate-limited. An EMPTY list means "never quota", so before 2026-08-29 a
+      # spent weekly allowance was classified as a transient rate_limit and the
+      # dead account was re-probed every ~60s for hours. These are the exact
+      # phrases Ollama Cloud returns.
       - id: ollama-1
         api_key_env: OLLAMA_API_KEY
         treat_403_as: passthrough
-        quota_markers: []
+        quota_markers:
+          - "weekly usage limit"
+          - "add extra usage"
+          - "requires a subscription"
       - id: ollama-lexus
         api_key_env: OLLAMA_API_KEY_2
+        quota_markers:
+          - "weekly usage limit"
+          - "add extra usage"
+          - "requires a subscription"
     type: ollama
     base_url: https://ollama.com
+
 server:
   bind: 127.0.0.1
     # localhost only. For Docker set 0.0.0.0 here
@@ -59,24 +85,67 @@ models:
   # single — 1:1 passthrough to one fast model.
   fast-glm:
     strategy: single
-    target: glm-5.2
-    # Suppress glm's chain-of-thought on the (mechanical) simple agent route: no
-    # reasoning to leak into chat, and ~3x faster (A/B: 1692->0 reasoning chars,
-    # 6s->2s, tool-calling intact). Restores the optimization lost in the
-    # `simple: fast-glm` refactor. request_overrides is honored by the single
-    # strategy (and by the smart `simple` route that resolves to this model).
+    provider: ollama-cloud
+    target: glm-5.3-flash:cloud
+    # This model IS the `simple` route of fusion-agents (see the bottom of this
+    # file), i.e. the mechanical agent steps: read a file, run a command, apply
+    # an edit. Suppress its chain-of-thought there — no reasoning to leak into
+    # chat, and ~3x faster (A/B: 1692->0 reasoning chars, 6s->2s, tool-calling
+    # intact). request_overrides is honored by the single strategy AND by the
+    # smart `simple` route that resolves to this model.
+    # Set to "high" on 2026-08-29 and reverted: high reasoning on a mechanical
+    # loop step buys nothing and costs the latency the A/B measured.
     request_overrides:
       reasoning_effort: "none"
 
   # single — 1:1 passthrough to one fast model.
   fast-kimi:
     strategy: single
+    provider: ollama-cloud
     target: kimi-k2.7-code
+    # Kept only so a panel voice can be queried directly for comparison against a
+    # fused answer. Never routed to, never ANTHROPIC_SMALL_FAST_MODEL — the panel
+    # overlap is deliberate and does not deserve a warning on every start.
+    panel_contention_ack: true
+    request_overrides:
+      reasoning_effort: "high"
 
   # single — 1:1 passthrough to one fast model.
   fast-deepseek:
     strategy: single
+    provider: ollama-cloud
     target: deepseek-v4-flash:0731-cloud
+    # Kept only so a panel voice can be queried directly for comparison against a
+    # fused answer. Never routed to, never ANTHROPIC_SMALL_FAST_MODEL — the panel
+    # overlap is deliberate and does not deserve a warning on every start.
+    panel_contention_ack: true
+    request_overrides:
+      reasoning_effort: "high"
+
+  # fast-background — the ONLY model safe for ANTHROPIC_SMALL_FAST_MODEL.
+  # Added 2026-08-29. Every other fast-* single shares its upstream with a
+  # pipeline role, which is exactly what the fusion-claude rate-limit note warns
+  # against (Claude Code fires 80-130 background calls/min and 429-starves the
+  # shared model):
+  #   fast-glm      -> glm-5.3-flash:cloud          = router + simple route + panel seat x2
+  #   fast-kimi     -> kimi-k2.7-code               = panel seat x2
+  #   fast-deepseek -> deepseek-v4-flash:0731-cloud = panel seat x2
+  # gpt-oss:20b-cloud is used by no panel, judge, synth, router or simple route,
+  # so its rate limit is free to burn. Verified 4/4 on a Claude-Code-shaped
+  # tool-calling harness (12 tools, real system prompt, multi-turn tool_result)
+  # and in live agent traffic (finish_reason=tool_calls with intact arguments).
+  # It was briefly pointed at deepseek-v4-flash:0731-cloud, which is a panel seat
+  # in BOTH fusion models — that put the 80-130/min background burst on the same
+  # bucket as the model that writes files, the exact hazard this entry exists to
+  # avoid, and the proxy warned about it four times per start.
+  fast-background:
+    strategy: single
+    provider: ollama-cloud
+    target: gpt-oss:20b-cloud
+    # gpt-oss leaks its harmony `analysis` channel into visible output when it
+    # deliberates; background summarisation never needs it.
+    request_overrides:
+      reasoning_effort: "none"
 
   # =========================================================================
   # Task-specialized virtual models — assembled from an empirical model shoot-out
@@ -84,7 +153,12 @@ models:
   # Panels MIX MODEL LINEAGES on purpose: 3 models from the same lab share
   # training blind spots, which defeats the point of a panel. glm/kimi/
   # deepseek/minimax/qwen are all Chinese labs; gemini=Google, gpt-oss=OpenAI
-  # are added as Western decorrelators.
+  # are the available Western decorrelators.
+  # STATUS 2026-08-29: the live panel is kimi + deepseek + glm — three Chinese
+  # labs, no Western voice, and the synth shares deepseek's lineage with one of
+  # them. That is a deliberate quality choice, not an oversight, but it does mean
+  # the decorrelation argument above no longer describes this file. A panel with
+  # gpt-oss:120b-cloud in the third seat is staged in fusion.tuned.yaml.
   # =========================================================================
 
   # fusion-coder — programming, planning, audit. Fusion = multiple viewpoints
@@ -106,7 +180,8 @@ models:
   #   watch the `tool-turn terminal state` log line in real agent-loop sessions.
   fusion-coder:
     strategy: fusion
-    panel: [ kimi-k2.7-code, deepseek-v4-pro:0813-cloud, mistral-large-3:675b-cloud ]
+    provider: ollama-cloud
+    panel: [ kimi-k2.7-code, deepseek-v4-flash:0731-cloud, glm-5.3-flash:cloud ]
     # panel: [kimi-k2.7-code, minimax-m3, gpt-oss:120b]   # earlier 3-model alternative, unused
     # Benchmark (bench/fusion-bench.mjs, 15/15 tasks, this panel): the fused answer beat
     # every panel member AND solo glm-5.2 on the 9/15 tasks that completed cleanly
@@ -119,16 +194,18 @@ models:
     # long, rambling generations that eat its own token budget; no per-panel-member
     # request_overrides mechanism exists yet to throttle it (only single/smart.simple
     # support request_overrides — see src/config.ts).
-    judge: glm-5.2 # most reliable structured-JSON (router shoot-out) -> fewer judge-parse failures
-    synth: deepseek-v4-flash:0731-cloud
-      # CHANGED 2026-07-07 (fusion-lift bench, docs/llm-fusion-audit.md):
-      # as synth, kimi emitted 17-19k-char draft-style output on factual/
-      # reasoning tasks and dragged fusion to 0.71 (below every solo);
-      # with glm-5.2 as synth the same pipeline scored 0.99 vs 0.89 for
-      # the best solo — the fused model finally EXCEEDS every member.
-      # kimi stays on the panel (its material remains valuable input).
+    judge: glm-5.3 # most reliable structured-JSON of the glm line -> fewer judge-parse failures
+    synth: deepseek-v4-pro:0813-cloud
+      # HISTORY: as synth, kimi emitted 17-19k-char draft-style output on
+      # factual/reasoning tasks and dragged fusion to 0.71 (below every solo);
+      # moving the synth off kimi took the same pipeline to 0.99 vs 0.89 for the
+      # best solo — the fused model finally EXCEEDS every member (fusion-lift
+      # bench, docs/llm-fusion-audit.md). kimi stays on the panel (its material
+      # remains valuable input). The synth seat has since moved glm-5.2 ->
+      # deepseek-v4-pro:0813-cloud; NOTE it now shares the deepseek lineage with
+      # the deepseek-v4-flash panel seat, so synth and one voice are correlated.
     tool_mode: deliberate
-    # Suppress the SYNTH's chain-of-thought: glm-5.2 as synth only ASSEMBLES the
+    # Suppress the SYNTH's chain-of-thought: the synth only ASSEMBLES the
     # panel+judge deliberation, so its own reasoning is redundant, leaks English CoT
     # into the agent's chat, and adds latency. reasoning_effort:"none" stops it.
     # Panel members keep full reasoning — that is where the deliberation value lives.
@@ -157,11 +234,10 @@ models:
     bineval:
       enabled: true
       model: minimax-m3
-        # CHANGED 2026-07-07: glm-5.2 became the coder SYNTH (v0.1.23),
-        # so a glm evaluator would self-grade its own answers.
-        # deepseek-v4-pro sits outside this pipeline entirely
-        # (bineval runs rarely — non-streaming responses only —
-        # so sharing the capped background-traffic model is fine).
+        # The evaluator must sit OUTSIDE panel/judge/synth or it grades answers it
+        # helped write. minimax-m3 is used by no other role in this file (only the
+        # image_describe pre-stage, which runs before the panel and cannot bias a
+        # verdict on the synth's prose).
       threshold: 0.7 # overall score below this marks the output as low-quality
       timeout_s: 60 # per-evaluation timeout; defaults to defaults.judge_timeout_s
       # Custom binary questions (optional; omit to use the built-in defaults):
@@ -194,9 +270,10 @@ models:
   #   gpt-oss:120b 13 (most exhaustive coverage + Western lineage).
   fusion-researcher:
     strategy: fusion
-    panel: [ kimi-k2.7-code, deepseek-v4-pro:0813-cloud, gpt-oss:120b ]
-    judge: glm-5.2
-    synth: deepseek-v4-flash:0731-cloud # scored 15/15; cleanest report-ready prose
+    provider: ollama-cloud
+    panel: [ kimi-k2.7-code, deepseek-v4-flash:0731-cloud, glm-5.3-flash:cloud ]
+    judge: glm-5.3
+    synth: deepseek-v4-pro:0813-cloud # scored 15/15; cleanest report-ready prose
     tool_mode: deliberate
     fusion_planning_turn_only: false # research isn't a mechanical loop — full deliberation each step is the value
     # Optional BinEval post-synth quality evaluation (non-streaming responses only).
@@ -215,15 +292,11 @@ models:
     bineval:
       enabled: true
       model: minimax-m3
-        # CHANGED 2026-07-08: glm-5.2 is BOTH a researcher panel member
-        # and the judge, so it was grading an answer it helped write and
-        # adjudicate — not literal self-grading (kimi is the synth) but a
-        # real correlation risk. deepseek-v4-flash sits outside this
-        # pipeline entirely (not panel/judge/synth here) and on a synthetic
-        # fabrication probe matched deepseek-v4-pro's correct verdict at
-        # roughly half the latency (~3.7s vs ~6.7s) and fewer tokens.
-        # deepseek-v3.2 was also tried and rejected: 42-49s, 3-4x more
-        # tokens, no better discrimination on the same probe.
+        # Same rule as fusion-coder: the evaluator must not be a panel member,
+        # the judge, or the synth. deepseek-v4-flash used to hold this seat on the
+        # grounds that it "sits outside this pipeline entirely" — that stopped
+        # being true when it took a panel seat here, so the evaluator moved to
+        # minimax-m3, which holds no deliberating role.
       threshold: 0.7 # overall score below this marks the output as low-quality
       timeout_s: 60 # per-evaluation timeout; defaults to defaults.judge_timeout_s
       # Custom binary questions (optional; omit to use the built-in defaults):
@@ -252,7 +325,7 @@ models:
   fusion-agents:
     strategy: smart
     provider: ollama-cloud
-    router: deepseek-v4-flash:0731-cloud
+    router: glm-5.3-flash:cloud
     default: simple
-    simple: fast-kimi
+    simple: fast-glm
     fusion: fusion-coder
