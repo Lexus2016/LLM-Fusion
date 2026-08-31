@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.44] - 2026-08-31
+
+Reasoning-containment release. A suppression knob in the shipped config did the
+opposite of what its name promised, and the resulting chain-of-thought went
+straight into the visible answer of every mechanical agent step.
+
+### Fixed
+- **`reasoning_effort: "none"` moved glm's whole chain-of-thought INTO
+  `content`.** On `glm-5.3-flash:cloud` the parameter does not stop the model
+  thinking. It empties the separate `reasoning` field and emits the entire chain
+  of thought as ordinary `content`, closed by a bare `</think>` with no opening
+  tag. Measured against `ollama.com/v1`, one prompt, three settings:
+
+  | setting | `content` |
+  |---|---|
+  | no parameter | `17 × 23 = 391.` (+ CoT in the `reasoning` field) |
+  | `"none"` | `The user asks: … Let me verify: …</think>17 × 23 = 391.` |
+  | `"low"` | `17 × 23 = 391.` |
+
+  `fast-glm` carried that override AND is the `simple` route of `fusion-agents`,
+  i.e. every mechanical agent step — read a file, run a command, apply an edit —
+  so English chain-of-thought reached the visible chat verbatim. On a STREAM no
+  proxy-side filter can repair this: the CoT is already on the wire by the time
+  the marker arrives. `fusion.yaml`, `fusion.tuned.yaml` and the two inline
+  `simple` routes in `fusion.example.yaml` move to `"low"`, with the measurement
+  recorded at the call site.
+
+  The earlier A/B that justified `"none"` read "1692 -> 0 reasoning chars". That
+  measured the FIELD emptying, not the reasoning stopping — the text had moved,
+  not gone. Models disagree here and are not interchangeable: `gpt-oss:20b-cloud`
+  IGNORES `"none"` and needs `"low"`; `deepseek-v4-pro:0813-cloud` honours it
+  cleanly and keeps it on the synth seat. Verify per model before setting it.
+- **An unmatched `</think>` is now treated as an implicit open.** Many thinking
+  models have the opening tag pre-filled by their chat template and emit only the
+  closing marker, so the text before it is chain-of-thought, not the answer.
+  `stripThinkingTags` dropped only the marker and kept the entire CoT. It now
+  drops everything before the marker — unless that would leave nothing, in which
+  case the text WAS the whole reply and only the marker goes (the shape a
+  separate-reasoning-field model produces). `createThinkTagStreamFilter`
+  deliberately does not mirror the rule: on a stream the prefix has already been
+  sent when the marker arrives, so the stream filter still strips the marker
+  alone and the containment for a streamed leak is upstream config.
+
 ## [0.1.43] - 2026-08-29
 
 Config-integrity release. Three knobs in the shipped config were inert or
