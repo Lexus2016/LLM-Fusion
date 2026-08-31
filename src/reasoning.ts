@@ -37,16 +37,34 @@ const CompletionSchema = z
  * Removes inline thinking from assistant text. First strips complete
  * `<think>…</think>` blocks (models like DeepSeek-R/QwQ inline their reasoning in
  * `content` this way — without this, the whole reasoning leaks into the answer),
- * then strips any orphan opening/closing tag left over (some Ollama "thinking"
- * models put reasoning in a separate field and leave a bare `</think>` marker in
- * `content`). Block removal must run first so the inline case is handled, with the
- * orphan-tag pass preserved for the separate-field case.
+ * then strips any orphan opening tag left over.
+ *
+ * An UNMATCHED closing tag is treated as an IMPLICIT OPEN at the start of the
+ * text: the chat template of many thinking models pre-fills `<think>`, so the
+ * model only ever emits the closing marker. MEASURED 2026-08-31 on
+ * glm-5.3-flash:cloud with `reasoning_effort: "none"` — that setting empties the
+ * separate `reasoning` field but does NOT stop the thinking, and the whole chain
+ * of thought arrives in `content` as
+ *   "The user asks: … Let me verify: …</think>17 × 23 = 391."
+ * Stripping only the marker (what this did until now) left the entire CoT in the
+ * visible answer. Everything before the orphan marker is therefore dropped —
+ * UNLESS that would leave nothing, in which case the text before it was the whole
+ * reply and only the marker is removed.
+ *
+ * NOTE: `createThinkTagStreamFilter` deliberately does NOT mirror this rule. On a
+ * stream the prefix is already on the wire by the time the marker arrives, so it
+ * strips the orphan marker alone; the fix for a streamed leak is upstream config
+ * (see the `reasoning_effort` note on fast-glm in fusion.yaml), not this filter.
  */
 export function stripThinkingTags(text: string): string {
-  return text
+  const withoutBlocks = text
     .replace(/<think>[\s\S]*?<\/think>/gi, "")
-    .replace(/<think>/gi, "")
-    .replace(/<\/think>/gi, "");
+    .replace(/<think>/gi, "");
+  const orphan = withoutBlocks.search(/<\/think>/i);
+  if (orphan === -1) return withoutBlocks;
+  const afterOrphan = withoutBlocks.slice(orphan).replace(/<\/think>/gi, "");
+  if (afterOrphan.trim().length > 0) return afterOrphan;
+  return withoutBlocks.replace(/<\/think>/gi, "");
 }
 
 /**

@@ -91,14 +91,18 @@ models:
   # --- singles ---------------------------------------------------------------
 
   # The `simple` route of fusion-agents: mechanical agent steps (read a file, run
-  # a command, apply an edit). Reasoning is suppressed there — measured 1692->0
-  # reasoning chars and 6s->2s with tool-calling intact.
+  # a command, apply an edit). Reasoning is kept short there — it buys nothing on
+  # a mechanical loop step and costs latency.
   fast-glm:
     strategy: single
     provider: ollama-cloud
     target: glm-5.3-flash:cloud
+    # MUST NOT be "none" — see the long note in fusion.yaml. On glm-5.3-flash
+    # "none" does not stop the thinking, it moves the whole chain of thought into
+    # `content` behind a bare `</think>`, which on a stream reaches the client
+    # verbatim. "low" is the setting that actually produces a clean answer.
     request_overrides:
-      reasoning_effort: "none"
+      reasoning_effort: "low"
 
   # ANTHROPIC_SMALL_FAST_MODEL. Holds NO pipeline role, so Claude Code's 80-130
   # background calls/min can never 429-starve the model that writes files.

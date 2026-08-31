@@ -89,14 +89,28 @@ models:
     target: glm-5.3-flash:cloud
     # This model IS the `simple` route of fusion-agents (see the bottom of this
     # file), i.e. the mechanical agent steps: read a file, run a command, apply
-    # an edit. Suppress its chain-of-thought there — no reasoning to leak into
-    # chat, and ~3x faster (A/B: 1692->0 reasoning chars, 6s->2s, tool-calling
-    # intact). request_overrides is honored by the single strategy AND by the
-    # smart `simple` route that resolves to this model.
+    # an edit. Keep its chain-of-thought short there — it buys nothing on a
+    # mechanical loop step and costs latency. request_overrides is honored by the
+    # single strategy AND by the smart `simple` route that resolves to this model.
+    #
+    # MUST NOT be "none". MEASURED 2026-08-31 against ollama.com/v1, same prompt:
+    #   no parameter          -> content "17 × 23 = 391."
+    #                            reasoning "The user asks: ... Let me verify: ..."
+    #                            (separate field; the proxy strips/buffers it)
+    #   reasoning_effort none -> content "The user asks: ... Let me verify: ...
+    #                            Answer in one sentence in Ukrainian.</think>17 × 23 = 391."
+    #                            (NO reasoning field, NO opening <think>)
+    #   reasoning_effort low  -> content "17 × 23 = 391."   <- clean
+    # "none" does NOT disable thinking on glm-5.3-flash: it moves the WHOLE chain
+    # of thought into `content`, closed by a bare `</think>` with no opening tag.
+    # No proxy-side filter can undo that on a STREAM (the CoT is already on the
+    # wire before the marker arrives), so every simple agent step shipped English
+    # CoT into the visible chat. The earlier A/B that read "1692->0 reasoning
+    # chars" measured the FIELD emptying, not the reasoning stopping.
     # Set to "high" on 2026-08-29 and reverted: high reasoning on a mechanical
     # loop step buys nothing and costs the latency the A/B measured.
     request_overrides:
-      reasoning_effort: "none"
+      reasoning_effort: "low"
 
   # single — 1:1 passthrough to one fast model.
   fast-kimi:

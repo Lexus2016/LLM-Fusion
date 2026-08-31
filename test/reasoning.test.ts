@@ -5,6 +5,31 @@ import {
   makeReasoningPromotionTransform,
 } from "../src/reasoning";
 
+describe("stripThinkingTags", () => {
+  it("drops the chain-of-thought before an unmatched close tag", () => {
+    // The shape glm-5.3-flash:cloud returns under `reasoning_effort: "none"`:
+    // no `reasoning` field, no opening tag, the whole CoT in `content`.
+    const leaked =
+      'The user asks: "Скільки буде 17*23?"\n\n17 × 23 = 391.\n\n' +
+      "Let me verify: 17 × 20 + 17 × 3 = 391. Correct.</think>17 × 23 = 391.";
+    expect(stripThinkingTags(leaked)).toBe("17 × 23 = 391.");
+  });
+
+  it("keeps the text when an unmatched close tag leaves nothing after it", () => {
+    // Separate-reasoning-field models leave a bare marker AFTER the answer.
+    expect(stripThinkingTags("the answer</think>")).toBe("the answer");
+    expect(stripThinkingTags("the answer</think>   ")).toBe("the answer   ");
+  });
+
+  it("still removes complete blocks, so a doc mentioning both tags is untouched after them", () => {
+    expect(stripThinkingTags("a <think>cot</think> b")).toBe("a  b");
+  });
+
+  it("is case-insensitive on the orphan close tag", () => {
+    expect(stripThinkingTags("cot</THINK>answer")).toBe("answer");
+  });
+});
+
 describe("createThinkTagStreamFilter", () => {
   function runFragments(fragments: string[]): string {
     const f = createThinkTagStreamFilter();
@@ -37,7 +62,11 @@ describe("createThinkTagStreamFilter", () => {
   });
 
   it("strips an orphan close tag outside a think block", () => {
+    // The STREAM filter strips the marker alone and keeps the prefix. It cannot
+    // do what stripThinkingTags does (drop everything before an unmatched
+    // close): by the time the marker arrives the prefix has already been sent.
     expect(runFragments(["A </think> B"])).toBe("A  B");
+    expect(stripThinkingTags("A </think> B")).toBe(" B");
   });
 
   it("is case-insensitive like stripThinkingTags", () => {

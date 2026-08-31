@@ -177,9 +177,13 @@ models:
       reasoning_effort: "low" #   upstream call for this model. Core keys (model,
                                #   messages, stream, tools, tool_choice) are protected
                                #   and cannot be overridden.
-                               #   Measured on Ollama Cloud: reasoning_effort "none"
-                               #   works (reasoning 1692->0 chars, 6s->2s, tool-calling
-                               #   intact); think:false and "low" are ignored.
+                               #   Measured on Ollama Cloud: "low" is the safe
+                               #   suppressor. "none" empties the `reasoning`
+                               #   FIELD but does not stop glm-5.3-flash from
+                               #   thinking — the chain of thought moves into
+                               #   `content` behind a bare `</think>`, which on a
+                               #   stream reaches the client verbatim. think:false
+                               #   is ignored.
     # promote_reasoning_to_content: true  # per-model override of the global default
     # panel_contention_ack: false         # (default: false) Silence the startup warning
                                           #   that fires when THIS model's target is also a
@@ -321,7 +325,7 @@ models:
     # `simple` and `fusion` each take EITHER a string naming another configured
     # model, OR an inline block. Inline keeps a route private to this model;
     # a string shares one definition (and its warnings) across models.
-    simple: { target: glm-5.3-flash:cloud, request_overrides: { reasoning_effort: "none" } }
+    simple: { target: glm-5.3-flash:cloud, request_overrides: { reasoning_effort: "low" } }
     # simple: fast-1                    # ← the string form
 
     fusion: fusion-1 # ← the string form; the inline form takes the SAME keys as a
@@ -393,7 +397,7 @@ models:
     router: glm-5.3-flash:cloud
     default: simple
     escalate_on_tool_error: true
-    simple: { target: glm-5.3-flash:cloud, request_overrides: { reasoning_effort: "none" } }
+    simple: { target: glm-5.3-flash:cloud, request_overrides: { reasoning_effort: "low" } }
       # The simple route carries the mechanical steps (read / grep / run). Two
       # hard constraints, in order:
       #   1. It MUST accept tool-call history produced by OTHER models in the loop.
