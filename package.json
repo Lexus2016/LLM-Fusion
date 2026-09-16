@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Lightweight OpenAI-compatible LLM proxy (Fusion Proxy) for Ollama Cloud.",
+  "license": "MIT",
   "engines": {
     "node": ">=24"
   },

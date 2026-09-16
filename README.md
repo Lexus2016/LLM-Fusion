@@ -629,3 +629,11 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 A JSON completion back means you are fully configured. Detailed Claude Code wiring lives in [`docs/claude-code.md`](./docs/claude-code.md); every config key is documented in [`fusion.example.yaml`](./fusion.example.yaml).
+
+## License
+
+Released under the [MIT License](./LICENSE). Copyright (c) 2026 Lexus2016.
+
+Use it, fork it, ship it commercially — the only condition is that the copyright
+notice and the permission notice travel with any copy or substantial portion of
+the software. It comes with no warranty of any kind.
