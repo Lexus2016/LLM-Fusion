@@ -539,6 +539,15 @@ models:
       #                                             of a 13 s simple request)
       #   agy/gemini-3.8-flash-medium 3.2 s  3/3
       #   xai/grok-4.6-low            6.0 s  3/3
+      # ACCURACY, same day, 10 prompts (5 routine / 5 genuinely complex) x 3 runs
+      # with the real ROUTER_SYSTEM_PROMPT — an INVALID verdict matters as much
+      # as a wrong one, because classify() degrades it to `default` (= simple),
+      # i.e. a hard task silently loses its deliberation:
+      #   agy/gemini-3.5-flash-lite   30/30   0 invalid
+      #   deepseek-v4.1-flash:cloud   28/30   2 invalid   (router of fusion-agents)
+      #   misha/glm-5.3-flash         26/30   4 invalid   (previous seat here)
+      # No router sent a complex prompt to simple or a routine one to fusion; the
+      # only failures were unparseable JSON, and flash-lite had none.
       # Before that, agy/gemini-3.8-flash-low held the seat and probed as "all
       # credentials cooling down" — a failing router degrades to `default` on
       # every request, so the smart routing was not routing at all. Same model
