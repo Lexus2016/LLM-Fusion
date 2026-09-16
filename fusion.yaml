@@ -33,13 +33,12 @@ upstream:
       # fusion-researcher. Raised 2 -> 3 to cover that extra call.
     # --- lg-server seats -----------------------------------------------------
     auto/js-coding: 4 # fast-js-code + the `simple` route of fusion-agents-x
-    misha/glm-5.3-flash: 6 # router of fusion-agents-x
+    agy/gemini-3.5-flash-lite: 6 # router of fusion-agents-x + image_describe of fusion-coder-x
     misha/glm-5.3: 3 # judge of fusion-coder-x
     misha/MiniMax-M3: 3 # panel seat in fusion-coder-x
     agy/gemini-3.8-flash-high: 3 # panel seat in fusion-coder-x
     cx/gpt-5.6-terra-high: 3 # panel seat in fusion-coder-x
     xai/grok-4.6-high: 3 # synth of fusion-coder-x
-    agy/gemini-3.5-flash-lite: 2 # image_describe of fusion-coder-x
       # REMOVED 2026-09-16, all verified dead with a live text probe against
       # lmlm.localguard.me ("not available in the active live catalog"):
       # ollamacloud/deepseek-v4.1-flash, cc/claude-opus-5-low, gemini/gemini-3.8-flash.
@@ -527,13 +526,23 @@ models:
   fusion-agents-x:
     strategy: smart
     provider: lg-server
-    router: misha/glm-5.3-flash
-      # agy/gemini-3.8-flash-low held this until 2026-09-16 and probes as "All
-      # credentials for model gemini-3.8-flash-low are cooling down" — a failing
-      # router degrades to `default` on EVERY request, so the smart routing was
-      # not routing at all. glm-5.3-flash is live (2.4 s) and the glm line is the
-      # one this file already trusts for structured JSON (see the judge seats);
-      # its per_model_concurrency budget was already sized for this role.
+    router: agy/gemini-3.5-flash-lite
+      # The router is pure overhead on EVERY simple step, so it must be the
+      # fastest live id that returns reliable JSON. Benchmarked 2026-09-16 with
+      # the real router prompt, 3 runs each, median / valid-JSON:
+      #   agy/gemini-3.5-flash-lite   1.5 s  3/3   <- this
+      #   misha/qwen3.6-35b-a3b       1.2 s  1/3   (fastest, but a router that
+      #                                             emits prose degrades to
+      #                                             `default` — not a router)
+      #   misha/glm-5.3-flash         3.1 s  3/3   (previous seat; under the
+      #                                             live test matrix it took 7 s
+      #                                             of a 13 s simple request)
+      #   agy/gemini-3.8-flash-medium 3.2 s  3/3
+      #   xai/grok-4.6-low            6.0 s  3/3
+      # Before that, agy/gemini-3.8-flash-low held the seat and probed as "all
+      # credentials cooling down" — a failing router degrades to `default` on
+      # every request, so the smart routing was not routing at all. Same model
+      # as the image describer of fusion-coder-x; both roles are short calls.
     default: simple
     simple: fast-js-code
     fusion: fusion-coder-x
