@@ -486,11 +486,17 @@ models:
         # role anywhere in this file (only fast-background, a passthrough single)
         # and adds a Western lineage to a verdict on a Chinese-lineage pipeline.
       threshold: 0.7 # overall score below this marks the output as low-quality
-      timeout_s: 60 # per-evaluation timeout; defaults to defaults.judge_timeout_s
-      # Custom binary questions (optional; omit to use the built-in defaults):
-      dimensions:
-        - dimension: factual_consistency
-          question: "Does the answer contain only claims well-supported by the request and accepted facts?"
+      timeout_s: 25
+        # 60 -> 25 on 2026-09-16. bineval runs AFTER the synth, so its timeout is
+        # pure tail latency on the response; a hung evaluator used to add a full
+        # minute (req de359ae8: timed out at 60 s inside a 107 s request). A
+        # 35B-class evaluator on a short verdict answers in a few seconds.
+      # Dimensions: DELIBERATELY omitted -> the five built-in ones apply
+      # (factual_consistency, instruction_following, format_compliance,
+      # completeness, clarity). A custom single-dimension list used to sit here,
+      # which collapsed the whole "quality score" to one bit per request — over
+      # the log's history that bit read 1 on 12 of 15 evaluations, which is not a
+      # signal anyone can act on.
 
     # Optional web grounding for the panel (research freshness). The proxy runs
     # ONE Tavily search before the panel fans out and injects the cleaned results
