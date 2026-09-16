@@ -2,6 +2,54 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.46] - 2026-09-16
+
+Routing release, under one rule: simple steps go fast, composite ones go to
+fusion for quality. An image is composite by construction, and the shipped
+config had four dead seats on the path that was supposed to handle it.
+
+### Added
+- **`smart` routes an image straight to `fusion` when that branch can describe
+  it.** The simple target is text-only in every shipped config, so an image
+  routed there ended in the vision gate's 400 — live on `fusion-agents-x`, for
+  every screenshot an agent sent. When the fusion branch runs `image_describe`
+  it can serve the request whatever its members can see, so the decision is
+  already made by the config; consulting the router only added a round-trip to
+  reach it, or a 400 to miss it. It is now skipped, the same way
+  `tool_error_escalation` already is (log reason: `image_escalation`). Without
+  a describer nothing changes — the router keeps deciding.
+
+### Fixed
+- **Four dead seats in `fusion.yaml`, none of which failed loudly.** Every id
+  was probed against its live provider. `ollamacloud/deepseek-v4.1-flash`
+  (panel seat of `fusion-coder-x`, so the panel ran 2-of-3 on every request),
+  `cc/claude-opus-5-low` (its synth — every request silently fell back to the
+  judge), `gemini/gemini-3.8-flash` (its describer — the `agy/` prefix of the
+  same family is alive; this was a dead provider prefix, not a dead model) and
+  `agy/gemini-3.8-flash-low` (router of `fusion-agents-x`, "credentials cooling
+  down" — a failing router degrades to `default` on every request, so the
+  smart routing was not routing). Replaced with live, lineage-distinct seats;
+  the describer verified on a real 133 KB screenshot.
+- **The bineval evaluator was grading its own answer.** On `fusion-coder` and
+  `fusion-researcher` the evaluator was `deepseek-v4.1-flash:cloud` — a panel
+  seat AND the synth of the same model. The comments asserted it was "used by
+  no other role"; that stopped being true when the seats moved. bineval never
+  changes the response body (`attachBinevalHeaders` returns the synth body
+  byte-for-byte; the score reaches headers and the log only), so on the two
+  agent paths it is now OFF — up to a minute of tail latency for a score no
+  client reads. It stays ON for `fusion-researcher` with an evaluator outside
+  the pipeline (`gpt-oss:20b-cloud`), the five built-in dimensions instead of a
+  custom single one (which had collapsed the score to one bit), and a 25 s
+  budget instead of 60.
+- **Concurrency budgets now name real seats.** `kimi-k2.7-code` 3 -> 4 — the
+  only gate that ever reported saturation; budgets added for every seat that
+  had none and dropped for four ids that gated nothing (including
+  `deepseek-v4-pro:0813-cloud`, listed as a dead key on every start).
+  Startup warnings: 10 -> 0.
+
+Measured end-to-end: `fusion-agents-x` + image 400 -> 18.0 s (correct answer);
+`fusion-coder-x` text 49.7 s -> 28.7 s; `fusion-agents-x` text 9.7 s -> 4.3 s.
+
 ## [0.1.45] - 2026-09-16
 
 Vision release. The image path worked; everything around it reported that it did
