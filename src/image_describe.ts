@@ -142,6 +142,12 @@ async function describeOne(
     model: cfg.model,
     stream: false,
     messages: [
+      // The describer's quality bar lives here. Without this turn the user text
+      // below ("per your instructions") referred to instructions that were never
+      // sent, so the describer fell back to a loose prose summary — the exact
+      // opposite of the verbatim transcription a downstream text-only panel
+      // needs to reason about a screenshot.
+      { role: "system", content: DESCRIBE_SYSTEM_PROMPT },
       {
         role: "user",
         content: [

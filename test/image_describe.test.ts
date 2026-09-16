@@ -89,6 +89,19 @@ interface CapturedCall {
   body: Record<string, unknown>;
 }
 
+/**
+ * Content parts of the USER turn in a describe body. Not `messages[0]`: the body
+ * leads with a `system` turn carrying the describer's instructions, so indexing
+ * by position silently reads the wrong message.
+ */
+function userParts(messages: unknown[]): unknown[] {
+  const user = messages.find(
+    (m): m is { role: string; content: unknown[] } =>
+      typeof m === "object" && m !== null && (m as { role?: string }).role === "user",
+  );
+  return Array.isArray(user?.content) ? user.content : [];
+}
+
 /** Mock client whose chatCompletions returns `content` and records bodies. */
 function describerClient(
   content: string | null,
@@ -171,7 +184,7 @@ describe("describeRequestImages", () => {
     const client: UpstreamClient = {
       chatCompletions: async (body) => {
         const messages = (body as { messages?: unknown[] }).messages ?? [];
-        const parts = (messages[0] as { content?: unknown[] } | undefined)?.content ?? [];
+        const parts = userParts(messages);
         const img = parts.find(
           (p): p is { image_url: { url: string } } =>
             typeof p === "object" && p !== null && (p as { type?: string }).type === "image_url",
@@ -418,7 +431,7 @@ describe("describeRequestImages", () => {
     const client: UpstreamClient = {
       chatCompletions: async (body) => {
         const messages = (body as { messages?: unknown[] }).messages ?? [];
-        const parts = (messages[0] as { content?: unknown[] } | undefined)?.content ?? [];
+        const parts = userParts(messages);
         const imagePart = parts.find(
           (p): p is { image_url: { url: string } } =>
             typeof p === "object" && p !== null && (p as { type?: string }).type === "image_url",
@@ -483,8 +496,28 @@ describe("describeRequestImages", () => {
     expect(JSON.stringify(sent)).toContain("What is in this picture?");
   });
 
-  it("returns null on a describer error (all-or-nothing fallback)", async () => {
-    const failing: UpstreamClient = {
+  it("sends the describer its instructions as a system turn", async () => {
+    // The user turn says "Describe this image exhaustively per your instructions",
+    // and those instructions (transcribe ALL visible text VERBATIM) used to live in
+    // a module constant that was never referenced — so the describer was pointed at
+    // a system prompt it had never been given and answered with loose prose. That
+    // is precisely the detail a text-only panel cannot recover: downstream members
+    // never see the pixels, so whatever the describer omits is gone for good.
+    const calls: CapturedCall[] = [];
+    const client = describerClient("described", { calls });
+    const ctx = makeCtx(imageRequest(["data:one"]), client);
+    const out = await describeRequestImages(ctx, resilience, cfg(), realTimer);
+    expect(out).not.toBeNull();
+
+    const sent = calls[0]?.body.messages as Array<{ role: string; content: unknown }>;
+    const system = sent.find((m) => m.role === "system");
+    expect(system).toBeDefined();
+    expect(String(system?.content)).toContain("VERBATIM");
+    // The image still rides on the user turn, not the system one.
+    expect(JSON.stringify(userParts(sent))).toContain("data:one");
+  });
+
+  it("returns null on a describer error (all-or-nothing fallback)", async () => {    const failing: UpstreamClient = {
       chatCompletions: async () => {
         throw new Error("boom");
       },

@@ -2608,6 +2608,37 @@ function renderPanelForJudgeBounded(panelAnswers: PanelAnswer[]): string {
 const JUDGE_REQUEST_MAX_CHARS = 120_000;
 
 /**
+ * Text of one (possibly multimodal) message content for the judge transcript.
+ *
+ * This render used to collapse EVERY array content to the fixed string
+ * `[multimodal content]`, which threw away the question itself. That is harmless
+ * only while array content means "an image we cannot transcribe" — and the
+ * `image_describe` pre-stage broke that assumption: it replaces each image with
+ * a pure TEXT part, so the judge adjudicated panel answers ABOUT a screenshot
+ * while seeing neither the screenshot's description nor the user's instruction,
+ * and silently graded them blind. `smart.ts` fixed the same defect for the
+ * router (`routerMessageLine`); this is the fusion half of it.
+ *
+ * A real `image_url` part is flagged rather than transcribed — it only reaches
+ * here when `image_describe` is off or fell back to the legacy vision gate.
+ */
+const JudgeTextPartSchema = z.object({ text: z.string() }).passthrough();
+const JudgeImagePartSchema = z.object({ type: z.literal("image_url") }).passthrough();
+function judgeContentText(content: unknown[]): string {
+  const text = content
+    .map((part) => {
+      const parsed = JudgeTextPartSchema.safeParse(part);
+      return parsed.success ? parsed.data.text : "";
+    })
+    .filter((t) => t.length > 0)
+    .join(" ");
+  if (content.some((p) => JudgeImagePartSchema.safeParse(p).success)) {
+    return text.length > 0 ? `[has image] ${text}` : "[has image]";
+  }
+  return text;
+}
+
+/**
  * Render the user's instruction for the judge: the `user`/`system` messages only.
  * The judge needs to know WHAT WAS ASKED to adjudicate factual conflicts, but the
  * assistant/tool history is what the panel already digested into its answers, so
@@ -2623,12 +2654,12 @@ const JUDGE_REQUEST_MAX_CHARS = 120_000;
  *    verbatim text, so the judge must adjudicate against verbatim text too.
  * 2. Over the whole render, UNCONDITIONALLY. This one is not gated on the panel's
  *    threshold, and deliberately so: `approxTotalChars` sums CONTENT, while the
- *    render also pays a `role: ` prefix and a newline per message and spends a
- *    fixed 19 chars on `[multimodal content]` for parts that count as 0. 15 000
- *    one-character user turns total 15 000 by the panel's measure and render at
- *    120 000. A bound conditional on an unrelated total is not a bound, and the
- *    band it left open is exactly where `runJudge` 400s and silently degrades to
- *    unadjudicated panel answers (see `JUDGE_REQUEST_MAX_CHARS`).
+ *    render also pays a `role: ` prefix and a newline per message (plus an
+ *    `[has image] ` flag on a message that still carries an undescribed image).
+ *    15 000 one-character user turns total 15 000 by the panel's measure and
+ *    render at 120 000. A bound conditional on an unrelated total is not a bound,
+ *    and the band it left open is exactly where `runJudge` 400s and silently
+ *    degrades to unadjudicated panel answers (see `JUDGE_REQUEST_MAX_CHARS`).
  *
  * The ceiling slices by CHARACTER, not by whole message. That is what makes an
  * unconditional ceiling safe: dropping whole messages discarded any message longer
@@ -2655,7 +2686,7 @@ function renderRequestForJudge(request: ChatCompletionRequest): string {
     if (role !== "user" && role !== "system") continue;
     const capped = capPerMessage ? capPanelMessageContent(m.content) : m.content;
     const text =
-      typeof capped === "string" ? capped : Array.isArray(m.content) ? "[multimodal content]" : "";
+      typeof capped === "string" ? capped : Array.isArray(capped) ? judgeContentText(capped) : "";
     if (text.length > 0) lines.push(`${role}: ${text}`);
   }
   // Over budget: keep the head (system prompts + original task) and the tail (the

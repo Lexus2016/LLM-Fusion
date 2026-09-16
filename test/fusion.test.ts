@@ -543,6 +543,67 @@ describe("fusion strategy — panel/judge/synth", () => {
     expect(judgeInput).not.toContain("ans-m2");
   });
 
+  it("renders array-content messages into the judge transcript instead of '[multimodal content]'", async () => {
+    // The image_describe pre-stage replaces each image IN PLACE with a TEXT part,
+    // so the user turn stays an ARRAY of pure text. Collapsing every array to a
+    // fixed marker handed the judge neither the question nor the description: it
+    // adjudicated panel answers ABOUT a screenshot while seeing none of it, and
+    // degraded silently because a judge with no question still returns JSON.
+    const up = makeUpstream(defaultChat());
+    const request: ChatCompletionRequest = {
+      model: "fusion-1",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "What are the form fields?" },
+            { type: "text", text: "[IMAGE 1]\nA modal titled Create model." },
+          ],
+        },
+      ],
+    };
+    const res = await fusionStrategy.execute(ctx(up.client, request));
+    expect(res.status).toBe(200);
+
+    const judgeBody = up.recorded.find((b) => b.model === "j");
+    expect(judgeBody).toBeDefined();
+    const judgeInput = userContents(judgeBody!).join("\n");
+    expect(judgeInput).toContain("What are the form fields?");
+    expect(judgeInput).toContain("A modal titled Create model.");
+    expect(judgeInput).not.toContain("[multimodal content]");
+  });
+
+  it("flags a still-undescribed image to the judge without pretending to transcribe it", async () => {
+    // image_describe off (or fallen back): the array still holds a real image_url
+    // part. The judge must be told an image is in play — it just cannot be shown
+    // one — while the accompanying text survives.
+    // Vision-capable members, so the request clears the legacy vision gate and the
+    // judge render is what this test is actually about.
+    const up = makeUpstream(defaultChat(), () =>
+      jsonResponse({ capabilities: ["completion", "vision"], model_info: {} }),
+    );
+    const request: ChatCompletionRequest = {
+      model: "fusion-1",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Is this layout accessible?" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+          ],
+        },
+      ],
+    };
+    const res = await fusionStrategy.execute(ctx(up.client, request));
+    expect(res.status).toBe(200);
+
+    const judgeBody = up.recorded.find((b) => b.model === "j");
+    const judgeInput = userContents(judgeBody!).join("\n");
+    expect(judgeInput).toContain("[has image]");
+    expect(judgeInput).toContain("Is this layout accessible?");
+    expect(judgeInput).not.toContain("data:image/png;base64");
+  });
+
   it("falls back to a working model when the synth is subscription-gated (403) instead of failing the fusion", async () => {
     const up = makeUpstream((body) => {
       if (body.model === "s") return jsonResponse({ error: "this model requires a subscription, upgrade for access" }, 403);
