@@ -93,6 +93,46 @@ describe("server", () => {
     expect(merged.context_window).toBe(250_000); // min(1M, 500k, 250k), NOT 1M
   });
 
+  it("GET /v1/models reports supports_vision for a fusion model whose image_describe is enabled", async () => {
+    // The flag describes the ROUTE. With the image_describe pre-stage on, every
+    // image is transcribed to text before the panel runs, so the route serves
+    // image input even though not one member is vision-capable. Reporting the
+    // judge's own flag advertised "no vision" for a route that demonstrably
+    // accepts screenshots — and an agent that believes it cannot send an image
+    // never sends one, which is exactly how this surfaced in production.
+    const fusionConfig = parseConfig({
+      upstream: { base_url: "https://mock.test", api_key_env: "X" },
+      models: {
+        described: {
+          strategy: "fusion",
+          panel: ["blind-a", "blind-b"],
+          judge: "blind-a",
+          synth: "blind-a",
+          image_describe: { enabled: true, model: "seer" },
+        },
+        plain: { strategy: "fusion", panel: ["blind-a", "blind-b"], judge: "blind-a", synth: "blind-a" },
+      },
+    });
+    const routes: MockRoute[] = [
+      {
+        // No member reports vision — only the describer would, and it is not a member.
+        match: (u) => u.endsWith("/api/show"),
+        respond: () => jsonResponse({ capabilities: ["completion"], model_info: {} }),
+      },
+    ];
+    const client = new OllamaClient({ baseUrl: "https://mock.test", apiKey: "k", fetchFn: mockFetch(routes) });
+    const capabilities = new CapabilityService({ client, getOverrides: () => fusionConfig.overrides, logger });
+    const app = createApp({ getConfig: () => fusionConfig, client, capabilities, getAuthToken: () => undefined, logger });
+
+    const res = await app.request("/v1/models");
+    const body = JSON.parse(await res.text());
+    const described = body.data.find((m: { id: string }) => m.id === "described");
+    const plain = body.data.find((m: { id: string }) => m.id === "plain");
+    expect(described.supports_vision).toBe(true);
+    // Without the pre-stage nothing changes: the members really cannot see.
+    expect(plain.supports_vision).toBe(false);
+  });
+
   it("GET /v1/models omits context_window when any member's context is unknown", async () => {
     const fusionConfig = parseConfig({
       upstream: { base_url: "https://mock.test", api_key_env: "X" },

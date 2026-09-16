@@ -164,9 +164,20 @@ export function createApp(deps: AppDeps): Hono {
 
         // supports_vision: surfaced from the representative member (unchanged) —
         // never guessed (spec §9.1).
+        //
+        // EXCEPT on a fusion block running the `image_describe` pre-stage: that
+        // route accepts image input whatever its members can do, because every
+        // image is transcribed to text BEFORE the panel runs. Reporting the
+        // judge's own vision flag there is not conservatism, it is wrong — it
+        // advertised "no vision" for a route that demonstrably serves screenshots,
+        // and an agent client that believes it cannot send an image never sends
+        // one. The flag describes the ROUTE, and this is a fact about the route,
+        // not a guess about a model.
         const repr = representativeMember(entry);
         const reprResult = discovered.find((d) => d.member === repr);
-        if (reprResult && reprResult.source !== "default") {
+        if (entry.strategy === "fusion" && entry.image_describe?.enabled === true) {
+          item.supports_vision = true;
+        } else if (reprResult && reprResult.source !== "default") {
           item.supports_vision = reprResult.capability.vision;
         }
 
