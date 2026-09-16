@@ -200,6 +200,23 @@ export const smartStrategy: Strategy = {
       return executeFusionWithFallback(ctx, cfg);
     }
 
+    // Image escalation. The project rule is "simple steps fast, composite ones to
+    // fusion for quality", and an image is composite by construction: the simple
+    // target is text-only in every shipped config, so routing there ends in the
+    // vision gate's 400 (`executeSimple`). When the fusion branch runs the
+    // image_describe pre-stage it can serve the request whatever its members can
+    // see — so the decision is already made by the config, and consulting the
+    // router only adds a round-trip to reach it (or a 400 to miss it). Skip the
+    // router. Without a describer there is nothing to short-cut: the fusion branch
+    // would fail one stage later on its own gate, so the router keeps deciding.
+    if (requestHasImages(ctx.request) && fusionCanDescribeImages(ctx, cfg)) {
+      ctx.logger.info(
+        { model: ctx.request.model, route: "fusion", reason: "image_escalation" },
+        "smart: request carries an image and the fusion branch can describe it; escalating to fusion",
+      );
+      return executeFusionWithFallback(ctx, cfg);
+    }
+
     const route = await classify(ctx, cfg);
     // The classification can outlive the client: it is a SHARED call bound to the
     // stage timeout, not to `ctx.signal` (see `classifyUncached`). Stop here rather
@@ -503,6 +520,14 @@ function resolveSimple(ctx: StrategyContext, cfg: SmartModelConfig): SingleModel
 }
 
 /** Resolve the `fusion` slot to a concrete fusion-model config (inline blocks get strategy defaults). */
+/** Whether the resolved fusion branch runs the image_describe pre-stage. */
+function fusionCanDescribeImages(ctx: StrategyContext, cfg: SmartModelConfig): boolean {
+  const ref = cfg.fusion;
+  if (typeof ref !== "string") return ref.image_describe?.enabled === true;
+  const target = ctx.config.models[ref];
+  return target?.strategy === "fusion" && target.image_describe?.enabled === true;
+}
+
 function resolveFusion(ctx: StrategyContext, cfg: SmartModelConfig): FusionModelConfig {
   const ref = cfg.fusion;
   if (typeof ref !== "string") {

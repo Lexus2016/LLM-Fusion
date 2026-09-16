@@ -70,6 +70,19 @@ const config = parseConfig({
       simple: { target: "deepseek" },
       fusion: "fusion-pto",
     },
+    // Fusion branch runs the image_describe pre-stage; simple target is blind.
+    "smart-describe": {
+      strategy: "smart",
+      router: "rt",
+      default: "simple",
+      simple: { target: "deepseek" },
+      fusion: {
+        panel: ["p1", "p2", "p3"],
+        judge: "jdg",
+        synth: "syn",
+        image_describe: { enabled: true, model: "seer" },
+      },
+    },
     // Vision-capable simple target, for the router-hallucination-guard "image present" test.
     "vision-single": { strategy: "single", target: "vdeepseek" },
     "smart-vision": {
@@ -161,6 +174,9 @@ function chatWith(routerResp: () => Response): ChatHandler {
     if (body.model === "syn") {
       if (body.stream === true) return sseResponse([{ choices: [{ delta: { content: "final" } }] }]);
       return jsonResponse({ choices: [{ message: { content: "final" } }] });
+    }
+    if (body.model === "seer") {
+      return jsonResponse({ choices: [{ message: { content: "a red square" } }] });
     }
     if (body.model === "deepseek" || body.model === "simp-t" || body.model === "vdeepseek") {
       if (body.stream === true) {
@@ -441,6 +457,54 @@ describe("smart strategy", () => {
     );
     // The gate fires before the single executor, so the simple target never ran.
     expect(up.modelsCalled()).not.toContain("deepseek");
+  });
+
+  it("routes an image straight to fusion when that branch can describe it, without asking the router", async () => {
+    // Project rule: simple steps go fast, composite ones go to fusion for quality.
+    // An image is composite by construction — the simple target cannot even read
+    // it — and the fusion branch has a describer. Asking the router first buys a
+    // round-trip to reach a decision the config already made; letting it say
+    // "simple" buys a 400. So the decision is deterministic and free.
+    const up = makeUpstream(chatWith(routeSimple)); // router WOULD say "simple"
+    const imageReq = req("smart-describe", {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+          ],
+        },
+      ],
+    });
+    const res = await smartStrategy.execute(ctx(up.client, imageReq, "smart-describe"));
+    expect(res.status).toBe(200);
+    const called = up.modelsCalled();
+    expect(called).toContain("seer"); // described...
+    for (const m of [...PANEL, "jdg", "syn"]) expect(called).toContain(m); // ...then deliberated
+    expect(up.routerBodies()).toHaveLength(0); // router never consulted
+    expect(called).not.toContain("deepseek"); // blind simple target never touched
+  });
+
+  it("still asks the router for an image when the fusion branch has no describer", async () => {
+    // Without a describer neither branch can read the image; the fusion branch
+    // would only fail one stage later on its own vision gate. Nothing to short-cut.
+    const up = makeUpstream(chatWith(routeSimple));
+    const imageReq = req("smart-inline", {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+          ],
+        },
+      ],
+    });
+    await expect(smartStrategy.execute(ctx(up.client, imageReq, "smart-inline"))).rejects.toThrow(
+      /does not support image input/,
+    );
+    expect(up.routerBodies()).toHaveLength(1);
   });
 
   it("route=fusion runs panel+judge+synth; router called once, non-streamed", async () => {
