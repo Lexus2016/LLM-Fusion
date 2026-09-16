@@ -2,6 +2,62 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.45] - 2026-09-16
+
+Vision release. The image path worked; everything around it reported that it did
+not, and the one stage that had to carry the image forward was under-instructed.
+Found by an agent client that concluded "our models do not support vision" and
+stopped sending screenshots — the proxy had told it exactly that.
+
+### Fixed
+- **The describer was told to follow instructions it never received.**
+  `DESCRIBE_SYSTEM_PROMPT` in `src/image_describe.ts` was declared and never
+  referenced. The user turn ends *"Describe this image exhaustively per your
+  instructions"* while those instructions — transcribe ALL visible text VERBATIM,
+  then layout, objects, chart data points, anything actionable — were never on
+  the wire. The describer answered with loose prose instead. This is the one
+  stage that cannot be recovered from later: no panel member, judge or synth ever
+  sees the pixels, so a label the describer skips is gone for the whole request.
+  It is now sent as a `system` turn.
+- **The judge never saw the description.** `renderRequestForJudge` collapsed
+  EVERY array-shaped message content to the fixed string `[multimodal content]`.
+  That is harmless only while array content means "an image we cannot
+  transcribe" — and the `image_describe` pre-stage broke that assumption by
+  design, replacing each image IN PLACE with a TEXT part. So on exactly the
+  requests the pre-stage exists to serve, the judge was handed neither the
+  question nor the description, and adjudicated the panel's answers about a
+  screenshot while seeing none of it. It degraded silently, because a judge with
+  no question still returns well-formed JSON. Text parts are now transcribed; a
+  real `image_url` part (pre-stage off, or fallen back) is flagged `[has image]`
+  rather than pretended away. `smart.ts` fixed the same defect for the router in
+  `routerMessageLine` (v0.1.38); this is the fusion half of it.
+- **`GET /v1/models` advertised no vision on a route that serves images.** The
+  catalogue reported the representative member's vision flag. On a fusion block
+  running `image_describe` that is not conservatism, it is wrong: images are
+  transcribed before the panel runs, so the route accepts image input whatever
+  its members can do. The shipped `fusion-coder` therefore published
+  `supports_vision: false` while answering questions about a 133 KB screenshot
+  down to verbatim form labels (verified live against the running proxy). An
+  agent client reads this catalogue to decide what it may send, so a wrong `false`
+  is self-fulfilling. Without the pre-stage nothing changes — the members really
+  cannot see.
+
+### Known issues
+- **Capability discovery ignores a model's `provider:` binding.** `src/index.ts`
+  pins the discovery client to `router.defaultPool` — the FIRST provider group.
+  With a second group configured, every one of its models is looked up against
+  the first group's `/api/show`: `model 'auto/js-coding' not found` (404),
+  `gc/grok-4.6` (404), `misha/glm-5.3` (404), on every `/v1/models` call. Each
+  miss degrades to `{vision: false, tools: true, context: null}` and the vision
+  gate then rejects image input with a 400 `capability_error`. Two aggravators:
+  the `openai-compat` client has no `/api/show` at all, so for such a provider
+  `overrides:` is the ONLY possible source of truth; and `overrides` are consulted
+  only when discovery FAILS, so an operator cannot correct a wrong-but-successful
+  discovery. Fixing this properly means threading the provider through
+  `CapabilityProvider.discover`, which is an interface change across
+  `server.ts`, `vision.ts` and the fusion strategy — deliberately not bundled
+  into a bugfix release.
+
 ## [0.1.44] - 2026-08-31
 
 Reasoning-containment release. A suppression knob in the shipped config did the
