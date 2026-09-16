@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.47] - 2026-09-16
+
+### Changed
+- **`fusion-agents-x` router -> `agy/gemini-3.5-flash-lite`.** The router is
+  pure overhead on every simple step, so it must be the fastest live id that
+  returns reliable JSON. Benchmarked with the real router prompt, 3 runs each:
+  1.5 s median vs 3.1 s for the previous `misha/glm-5.3-flash` (which took 7 s
+  of a 13 s simple request under load). Through the proxy: text 6.8 s -> 3.2 s,
+  stream 13.2 s -> 5.4 s.
+
+  Speed was not bought with quality — the opposite. On 10 prompts (5 routine,
+  5 genuinely complex) x 3 runs, the new router scored 30/30 with 0 invalid
+  verdicts; the previous one 26/30 with 4. An invalid verdict is a quality
+  number, not a reliability one: `classify()` degrades it to `default`
+  (= simple), so on a hard task it is a silent loss of deliberation. No router
+  ever sent a complex prompt to simple; every miss was unparseable JSON. The
+  benchmark is recorded in `fusion.yaml` next to the seat it justifies.
+
+  Tool calls on the `-x` path stay noisy (9-18 s) and the router is not the
+  cause: the same request against `auto/js-coding` directly on lg-server swings
+  1.7-10.5 s on the same resolved upstream. That jitter is the provider's.
+
 ## [0.1.46] - 2026-09-16
 
 Routing release, under one rule: simple steps go fast, composite ones go to
