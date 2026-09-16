@@ -20,13 +20,32 @@ upstream:
     glm-5.3-flash:cloud: 6
       # hottest model in the config: the smart router, the `simple` route via
       # fast-glm, AND a panel seat in both fusion models.
-    deepseek-v4-flash:0731-cloud: 4 # panel seat in both fusion models
-    deepseek-v4-pro:0813-cloud: 3 # synth of both fusion models
-    kimi-k2.7-code: 3 # panel seat in both fusion models
-    gpt-oss:20b-cloud: 2
-      # ANTHROPIC_SMALL_FAST_MODEL via fast-background. Claude Code fires 80-130
-      # background calls/min; 2 slots keep them flowing without ever occupying
-      # more of the global queue than that.
+    deepseek-v4.1-flash:cloud: 4 # panel seat x2 + synth x2 + image_describe x2
+    glm-5.3: 3 # judge of fusion-coder AND fusion-researcher
+    kimi-k2.7-code: 4
+      # Raised 3 -> 4 on 2026-09-16. This is the ONLY gate that has ever reported
+      # saturation in this config: 6x "per-model concurrency budget saturated,
+      # queued 1" in .launchd.log, always kimi. It holds a panel seat in BOTH
+      # ollama fusions plus fast-kimi, so two overlapping requests already fill 3.
+    gpt-oss:20b-cloud: 3
+      # ANTHROPIC_SMALL_FAST_MODEL via fast-background (Claude Code fires 80-130
+      # background calls/min), AND since 2026-09-16 the bineval evaluator of
+      # fusion-researcher. Raised 2 -> 3 to cover that extra call.
+    # --- lg-server seats -----------------------------------------------------
+    auto/js-coding: 4 # fast-js-code + the `simple` route of fusion-agents-x
+    misha/glm-5.3-flash: 6 # router of fusion-agents-x
+    misha/glm-5.3: 3 # judge of fusion-coder-x
+    misha/MiniMax-M3: 3 # panel seat in fusion-coder-x
+    agy/gemini-3.8-flash-high: 3 # panel seat in fusion-coder-x
+    cx/gpt-5.6-terra-high: 3 # panel seat in fusion-coder-x
+    xai/grok-4.6-high: 3 # synth of fusion-coder-x
+    agy/gemini-3.5-flash-lite: 2 # image_describe of fusion-coder-x
+      # REMOVED 2026-09-16, all verified dead with a live text probe against
+      # lmlm.localguard.me ("not available in the active live catalog"):
+      # ollamacloud/deepseek-v4.1-flash, cc/claude-opus-5-low, gemini/gemini-3.8-flash.
+      # deepseek-v4-pro:0813-cloud was dropped too — it is alive upstream but has
+      # held no seat since the synth moved to deepseek-v4.1-flash, and the proxy
+      # was already listing it as a dead key on every start.
   request_timeout_s: 180
     # per upstream call; MUST be < 182 (default: 170).
     # Raised 120 -> 170 -> 180: a full fusion-coder/researcher path
@@ -64,6 +83,23 @@ providers:
           - "requires a subscription"
     type: ollama
     base_url: https://ollama.com
+  lg-server:
+    accounts:
+      # quota_markers: lowercase phrases in a 429/402 body that mean the account
+      # is OUT OF BUDGET (park it on a long cooldown) rather than briefly
+      # rate-limited. An EMPTY list means "never quota", so before 2026-08-29 a
+      # spent weekly allowance was classified as a transient rate_limit and the
+      # dead account was re-probed every ~60s for hours. These are the exact
+      # phrases Ollama Cloud returns.
+      - id: lg-api
+        api_key_env: LG_API_KEY
+        treat_403_as: passthrough
+        quota_markers:
+          - "weekly usage limit"
+          - "add extra usage"
+          - "requires a subscription"
+    type: openai-compat
+    base_url: https://lmlm.localguard.me
 
 server:
   bind: 127.0.0.1
@@ -83,15 +119,23 @@ defaults:
 
 models:
   # single — 1:1 passthrough to one fast model.
+  fast-js-code:
+    strategy: single
+    provider: lg-server
+    target: auto/js-coding
   fast-glm:
     strategy: single
     provider: ollama-cloud
     target: glm-5.3-flash:cloud
-    # This model IS the `simple` route of fusion-agents (see the bottom of this
-    # file), i.e. the mechanical agent steps: read a file, run a command, apply
-    # an edit. Keep its chain-of-thought short there — it buys nothing on a
-    # mechanical loop step and costs latency. request_overrides is honored by the
-    # single strategy AND by the smart `simple` route that resolves to this model.
+    panel_contention_ack: true
+    # Kept so a panel voice can be queried directly for comparison against a fused
+    # answer. Its target is a panel seat in BOTH ollama fusions, so the overlap is
+    # deliberate and acked — without the ack this warned twice on every start,
+    # which is exactly the noise v0.1.43 removed elsewhere in this file.
+    # NOTE: this comment used to claim fast-glm IS the `simple` route of
+    # fusion-agents. It is not, and has not been since that slot moved to
+    # fast-deepseek (see the bottom of this file) — keep its reasoning_effort
+    # short anyway, the measurements below still hold for direct calls.
     #
     # MUST NOT be "none". MEASURED 2026-08-31 against ollama.com/v1, same prompt:
     #   no parameter          -> content "17 × 23 = 391."
@@ -128,7 +172,7 @@ models:
   fast-deepseek:
     strategy: single
     provider: ollama-cloud
-    target: deepseek-v4-flash:0731-cloud
+    target: deepseek-v4.1-flash:cloud
     # Kept only so a panel voice can be queried directly for comparison against a
     # fused answer. Never routed to, never ANTHROPIC_SMALL_FAST_MODEL — the panel
     # overlap is deliberate and does not deserve a warning on every start.
@@ -203,7 +247,7 @@ models:
   fusion-coder:
     strategy: fusion
     provider: ollama-cloud
-    panel: [ kimi-k2.7-code, deepseek-v4-flash:0731-cloud, glm-5.3-flash:cloud ]
+    panel: [ kimi-k2.7-code, deepseek-v4.1-flash:cloud, glm-5.3-flash:cloud ]
     # panel: [kimi-k2.7-code, minimax-m3, gpt-oss:120b]   # earlier 3-model alternative, unused
     # Benchmark (bench/fusion-bench.mjs, 15/15 tasks, this panel): the fused answer beat
     # every panel member AND solo glm-5.2 on the 9/15 tasks that completed cleanly
@@ -217,7 +261,7 @@ models:
     # request_overrides mechanism exists yet to throttle it (only single/smart.simple
     # support request_overrides — see src/config.ts).
     judge: glm-5.3 # most reliable structured-JSON of the glm line -> fewer judge-parse failures
-    synth: deepseek-v4-pro:0813-cloud
+    synth: deepseek-v4.1-flash:cloud
       # HISTORY: as synth, kimi emitted 17-19k-char draft-style output on
       # factual/reasoning tasks and dragged fusion to 0.71 (below every solo);
       # moving the synth off kimi took the same pipeline to 0.99 vs 0.89 for the
@@ -238,14 +282,16 @@ models:
       # refinement / module — even days into one chat); synth-only
       # only on mid-loop tool-result continuations (cost knob)
     # IMAGE DESCRIBE pre-stage: every image in the request is described once by
-    # the multimodal `model` (minimax-m3 is natively multimodal, Text+Image
-    # input) and replaced IN PLACE with a text block, so panel/judge/synth run
-    # on pure text — no member needs vision capability and a vision request can
-    # never thin the panel below min_panel_success. All-or-nothing: a describer
-    # failure falls back to the legacy per-member vision gate unchanged.
+    # the multimodal `model` and replaced IN PLACE with a text block, so
+    # panel/judge/synth run on pure text — no member needs vision capability and a
+    # vision request can never thin the panel below min_panel_success.
+    # All-or-nothing: a describer failure falls back to the legacy per-member
+    # vision gate unchanged. The describer is pre-panel and sees no panel output,
+    # so sharing an id with a panel/synth seat cannot bias a verdict — it only
+    # shares that model's concurrency budget.
     image_describe:
       enabled: true
-      model: minimax-m3 # same id already verified as the bineval evaluator
+      model: deepseek-v4.1-flash:cloud # VERIFIED live on a real screenshot
       max_chars: 12000
       timeout_s: 60
     # Optional BinEval post-synth quality evaluation (non-streaming responses only).
@@ -254,12 +300,130 @@ models:
     # and X-Fusion-Bineval-Low-Score when the overall score is below threshold.
     # Useful for factual consistency checks on research / report outputs.
     bineval:
+      enabled: false
+        # OFF since 2026-09-16, for two independent reasons.
+        # 1. CORRECTNESS: the evaluator was deepseek-v4.1-flash:cloud, which is
+        #    simultaneously a PANEL SEAT and the SYNTH of this model — it was
+        #    grading the answer it had just written. The comment here claimed the
+        #    evaluator was minimax-m3 and "used by no other role"; that stopped
+        #    being true when the seats moved, and nothing flagged it.
+        # 2. LATENCY: bineval is one extra upstream call AFTER the synth, and it
+        #    is the agent-loop path that routes here. Measured on req de359ae8
+        #    (.launchd.log): the evaluator timed out at its full 60 s and the
+        #    request still completed at 107.7 s — a minute of pure waiting for a
+        #    score that only ever reaches response HEADERS.
+        # fusion-researcher keeps it: reports are worth one extra call, and its
+        # evaluator now sits outside the pipeline.
+      model: deepseek-v4.1-flash:cloud
+      threshold: 0.7 # overall score below this marks the output as low-quality
+      timeout_s: 60 # per-evaluation timeout; defaults to defaults.judge_timeout_s
+      # Custom binary questions (optional; omit to use the built-in defaults):
+      dimensions:
+        - dimension: factual_consistency
+          question: "Does the answer contain only claims well-supported by the request and accepted facts?"
+
+    # Optional web grounding for the panel (research freshness). The proxy runs
+    # ONE Tavily search before the panel fans out and injects the cleaned results
+    # as prose context into every panel member — no member receives real tools,
+    # so the one-tool_calls-per-step invariant is preserved.
+    # Gated TWO ways (both required, else fully OFF, no latency/cost):
+    #   1. TAVILY_API_KEY must be set in the environment (.env).
+    #   2. web_search.enabled must be true here.
+    # A failed search degrades silently to an ungrounded panel. Respects
+    # fusion_planning_turn_only (no web search on mid-loop tool-result turns).
+    web_search:
+      enabled: false
+        # OFF for the coder (2026-07-07): agent tool-loops route here, and
+        # grounding added ~12s of pre-panel silence per deliberate turn
+        # (measured 12.7s of a 28.7s time-to-first-byte) while searching
+        # for things like "create page.html" — pure latency, no value.
+        # fusion-researcher keeps grounding ON (freshness matters there).
+      max_results: 5 # Tavily results to fetch (1-10)
+      timeout_s: 10 # per-search timeout (< 60)
+      max_context_chars: 4000 # cap on the injected context block
+
+  fusion-coder-x:
+    strategy: fusion
+    provider: lg-server
+    panel: [ misha/MiniMax-M3, agy/gemini-3.8-flash-high, cx/gpt-5.6-terra-high ]
+    # ollamacloud/deepseek-v4.1-flash held the first seat until 2026-09-16 and was
+    # DEAD upstream ("Model 'deepseek-v4.1-flash' is not available in the active
+    # live catalog for provider 'ollamacloud'"). With min_panel_success: 2 the
+    # panel was running 2-of-3 on every request — one more failure from a 502.
+    # MiniMax keeps the three seats on three different lineages (MiniMax / Google
+    # / OpenAI), which is the whole point of a panel.
+    # panel: [kimi-k2.7-code, minimax-m3, gpt-oss:120b]   # earlier 3-model alternative, unused
+    # Benchmark (bench/fusion-bench.mjs, 15/15 tasks, this panel): the fused answer beat
+    # every panel member AND solo glm-5.2 on the 9/15 tasks that completed cleanly
+    # (29.56/30 vs best member 26.67/30) — the panel/judge/synth mechanism is sound.
+    # The other 6/15 tasks were dragged down by a separate synth bug (the synth
+    # narrating its own reasoning — "Expert 1 says X... I will provide..." — into the
+    # visible answer, sometimes exhausting the token budget before a real answer),
+    # fixed in src/strategies/fusion.ts (SYNTH_DIRECT_ANSWER_DIRECTIVE, 2026-07-08).
+    # kimi-k2.7-code is the weakest panel voice in this bench (17.00/30) — prone to
+    # long, rambling generations that eat its own token budget; no per-panel-member
+    # request_overrides mechanism exists yet to throttle it (only single/smart.simple
+    # support request_overrides — see src/config.ts).
+    judge: misha/glm-5.3 # most reliable structured-JSON of the glm line -> fewer judge-parse failures
+    synth: xai/grok-4.6-high
+      # Strongest model in the pipeline sits on synth, not on the panel: the panel
+      # supplies material, the synth decides the answer the caller sees.
+      # cc/claude-opus-5-low held this seat until 2026-09-16 and was DEAD upstream
+      # ("Model 'claude-opus-5-low' is not available in the active live catalog for
+      # provider 'claude'"), so EVERY fusion-coder-x request was silently falling
+      # back to the judge as synth. The whole agy/claude-* family answers 429 on
+      # probe, so an Anthropic seat here is not dependable; grok-4.6 is live and
+      # adds a fourth lineage (panel is MiniMax/Google/OpenAI, judge is glm).
+      # A tiered `-high` id, NOT synth_request_overrides reasoning_effort:"none" —
+      # that parameter is honoured inconsistently per model (see fast-glm vs
+      # fast-background). Thinking budget is kept on purpose: reconciling
+      # conflicting panel answers is the reason this seat exists.
+    tool_mode: deliberate
+    # NOTE: unlike fusion-coder there is deliberately NO synth_request_overrides
+    # here. The synth seat carries its reasoning tier in the model id itself
+    # (`xai/grok-4.6-high`), because reasoning_effort is honoured inconsistently
+    # across models — see the measurements on fast-glm vs fast-background.
+    fusion_planning_turn_only: true
+      # full panel on EVERY fresh user instruction (a new task /
+      # refinement / module — even days into one chat); synth-only
+      # only on mid-loop tool-result continuations (cost knob)
+    # IMAGE DESCRIBE pre-stage: every image in the request is described once by
+    # the multimodal `model` (minimax-m3 is natively multimodal, Text+Image
+    # input) and replaced IN PLACE with a text block, so panel/judge/synth run
+    # on pure text — no member needs vision capability and a vision request can
+    # never thin the panel below min_panel_success. All-or-nothing: a describer
+    # failure falls back to the legacy per-member vision gate unchanged.
+    image_describe:
       enabled: true
-      model: minimax-m3
+      model: agy/gemini-3.5-flash-lite
+        # Changed 2026-09-16. gemini/gemini-3.8-flash was DEAD (the whole `gemini/`
+        # prefix answers "not available in the active live catalog"), so every
+        # image request to fusion-coder-x fell back to the legacy vision gate and
+        # 400'd — "none of its panel members are vision-capable". Note the `agy/`
+        # prefix of the SAME family is alive: this was a dead provider prefix, not
+        # a dead model. VERIFIED on a real 133 KB screenshot: answered "Create
+        # model" in 2.1 s, the fastest of every live vision candidate probed.
+      max_chars: 16000
+      timeout_s: 60
+    # Optional BinEval post-synth quality evaluation (non-streaming responses only).
+    # Adds one extra evaluator call after the synth stage and returns per-dimension
+    # scores in response headers: X-Fusion-Bineval-Score, X-Fusion-Bineval-Dimensions,
+    # and X-Fusion-Bineval-Low-Score when the overall score is below threshold.
+    # Useful for factual consistency checks on research / report outputs.
+    bineval:
+      enabled: false
+        # OFF since 2026-09-16, same reasoning as fusion-coder: this model is the
+        # `fusion` branch of fusion-agents-x, i.e. an AGENT path, and bineval is one
+        # extra upstream call after the synth whose score only ever reaches response
+        # HEADERS. Measured before switching it off: 49.7 s for a request whose
+        # whole content was "Reply with exactly: OK".
+      model: misha/qwen3.6-35b-a3b
         # The evaluator must sit OUTSIDE panel/judge/synth or it grades answers it
-        # helped write. minimax-m3 is used by no other role in this file (only the
-        # image_describe pre-stage, which runs before the panel and cannot bias a
-        # verdict on the synth's prose).
+        # helped write. It was xai/grok-4.6-low, which became the SYNTH's own
+        # lineage when the dead opus seat was replaced by xai/grok-4.6-high on
+        # 2026-09-16. Qwen holds no other seat here (panel MiniMax/Google/OpenAI,
+        # judge glm, synth grok) and probes at 1.7 s, which matters because bineval
+        # runs AFTER synth under request_timeout_s: 180.
       threshold: 0.7 # overall score below this marks the output as low-quality
       timeout_s: 60 # per-evaluation timeout; defaults to defaults.judge_timeout_s
       # Custom binary questions (optional; omit to use the built-in defaults):
@@ -293,9 +457,9 @@ models:
   fusion-researcher:
     strategy: fusion
     provider: ollama-cloud
-    panel: [ kimi-k2.7-code, deepseek-v4-flash:0731-cloud, glm-5.3-flash:cloud ]
+    panel: [ kimi-k2.7-code, deepseek-v4.1-flash:cloud, glm-5.3-flash:cloud ]
     judge: glm-5.3
-    synth: deepseek-v4-pro:0813-cloud # scored 15/15; cleanest report-ready prose
+    synth: deepseek-v4.1-flash:cloud # scored 15/15; cleanest report-ready prose
     tool_mode: deliberate
     fusion_planning_turn_only: false # research isn't a mechanical loop — full deliberation each step is the value
     # Optional BinEval post-synth quality evaluation (non-streaming responses only).
@@ -303,22 +467,24 @@ models:
     # scores in response headers: X-Fusion-Bineval-Score, X-Fusion-Bineval-Dimensions,
     # and X-Fusion-Bineval-Low-Score when the overall score is below threshold.
     # Useful for factual consistency checks on research / report outputs.
-    # IMAGE DESCRIBE pre-stage (same rationale as fusion-coder): screenshots in
-    # research requests are described once by minimax-m3 (natively multimodal,
-    # Text+Image) and replaced with text, so the panel/synth never need vision.
+    # IMAGE DESCRIBE pre-stage (same rationale as fusion-coder): screenshots in a
+    # research request are described once by the multimodal `model` below and
+    # replaced with text, so the panel/synth never need vision.
     image_describe:
       enabled: true
-      model: minimax-m3
+      model: deepseek-v4.1-flash:cloud
       max_chars: 12000
       timeout_s: 60
     bineval:
       enabled: true
-      model: minimax-m3
-        # Same rule as fusion-coder: the evaluator must not be a panel member,
-        # the judge, or the synth. deepseek-v4-flash used to hold this seat on the
-        # grounds that it "sits outside this pipeline entirely" — that stopped
-        # being true when it took a panel seat here, so the evaluator moved to
-        # minimax-m3, which holds no deliberating role.
+      model: gpt-oss:20b-cloud
+        # The evaluator must not be a panel member, the judge, or the synth, or it
+        # grades an answer it helped write. It was deepseek-v4.1-flash:cloud, which
+        # is BOTH a panel seat and the synth here — the exact collision this rule
+        # exists to prevent, and it survived two seat moves because the comment was
+        # updated while the value was not. gpt-oss:20b-cloud holds no deliberating
+        # role anywhere in this file (only fast-background, a passthrough single)
+        # and adds a Western lineage to a verdict on a Chinese-lineage pipeline.
       threshold: 0.7 # overall score below this marks the output as low-quality
       timeout_s: 60 # per-evaluation timeout; defaults to defaults.judge_timeout_s
       # Custom binary questions (optional; omit to use the built-in defaults):
@@ -347,7 +513,21 @@ models:
   fusion-agents:
     strategy: smart
     provider: ollama-cloud
-    router: glm-5.3-flash:cloud
+    router: deepseek-v4.1-flash:cloud
     default: simple
-    simple: fast-glm
+    simple: fast-deepseek
     fusion: fusion-coder
+
+  fusion-agents-x:
+    strategy: smart
+    provider: lg-server
+    router: misha/glm-5.3-flash
+      # agy/gemini-3.8-flash-low held this until 2026-09-16 and probes as "All
+      # credentials for model gemini-3.8-flash-low are cooling down" — a failing
+      # router degrades to `default` on EVERY request, so the smart routing was
+      # not routing at all. glm-5.3-flash is live (2.4 s) and the glm line is the
+      # one this file already trusts for structured JSON (see the judge seats);
+      # its per_model_concurrency budget was already sized for this role.
+    default: simple
+    simple: fast-js-code
+    fusion: fusion-coder-x
