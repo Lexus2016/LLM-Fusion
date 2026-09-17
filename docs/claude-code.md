@@ -4,7 +4,7 @@
 
 ## Quick start
 
-With the proxy installed and your Ollama Cloud key in `.env`:
+With the proxy installed and your provider key in `.env` (`OLLAMA_API_KEY` with the shipped config):
 
 ```bash
 npm install

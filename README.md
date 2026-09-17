@@ -4,11 +4,11 @@
 
 > **Three models argue over your prompt, a judge scores their answers, and one final model writes the reply you actually see.**
 
-llm-fusion is a small proxy you run on your own machine, in front of [Ollama Cloud](https://ollama.com). Your coding tool connects to it the way it would connect to any single model — same API, same streaming, same tool calls. The difference is hidden behind the model name: ask for `fusion-coder` and you get a panel of four models answering in parallel, a judge comparing what they said, and a synthesizer writing the final answer. On hard questions, that panel gives you several decorrelated viewpoints from different model families instead of one, an impartial judge that adjudicates their disagreements and flags fragile or hallucinated claims, and a synthesizer that reconciles them into a single answer — plus within-provider failover and completeness guards that keep a single stalled or rate-limited model from ending the turn.
+llm-fusion is a small proxy you run on your own machine, in front of any OpenAI-compatible provider — [Ollama Cloud](https://ollama.com), which the shipped config points at, or OpenRouter, Groq, DeepInfra, Together, DeepSeek, your own endpoint, or several of them at once. Your coding tool connects to it the way it would connect to any single model — same API, same streaming, same tool calls. The difference is hidden behind the model name: ask for `fusion-coder` and you get a panel of four models answering in parallel, a judge comparing what they said, and a synthesizer writing the final answer. On hard questions, that panel gives you several decorrelated viewpoints from different model families instead of one, an impartial judge that adjudicates their disagreements and flags fragile or hallucinated claims, and a synthesizer that reconciles them into a single answer — plus within-provider failover and completeness guards that keep a single stalled or rate-limited model from ending the turn.
 
 Running that panel on every request would be expensive, so there is also `fusion-agents`: a fast router looks at each request and decides whether it deserves the full panel or just one cheap call. Reading a file gets one call. Recovering from a failed test run gets the whole panel.
 
-No database, no build step, no accounts. Node 24, one YAML config file, and your Ollama Cloud key. It speaks both the OpenAI Chat Completions API and the Anthropic Messages API, so OpenCode, Claude Code, Continue, Cline, Aider — or your own agent loop — all work unchanged.
+No database, no build step, no accounts. Node 24, one YAML config file, and an API key for whichever provider you point it at. It speaks both the OpenAI Chat Completions API and the Anthropic Messages API, so OpenCode, Claude Code, Continue, Cline, Aider — or your own agent loop — all work unchanged.
 
 Familiar with **OpenRouter Fusion**? Same idea — *many models think, one answers* — but self-hosted, transparent, and built to survive long agent loops. Full comparison [below](#llm-fusion-vs-openrouter-fusion).
 
@@ -16,7 +16,7 @@ Familiar with **OpenRouter Fusion**? Same idea — *many models think, one answe
 
 ## Quick start — 5 minutes
 
-You need two things: **Node.js 24 or newer** and an **[Ollama Cloud](https://ollama.com) API key**.
+You need two things: **Node.js 24 or newer** and an API key for one provider. The shipped config points at **[Ollama Cloud](https://ollama.com)**, so that is the five-minute path; any other OpenAI-compatible provider is one `providers:` block away — see *Connectors, multi-account failover & the panel* below.
 
 ```bash
 # 1. Get the code
@@ -234,7 +234,7 @@ Long agent runs used to die on four load-dependent failure modes; all four are n
 
 ## Connectors, multi-account failover & the panel
 
-By default the proxy talks to one upstream (one Ollama Cloud account). You can
+By default the proxy talks to one upstream (one account of one provider). You can
 instead group upstreams into **providers**, each with several **accounts**, and
 it **fails over between accounts of the same provider automatically** when one
 degrades, hits its rate limit, or its billing runs out. Failover stays *within* a
@@ -381,8 +381,8 @@ Both run a prompt through a panel of models plus a judge/synth step to reconcile
 | | **llm-fusion** | **OpenRouter Fusion** |
 |---|---|---|
 | **Hosting & control** | Runs on your machine / Docker. Single-tenant, inspectable, one config file. | Fully managed SaaS on OpenRouter. |
-| **Bill** | Pay Ollama Cloud directly. | Pay OpenRouter; usage is bundled. |
-| **Provider scope** | Ollama Cloud only (one bill, one upstream). | Any provider on OpenRouter (broader model catalog). |
+| **Bill** | Pay each provider directly, on your own accounts. | Pay OpenRouter; usage is bundled. |
+| **Provider scope** | Any OpenAI-compatible endpoint (`type: openai-compat`), several at once, on your own keys; `type: ollama` adds native `/api/show` discovery and `/api/chat` vision. | Any provider on OpenRouter (broader model catalog, one key). |
 | **Automatic routing** | Built-in `smart` strategy: a fast LLM router picks `single` (cheap) vs `fusion` (deep) **per request**. | Fusion always runs the full panel; routing is manual or a separate router. |
 | **Agent-loop safety** | Emits **exactly one `tool_calls`** per step; panel never touches real tools in `deliberate` mode. | Plugin returns analysis; the calling model decides final tool use. |
 | **Cost knob for long runs** | `fusion_planning_turn_only`: full panel on the planning turn, then synth-only (5 calls → 1) for mechanical mid-loop steps. | No per-request auto-downgrade inside a loop. |
@@ -395,7 +395,7 @@ Both run a prompt through a panel of models plus a judge/synth step to reconcile
 - You run an autonomous agent for **hundreds of steps** and need deterministic, exactly-once side effects.
 - You want routine steps to cost **1 upstream call**, with fusion reserved for hard or error-recovery steps.
 - You prefer a **local, transparent process** with one config file and no extra vendor lock-in.
-- Your models and budget live on **Ollama Cloud**.
+- You want to keep paying your providers **directly**, on keys you already hold.
 
 **Use OpenRouter Fusion when:**
 
@@ -471,7 +471,7 @@ The proxy reads plain environment variables. It also **auto-loads a local `.env`
 
 | Variable | Required | Default | Purpose |
 |----------|----------|---------|---------|
-| `OLLAMA_API_KEY` | Yes, for live use | — | The Ollama Cloud Bearer key. The name is whatever `upstream.api_key_env` points to (default `OLLAMA_API_KEY`). Held server-side only; never sent to clients or logged. |
+| `OLLAMA_API_KEY` | With the shipped config | — | The Bearer key for the provider account. The NAME is whatever `api_key_env` on that account points to (`OLLAMA_API_KEY` in the shipped config, `LG_API_KEY` for a second provider, anything you like) — each account names its own variable. Held server-side only; never sent to clients or logged. |
 | `FUSION_PROXY_TOKEN` | No | unset | When `server.auth_token_env: FUSION_PROXY_TOKEN` is set in the config, clients must send `Authorization: Bearer <this value>`. If the config names the var but it is UNSET (e.g. a typo), auth fails closed — every request gets a 500 and startup logs an error — rather than silently disabling auth. |
 | `AUTH_WEB_TOKEN` | No | unset | Optional **separate** admin/panel token. When `server.admin_token_env: AUTH_WEB_TOKEN` is set, the panel + `/admin/*` API authenticate with THIS token instead of the client `FUSION_PROXY_TOKEN` — so the widely-copied client API token doesn't also grant config edits + restart. Unset → the admin surface reuses the client token (or is loopback-only when neither is set). The var name is whatever `server.admin_token_env` points to. |
 | `FUSION_CONFIG` | No | `./fusion.yaml` | Path to the config file to load. |
@@ -532,7 +532,7 @@ On boot it prints a banner: the listen URL, the loaded virtual models and their 
 
 ## Phase 0 — live verification
 
-The upstream adapter's correctness depends on assumptions about Ollama Cloud (Bearer + SSE, per-model tool-calling, `/api/show` discovery, the vision format). Verify them against the real API with your key:
+The Ollama adapter (`type: ollama`) depends on assumptions about that API (Bearer + SSE, per-model tool-calling, `/api/show` discovery, the vision format); the generic `openai-compat` adapter only assumes `/v1/chat/completions`. Verify them against the real API with your key:
 
 ```bash
 OLLAMA_API_KEY=ollama-... npm run smoke

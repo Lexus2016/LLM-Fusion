@@ -6,6 +6,7 @@ dist
 research-test/
 docs/superpowers/specs/
 AUDIT*
+PROJECT_AUDIT.md
 .serena/
 fusion.yaml.bak-*
 .playwright-mcp/

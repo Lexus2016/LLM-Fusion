@@ -4,7 +4,7 @@ This file is the quick brief an AI coding agent should read first. Humans: see [
 
 ## What this is
 
-`llm-fusion` (**Fusion Proxy**) is an OpenAI-compatible HTTP proxy in front of **Ollama Cloud**. One virtual model name resolves to a multi-model pipeline: `single`, `failover`, `fusion` (panel → judge → synth), or `smart` (an LLM router picks cheap vs deep per request). Single process, Node 24 + TypeScript + Hono, **no build step** (runs `.ts` via `tsx`), config in one YAML file.
+`llm-fusion` (**Fusion Proxy**) is an OpenAI-compatible HTTP proxy in front of **any OpenAI-compatible provider** — one or several at once (`type: openai-compat`; `type: ollama` adds `/api/show` discovery and `/api/chat` vision). The shipped config points at Ollama Cloud. One virtual model name resolves to a multi-model pipeline: `single`, `failover`, `fusion` (panel → judge → synth), or `smart` (an LLM router picks cheap vs deep per request). Single process, Node 24 + TypeScript + Hono, **no build step** (runs `.ts` via `tsx`), config in one YAML file.
 
 ## Run it
 
@@ -36,7 +36,7 @@ OpenCode shortcut: `./bin/fusion-opencode fusion-coder` (starts the proxy + wire
 - **No build step / no `dist`.** Edit `src/*.ts`; `tsx` runs them directly. Do not add a compile step.
 - **Avoid typecasting.** No `as` casts in new TypeScript — fix the types at the source where practical (some legacy casts remain, e.g. in `src/strategies/fusion.ts`; don't add more).
 - **Config is hot-reloaded** from `fusion.yaml`; an invalid edit is rejected and the previous config kept. Model/routing changes apply live, and `providers:` changes rebuild the provider router in place (no restart — see the `manager.onReload` handler in `src/index.ts`). The process-level `upstream:` connection knobs (`max_concurrency`, `per_model_concurrency`, `per_model_concurrency_default`, `request_timeout_s`, `connector_cooldown_s`, `connector_down_recheck_s`) are read once at startup and still need a restart — the resilience bundle is built one time in `createApp`. Full annotated reference: [`fusion.example.yaml`](./fusion.example.yaml).
-- **Secrets:** the Ollama key lives in `.env` / the `OLLAMA_API_KEY` env var only. Never inline it in code, config, logs, or commits.
+- **Secrets:** provider keys live in `.env` / the env vars each account's `api_key_env` names (`OLLAMA_API_KEY`, `LG_API_KEY`, …) only. Never inline it in code, config, logs, or commits.
 
 ## Layout
 
