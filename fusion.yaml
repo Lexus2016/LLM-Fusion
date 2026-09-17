@@ -269,6 +269,16 @@ models:
       # remains valuable input). The synth seat has since moved glm-5.2 ->
       # deepseek-v4-pro:0813-cloud; NOTE it now shares the deepseek lineage with
       # the deepseek-v4-flash panel seat, so synth and one voice are correlated.
+    # Compress the panel's copy of the history only past this many characters of
+    # conversation text (message content PLUS tool-call arguments). The binding
+    # constraint is the SMALLEST window on this panel — kimi-k2.7-code at 262144
+    # tokens (deepseek-v4.1-flash and glm-5.3-flash are 1M, confirmed via
+    # /api/show). 500000 chars stays under it even at a worst-case 2 chars/token
+    # (Cyrillic prose, minified JSON), and leaves room for the completion. The
+    # 200000 default is sized for a 64k-token member: on THIS panel it threw away
+    # four fifths of the context the members could hold, and 12.5% of live traffic
+    # was past it (375 of 3012 requests).
+    panel_max_chars: 500000
     tool_mode: deliberate
     # Suppress the SYNTH's chain-of-thought: the synth only ASSEMBLES the
     # panel+judge deliberation, so its own reasoning is redundant, leaks English CoT
@@ -459,6 +469,16 @@ models:
     panel: [ kimi-k2.7-code, deepseek-v4.1-flash:cloud, glm-5.3-flash:cloud ]
     judge: glm-5.3
     synth: deepseek-v4.1-flash:cloud # scored 15/15; cleanest report-ready prose
+    # Compress the panel's copy of the history only past this many characters of
+    # conversation text (message content PLUS tool-call arguments). The binding
+    # constraint is the SMALLEST window on this panel — kimi-k2.7-code at 262144
+    # tokens (deepseek-v4.1-flash and glm-5.3-flash are 1M, confirmed via
+    # /api/show). 500000 chars stays under it even at a worst-case 2 chars/token
+    # (Cyrillic prose, minified JSON), and leaves room for the completion. The
+    # 200000 default is sized for a 64k-token member: on THIS panel it threw away
+    # four fifths of the context the members could hold, and 12.5% of live traffic
+    # was past it (375 of 3012 requests).
+    panel_max_chars: 500000
     tool_mode: deliberate
     fusion_planning_turn_only: false # research isn't a mechanical loop — full deliberation each step is the value
     # Optional BinEval post-synth quality evaluation (non-streaming responses only).

@@ -225,6 +225,23 @@ models:
     #     canonical tool_call. Keeps the cross-check even on agentic steps.
     #   bypass: skip panel+judge, go straight to synth with the tools (1 call
     #     instead of 5) — faster and cheaper, but no deliberation on tool choices.
+    # panel_max_chars — when the panel's copy of the conversation gets compressed.
+    # Measured over the whole conversation text: message content PLUS the JSON
+    # arguments of every tool call (a codegen loop keeps its bulk in the calls it
+    # MADE — the file being written — not in what it read back). Past this many
+    # characters the panel gets the system prompts, the original task, the active
+    # instruction and the last 30 turns, each excerpted; the middle is replaced by
+    # an omission marker. Below it, the history goes verbatim.
+    #
+    # The right value is the SMALLEST context window on this panel, in characters,
+    # with headroom for the completion. Budget ~2 chars/token to stay safe on
+    # Cyrillic prose and minified JSON. The 200000 default assumes an unknown (so
+    # small) panel; this one is bounded by gpt-oss:120b at ~128k tokens, which the
+    # default already fits. A panel whose smallest member is 262k tokens can hold
+    # 500000 — raise it there, or the panel deliberates on a fifth of the context
+    # its members could actually read.
+    panel_max_chars: 200000
+
     tool_mode: deliberate
 
     # fusion_planning_turn_only — the main cost knob for fusion inside an agent loop:

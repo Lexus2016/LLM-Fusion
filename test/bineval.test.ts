@@ -63,6 +63,7 @@ function makeCtx(client: UpstreamClient): StrategyContext {
       synth: "s",
       tool_mode: "deliberate",
       fusion_planning_turn_only: false,
+      panel_max_chars: 200_000,
     } satisfies FusionModelConfig,
   };
 }

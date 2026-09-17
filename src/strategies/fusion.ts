@@ -234,6 +234,7 @@ async function runFusion(
     native,
     webContext,
     adversarialModel: cfg.adversarial ?? null,
+    maxChars: cfg.panel_max_chars,
   });
   // A member gated by subscription (403) / not-found (404) / retired (410) will
   // never answer, so don't fail the whole fusion waiting for min_panel_success from
@@ -261,7 +262,7 @@ async function runFusion(
   );
 
   // JUDGE — one structured-JSON call; failure degrades to raw panel answers.
-  const analysis = await runJudge(ctx, resilience, cfg.judge, panelAnswers, timer, defaults);
+  const analysis = await runJudge(ctx, resilience, cfg.judge, panelAnswers, timer, defaults, cfg.panel_max_chars);
 
   // SYNTH — final answer, streams when requested, the only stage with real tools.
   let response = await runSynth(ctx, resilience, cfg.synth, analysis, panelAnswers, {
@@ -536,7 +537,13 @@ async function runPanel(
   resilience: Resilience,
   members: string[],
   timer: TimerFactory,
-  opts: { hasTools: boolean; native: boolean; webContext: string | null; adversarialModel: string | null },
+  opts: {
+    hasTools: boolean;
+    native: boolean;
+    webContext: string | null;
+    adversarialModel: string | null;
+    maxChars: number;
+  },
 ): Promise<{ answers: PanelAnswer[]; permanentlyUnavailable: number }> {
   const timeoutMs = ctx.config.defaults.panel_member_timeout_s * 1000;
   const minSuccess = ctx.config.defaults.min_panel_success;
@@ -665,7 +672,13 @@ async function callPanelMember(
   member: string,
   timer: TimerFactory,
   timeoutMs: number,
-  opts: { hasTools: boolean; native: boolean; webContext: string | null; adversarialModel: string | null },
+  opts: {
+    hasTools: boolean;
+    native: boolean;
+    webContext: string | null;
+    adversarialModel: string | null;
+    maxChars: number;
+  },
   signal?: AbortSignal,
   onFirstToken?: () => void,
   onPermanentUnavailable?: () => void,
@@ -680,6 +693,7 @@ async function callPanelMember(
     native: opts.native,
     webContext: opts.webContext,
     adversarial: opts.adversarialModel !== null && member === opts.adversarialModel,
+    maxChars: opts.maxChars,
   });
   const startedAt = Date.now();
   const abort = new AbortController();
@@ -877,8 +891,10 @@ function shortErrorReason(data: unknown): string | undefined {
  * and recent state to deliberate — just like the router sees a compressed view
  * (renderRequestForRouter), the panel gets a wider but still bounded view.
  *
- * PANEL_MAX_CHARS: if total message content is under this, skip compression
- * (short conversations are sent verbatim — no fidelity loss).
+ * panel_max_chars: if the conversation's total text is under this, skip compression
+ * (short conversations are sent verbatim — no fidelity loss). `PANEL_MAX_CHARS` is
+ * only its DEFAULT: each fusion model sets `panel_max_chars` to match the smallest
+ * context window on its own panel — see the schema note in src/config.ts.
  * PANEL_RECENT_WINDOW: how many recent non-system messages to keep.
  * PANEL_MSG_CAP: max chars per individual message content (head+tail).
  */
@@ -886,6 +902,36 @@ const PANEL_MAX_CHARS = 200_000;
 const PANEL_RECENT_WINDOW = 30;
 const PANEL_MSG_HEAD = 6000;
 const PANEL_MSG_TAIL = 2000;
+
+/**
+ * The `arguments` JSON of one tool call, or null when the entry is not a tool call
+ * with a string `arguments` (the OpenAI shape; `arguments` is a string, not an object).
+ */
+function toolCallArguments(tc: unknown): string | null {
+  if (typeof tc !== "object" || tc === null) return null;
+  const fn = (tc as Record<string, unknown>).function;
+  if (typeof fn !== "object" || fn === null) return null;
+  const args = (fn as Record<string, unknown>).arguments;
+  return typeof args === "string" ? args : null;
+}
+
+/**
+ * Characters carried by an assistant turn's `tool_calls`.
+ *
+ * This is NOT an accounting detail. A coding agent's context is dominated by the
+ * calls it MADE, not by what it read back: a `write_file` turn carries the whole
+ * file in `tool_calls[].function.arguments`, while its tool result is "ok". Sizing
+ * the conversation by `content` alone therefore measured a 690k-token write-heavy
+ * loop as small, `compressPanelMessages` short-circuited, and the verbatim history
+ * went to a 262k-token panel member — the exact overflow compression exists to
+ * prevent, reached by the path that never enters `content`.
+ */
+function toolCallArgsChars(toolCalls: unknown): number {
+  if (!Array.isArray(toolCalls)) return 0;
+  let total = 0;
+  for (const tc of toolCalls) total += toolCallArguments(tc)?.length ?? 0;
+  return total;
+}
 
 /** Approximate total character count of all message content in the array. */
 function approxTotalChars(msgs: unknown[]): number {
@@ -903,6 +949,7 @@ function approxTotalChars(msgs: unknown[]): number {
         }
       }
     }
+    total += toolCallArgsChars((m as Record<string, unknown>).tool_calls);
   }
   return total;
 }
@@ -993,6 +1040,84 @@ function capPanelMessageContent(content: unknown): unknown {
   return content;
 }
 
+/**
+ * Smallest excerpt left to one string field of a capped tool call. With many string
+ * fields an even split would shrink each to nothing; this keeps every field readable
+ * (a path, a flag, the opening of a body) at the cost of overshooting the budget on a
+ * call that has a lot of them — bounded, and far below the payload it replaces.
+ */
+const TOOL_ARG_FIELD_MIN_CHARS = 400;
+
+/**
+ * Cap the `arguments` JSON of one tool call.
+ *
+ * Not the head+tail slice used for prose: `arguments` is a JSON document, and cutting
+ * its middle yields a string that no longer parses — the panel would read a truncated
+ * object, and a client that re-parses the history would read a broken one. The long
+ * string VALUES are excerpted instead and the object re-serialised, so the call keeps
+ * the shape that makes it comprehensible (tool name, path, flags) and loses only the
+ * payload that made it large. For a `write_file`, that payload is the whole file.
+ *
+ * A document that is not a JSON object, or that does not parse, has no field to
+ * excerpt — that one falls back to the prose slice, because an over-long argument
+ * blob is worse than an unparseable one.
+ */
+function capToolCallArguments(args: string): string {
+  const max = PANEL_MSG_HEAD + PANEL_MSG_TAIL;
+  if (args.length <= max) return args;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(args);
+  } catch {
+    parsed = undefined;
+  }
+  if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+    const fields = Object.entries(parsed as Record<string, unknown>);
+    const stringFields = fields.filter(([, v]) => typeof v === "string").length;
+    if (stringFields > 0) {
+      // Split the budget across the string fields, so a call carrying several large
+      // values stays bounded in TOTAL rather than per field.
+      const perField = Math.max(TOOL_ARG_FIELD_MIN_CHARS, Math.floor(max / stringFields));
+      const capped: Record<string, unknown> = {};
+      for (const [key, value] of fields) {
+        capped[key] =
+          typeof value === "string" && value.length > perField
+            ? excerptMiddle(value, perField, (n) => `\n…[${n} chars omitted]…\n`)
+            : value;
+      }
+      return JSON.stringify(capped);
+    }
+  }
+
+  const head = sliceHeadSafe(args, PANEL_MSG_HEAD);
+  const tail = sliceTailSafe(args, PANEL_MSG_TAIL);
+  return `${head}\n…[${args.length - head.length - tail.length} chars omitted]…\n${tail}`;
+}
+
+/**
+ * The panel's copy of one message: content capped, and the arguments of every tool
+ * call on it capped too. Both halves matter — an agent loop puts its bulk in whichever
+ * of the two the task happens to use (file reads land in `content`, file writes in
+ * `tool_calls`), and capping only one leaves the other unbounded.
+ */
+function capPanelMessage(msg: unknown): unknown {
+  if (typeof msg !== "object" || msg === null) return msg;
+  const rec = msg as Record<string, unknown>;
+  const out: Record<string, unknown> = { ...rec, content: capPanelMessageContent(rec.content) };
+  if (Array.isArray(rec.tool_calls)) {
+    out.tool_calls = rec.tool_calls.map((tc: unknown) => {
+      const args = toolCallArguments(tc);
+      if (args === null) return tc;
+      const capped = capToolCallArguments(args);
+      if (capped === args) return tc;
+      const tcRec = tc as Record<string, unknown>;
+      return { ...tcRec, function: { ...(tcRec.function as Record<string, unknown>), arguments: capped } };
+    });
+  }
+  return out;
+}
+
 /** Role of the non-system entry at index `i`, or undefined if not a typed message. */
 function roleOfNonSystem(entries: Array<{ idx: number; msg: unknown }>, i: number): string | undefined {
   const m = entries[i]?.msg;
@@ -1002,20 +1127,23 @@ function roleOfNonSystem(entries: Array<{ idx: number; msg: unknown }>, i: numbe
 }
 
 /**
- * Compress the panel message array when total content exceeds PANEL_MAX_CHARS.
+ * Compress the panel message array when its total text exceeds `maxChars`
+ * (message content plus the JSON arguments of every tool call — both, because an
+ * agent loop's bulk lands in whichever one its task uses).
  * Strategy: keep system messages intact, keep the first non-system message
  * (original task), keep the most recent user instruction that predates the
  * recent window, and keep the last PANEL_RECENT_WINDOW non-system messages.
  * The middle is replaced with an omission marker. Each kept message is also
- * content-capped to prevent a single huge tool result from dominating.
+ * content-capped — and tool-call-argument-capped — to prevent a single huge
+ * tool result or file write from dominating.
  *
  * The recent-window start is walked back past any leading `tool` results so the
  * window never opens on an orphaned tool message (which strict upstreams reject).
  *
  * Exported for direct unit testing of the tool-pairing invariant.
  */
-export function compressPanelMessages(msgs: unknown[]): unknown[] {
-  if (approxTotalChars(msgs) <= PANEL_MAX_CHARS) return msgs;
+export function compressPanelMessages(msgs: unknown[], maxChars: number = PANEL_MAX_CHARS): unknown[] {
+  if (approxTotalChars(msgs) <= maxChars) return msgs;
 
   // Separate system messages (kept in full) from non-system.
   const systems: Array<{ idx: number; msg: unknown }> = [];
@@ -1033,11 +1161,7 @@ export function compressPanelMessages(msgs: unknown[]): unknown[] {
   // If non-system messages fit in the window, no compression needed.
   if (nonSystems.length <= PANEL_RECENT_WINDOW + 1) {
     // Just cap individual messages.
-    return msgs.map((m) => {
-      if (typeof m !== "object" || m === null) return m;
-      const rec = m as Record<string, unknown>;
-      return { ...rec, content: capPanelMessageContent(rec.content) };
-    });
+    return msgs.map((m) => capPanelMessage(m));
   }
 
   // Build the set of non-system indices to keep.
@@ -1071,8 +1195,7 @@ export function compressPanelMessages(msgs: unknown[]): unknown[] {
   // This is safe because panel system prompts are position-independent (they frame
   // the deliberation, not interleave with the conversation).
   for (const s of systems) {
-    const rec = s.msg as Record<string, unknown>;
-    result.push({ ...rec, content: capPanelMessageContent(rec.content) });
+    result.push(capPanelMessage(s.msg));
   }
 
   let prev = -1;
@@ -1086,8 +1209,7 @@ export function compressPanelMessages(msgs: unknown[]): unknown[] {
     }
     const m = nonSystems[i]?.msg;
     if (m && typeof m === "object") {
-      const rec = m as Record<string, unknown>;
-      result.push({ ...rec, content: capPanelMessageContent(rec.content) });
+      result.push(capPanelMessage(m));
     }
     prev = i;
   }
@@ -1098,7 +1220,13 @@ export function compressPanelMessages(msgs: unknown[]): unknown[] {
 function buildPanelBody(
   request: ChatCompletionRequest,
   member: string,
-  opts: { hasTools: boolean; native: boolean; webContext: string | null; adversarial: boolean },
+  opts: {
+    hasTools: boolean;
+    native: boolean;
+    webContext: string | null;
+    adversarial: boolean;
+    maxChars: number;
+  },
 ): Record<string, unknown> {
   // Strip tools/tool_choice/stream/model so the panel deliberates rather than
   // executes. Also strip request-level OUTPUT controls (response_format,
@@ -1134,7 +1262,7 @@ function buildPanelBody(
   // deliberation-relevant context (system, original task, recent state) while
   // trimming the mechanical middle.
   const rawMsgs: unknown[] = Array.isArray(messages) ? [...messages] : [];
-  const msgs: unknown[] = compressPanelMessages(rawMsgs);
+  const msgs: unknown[] = compressPanelMessages(rawMsgs, opts.maxChars);
   if (opts.webContext !== null) {
     // Inject as a `user` message directly before the latest user instruction,
     // not as `system`: some panel members (kimi-k2.7-code) ignore live facts
@@ -1212,6 +1340,7 @@ async function runJudge(
   panelAnswers: PanelAnswer[],
   timer: TimerFactory,
   defaults: { judge_timeout_s: number },
+  panelMaxChars: number,
 ): Promise<JudgeAnalysis | null> {
   if (!resilience.breaker.canAttempt(judge)) {
     logUpstreamFailure(ctx.logger, { stage: "judge", model: judge, kind: "circuit_open", latencyMs: 0 });
@@ -1229,7 +1358,7 @@ async function runJudge(
         role: "user",
         content:
           "ORIGINAL USER REQUEST:\n" +
-          renderRequestForJudge(ctx.request) +
+          renderRequestForJudge(ctx.request, panelMaxChars) +
           "\n\nEXPERT ANSWERS:\n" +
           renderPanelForJudgeBounded(panelAnswers),
       },
@@ -2237,7 +2366,7 @@ async function attachBinevalHeaders(
     // content) — nothing to score.
     skippedReason = "empty_output";
   } else {
-    const requestText = renderRequestForJudge(ctx.request);
+    const requestText = renderRequestForJudge(ctx.request, cfg.panel_max_chars);
     const model = bineval.model ?? cfg.judge;
     const timeoutMs = (bineval.timeout_s ?? defaults.judge_timeout_s) * 1000;
     const questions = bineval.dimensions ?? DEFAULT_DIMENSIONS;
@@ -2597,7 +2726,7 @@ function renderPanelForJudgeBounded(panelAnswers: PanelAnswer[]): string {
 /**
  * Ceiling for the rendered request handed to the judge / bineval, applied
  * UNCONDITIONALLY over the whole render — see point 2 on `renderRequestForJudge`:
- * it is deliberately NOT gated on `PANEL_MAX_CHARS`. The per-message cap, which IS
+ * it is deliberately NOT gated on `panel_max_chars`. The per-message cap, which IS
  * gated on that threshold, does not bound growth on its own: a long
  * agent session accumulates hundreds of user turns, and this render walks the
  * ORIGINAL array, so it also sees the turns `compressPanelMessages` dropped.
@@ -2648,7 +2777,7 @@ function judgeContentText(content: unknown[]): string {
  *
  * 1. Per message via `capPanelMessageContent` (head+tail, so a single pasted file
  *    cannot dominate) — but ONLY when the whole conversation exceeds
- *    `PANEL_MAX_CHARS`, which is the exact condition `compressPanelMessages` uses
+ *    `panel_max_chars`, which is the exact condition `compressPanelMessages` uses
  *    to start capping the panel's own messages. Gating on the same total over the
  *    same array is the point: below the threshold the panel members answer against
  *    verbatim text, so the judge must adjudicate against verbatim text too.
@@ -2670,16 +2799,16 @@ function judgeContentText(content: unknown[]): string {
  * instruction actually in play).
  *
  * It is NOT a claim that the judge always sees at least as much as the panel.
- * Below `PANEL_MAX_CHARS` and under the ceiling the two match verbatim; past
+ * Below `panel_max_chars` and under the ceiling the two match verbatim; past
  * either one they are bounded by different rules — the panel by a message window
  * (first + `PANEL_RECENT_WINDOW`, each 8 KB-capped), this render by a character
  * budget — so a mid-conversation turn the panel kept can fall in the omitted
  * middle. Losing the middle of a question beats losing the judge entirely.
  */
-function renderRequestForJudge(request: ChatCompletionRequest): string {
+function renderRequestForJudge(request: ChatCompletionRequest, panelMaxChars: number): string {
   const messages: ChatMessage[] = Array.isArray(request.messages) ? request.messages : [];
   // Same predicate, same input array, same threshold as compressPanelMessages.
-  const capPerMessage = approxTotalChars(messages) > PANEL_MAX_CHARS;
+  const capPerMessage = approxTotalChars(messages) > panelMaxChars;
   const lines: string[] = [];
   for (const m of messages) {
     const role = typeof m.role === "string" ? m.role : "user";

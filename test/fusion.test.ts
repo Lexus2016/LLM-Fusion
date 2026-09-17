@@ -2695,6 +2695,79 @@ describe("fusion strategy — panel compression tool-pairing", () => {
   });
 });
 
+describe("fusion strategy — panel compression sizes tool-call arguments", () => {
+  /**
+   * A WRITE-heavy agent loop: the payload lives in `tool_calls[].function.arguments`
+   * (the file being written), and every tool result is a one-word ack. This is the
+   * shape a codegen client produces, and the shape that used to walk straight past
+   * compression — `approxTotalChars` summed `content` only, so 2.4M chars of file
+   * bodies measured as ~1.5k and the verbatim history went to the panel.
+   */
+  function writeHeavyLoop(turns: number, fileChars: number): unknown[] {
+    const file = "Y".repeat(fileChars);
+    const msgs: unknown[] = [{ role: "user", content: "Build the landing page." }];
+    for (let k = 0; k < turns; k++) {
+      msgs.push({
+        role: "assistant",
+        content: "writing",
+        tool_calls: [
+          {
+            id: `w${k}`,
+            type: "function",
+            function: { name: "write_file", arguments: JSON.stringify({ path: `src/f${k}.tsx`, content: file }) },
+          },
+        ],
+      });
+      msgs.push({ role: "tool", tool_call_id: `w${k}`, content: "ok" });
+    }
+    return msgs;
+  }
+
+  const totalChars = (msgs: unknown[]): number => JSON.stringify(msgs).length;
+
+  it("compresses a loop whose bulk is in tool-call arguments, not in content", () => {
+    const input = writeHeavyLoop(60, 40_000);
+    const out = compressPanelMessages(input);
+    expect(out.length).toBeLessThan(input.length);
+    // The panel copy must be a small fraction of the original, not a pass-through.
+    expect(totalChars(out)).toBeLessThan(totalChars(input) / 10);
+  });
+
+  it("caps a tool call's arguments to parseable JSON: shape kept, payload dropped", () => {
+    const out = compressPanelMessages(writeHeavyLoop(60, 40_000));
+    const withCalls = out.filter(
+      (m): m is Record<string, unknown> =>
+        typeof m === "object" && m !== null && Array.isArray((m as Record<string, unknown>).tool_calls),
+    );
+    expect(withCalls.length).toBeGreaterThan(0);
+    for (const m of withCalls) {
+      for (const tc of m.tool_calls as Array<Record<string, unknown>>) {
+        const fn = tc.function as Record<string, unknown>;
+        const args = fn.arguments as string;
+        // Still valid JSON — a head+tail slice of the blob would not be.
+        const parsed = JSON.parse(args) as { path: string; content: string };
+        expect(parsed.path).toMatch(/^src\/f\d+\.tsx$/); // the call stays comprehensible
+        expect(parsed.content.length).toBeLessThan(40_000); // the file body does not
+        expect(parsed.content).toContain("chars omitted");
+      }
+    }
+  });
+
+  it("leaves a small tool-call payload untouched", () => {
+    const msgs = writeHeavyLoop(1, 100);
+    const out = compressPanelMessages(msgs);
+    expect(out).toEqual(msgs);
+  });
+
+  it("honours an explicit maxChars over the default threshold", () => {
+    const input = writeHeavyLoop(60, 40_000);
+    // A budget above the conversation's real size sends it verbatim...
+    expect(compressPanelMessages(input, 10_000_000)).toEqual(input);
+    // ...and a budget below it compresses, on the same input.
+    expect(compressPanelMessages(input, 100_000).length).toBeLessThan(input.length);
+  });
+});
+
 describe("fusion strategy — web grounding (gated on TAVILY_API_KEY + web_search.enabled)", () => {
   const TAVILY = "https://api.tavily.com/search";
   let realFetch: typeof globalThis.fetch;
@@ -2895,6 +2968,65 @@ describe("fusion strategy — web grounding (gated on TAVILY_API_KEY + web_searc
       expect(sysMsgs.some((s) => s.includes("earlier message"))).toBe(true);
     }
   });
+  it("a fusion model's panel_max_chars raises the threshold for its own panel", async () => {
+    // ~250k chars — over the 200k default, under a panel whose smallest member is
+    // big enough to say so. The knob is the whole point: the default is sized for an
+    // unknown (small) panel, and a 262k-token member should not be fed one fifth of
+    // the history it can actually hold.
+    const big = "x".repeat(5000);
+    const messages: Array<Record<string, unknown>> = [
+      { role: "system", content: "You are a coding assistant." },
+      { role: "user", content: "Implement the feature." },
+    ];
+    for (let i = 0; i < 50; i++) {
+      messages.push({ role: "assistant", content: `step ${i}` });
+      messages.push({ role: "tool", content: `${big} result-${i}` });
+    }
+
+    const wide = parseConfig({
+      upstream: { base_url: "https://mock.test", api_key_env: "X", max_concurrency: 4 },
+      models: {
+        "fusion-wide": {
+          strategy: "fusion",
+          panel: ["m1", "m2", "m3"],
+          judge: "j",
+          synth: "s",
+          panel_max_chars: 1_000_000,
+        },
+      },
+    });
+    const entry = wide.models["fusion-wide"];
+    if (!entry) throw new Error("test config missing 'fusion-wide'");
+
+    const up = makeUpstream(defaultChat());
+    const request: ChatCompletionRequest = {
+      model: "fusion-wide",
+      messages: messages as ChatCompletionRequest["messages"],
+    };
+    const capabilities = new CapabilityService({
+      client: up.client,
+      getOverrides: () => wide.overrides,
+      logger,
+    });
+    const res = await fusionStrategy.execute({
+      request,
+      config: wide,
+      client: up.client,
+      capabilities,
+      logger,
+      modelConfig: entry,
+    });
+    expect(res.status).toBe(200);
+
+    const panelBodies = up.recorded.filter((b) => ["m1", "m2", "m3"].includes(String(b.model)));
+    expect(panelBodies.length).toBeGreaterThanOrEqual(1);
+    for (const pb of panelBodies) {
+      // Verbatim history (plus the injected panel directives), not a compressed copy.
+      expect(pb.messages.length).toBeGreaterThanOrEqual(messages.length);
+      expect(systemContents(pb).some((c) => c.includes("earlier message"))).toBe(false);
+    }
+  });
+
   it("compresses array-based multimodal messages in the panel context", async () => {
     const bigContent = "x".repeat(15000); // Exceeds PANEL_MSG_HEAD + PANEL_MSG_TAIL
     const request: ChatCompletionRequest = {

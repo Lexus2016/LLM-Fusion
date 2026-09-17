@@ -539,6 +539,7 @@ function resolveFusion(ctx: StrategyContext, cfg: SmartModelConfig): FusionModel
       synth_request_overrides: ref.synth_request_overrides,
       tool_mode: "deliberate",
       fusion_planning_turn_only: false,
+      panel_max_chars: ref.panel_max_chars,
       promote_reasoning_to_content: ref.promote_reasoning_to_content,
       web_search: ref.web_search,
       image_describe: ref.image_describe,

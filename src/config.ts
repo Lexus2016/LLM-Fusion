@@ -130,6 +130,17 @@ const FusionModelSchema = z
     synth: z.string().min(1),
     tool_mode: z.enum(["deliberate", "bypass"]).default("deliberate"),
     fusion_planning_turn_only: z.boolean().default(false),
+    // When the conversation's total text — message content PLUS the JSON
+    // arguments of every tool call in it — exceeds this many characters, the
+    // panel's COPY of the history is compressed (see compressPanelMessages).
+    // The binding constraint is the SMALLEST context window on the panel, so the
+    // right value is that window in characters with headroom for the completion:
+    // the default is sized for a 64k-token member and is deliberately safe rather
+    // than generous, because an unknown panel is assumed small. Raise it to stop
+    // amputating history on a panel whose members are actually large — a 262k-token
+    // member tolerates ~500000 at a worst-case 2 chars/token (Cyrillic, minified
+    // JSON), where the default throws away four fifths of the context it could hold.
+    panel_max_chars: z.number().int().positive().default(200_000),
     // Per-model override of `defaults.promote_reasoning_to_content`. When unset
     // the global default applies.
     promote_reasoning_to_content: z.boolean().optional(),
@@ -174,6 +185,9 @@ const FusionBlockSchema = z
     // Synth-only overrides (mirrors FusionModelSchema.synth_request_overrides) so an
     // inline `smart` fusion block can also suppress the synth's reasoning.
     synth_request_overrides: z.record(z.string(), z.unknown()).optional(),
+    // Same semantics as FusionModelSchema.panel_max_chars, so an inline `smart`
+    // fusion block can also match its threshold to its panel's real windows.
+    panel_max_chars: z.number().int().positive().default(200_000),
     promote_reasoning_to_content: z.boolean().optional(),
     web_search: WebSearchSchema,
     image_describe: ImageDescribeSchema.optional(),
