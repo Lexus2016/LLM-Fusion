@@ -43,6 +43,31 @@ OpenCode shortcut: `./bin/fusion-opencode fusion-coder` (starts the proxy + wire
   Do not size your context against the header.
 - **Secrets:** provider keys live in `.env` / the env vars each account's `api_key_env` names (`OLLAMA_API_KEY`, `LG_API_KEY`, …) only. Never inline it in code, config, logs, or commits.
 
+## Ship it (what "a release" means here)
+
+A release is **published**, not just tagged. Four steps, all four required — a tag
+alone leaves the repo's landing page showing the previous version, because the
+GitHub Releases widget reads published releases, not tags. That is exactly how
+v0.1.48-v0.1.50 sat invisible while `main` already carried the code.
+
+1. Bump `version` in `package.json`.
+2. Add the `## [x.y.z] - YYYY-MM-DD` section to `CHANGELOG.md` — what changed and
+   the evidence for it, in the voice of the sections already there.
+3. Commit, then `git tag -a vx.y.z -m "..."` and
+   `git push origin main --follow-tags`.
+4. **Publish the GitHub Release:**
+   ```bash
+   gh release create vx.y.z --verify-tag \
+     --title "vx.y.z — one line on what changed" \
+     --notes-file <the CHANGELOG section for this version, header line dropped>
+   ```
+   Then confirm: `gh release view --json tagName,name` (or
+   `/releases/latest` on the API) must name the version you just shipped.
+
+Titles follow `vx.y.z — <short summary>`; the body is the CHANGELOG section
+verbatim. Check `gh release list` before assuming a convention — this repo has
+30+ published releases and every one of them has notes.
+
 ## Layout
 
 - `src/index.ts` — entrypoint / HTTP server (Hono).
