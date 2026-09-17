@@ -2753,6 +2753,98 @@ describe("fusion strategy — panel compression sizes tool-call arguments", () =
     }
   });
 
+  it("caps a NESTED tool-call payload, not just top-level string fields", () => {
+    // The shape a batch-edit / structured write tool produces. Capping only the
+    // top level left this untouched: the defense engaged for the flat shape and
+    // silently missed this one.
+    const msgs: unknown[] = [{ role: "user", content: "Refactor everything." }];
+    for (let k = 0; k < 60; k++) {
+      msgs.push({
+        role: "assistant",
+        content: "editing",
+        tool_calls: [
+          {
+            id: `e${k}`,
+            type: "function",
+            function: {
+              name: "apply_edits",
+              arguments: JSON.stringify({ edits: [{ path: `src/f${k}.ts`, content: "Z".repeat(40_000) }] }),
+            },
+          },
+        ],
+      });
+      msgs.push({ role: "tool", tool_call_id: `e${k}`, content: "ok" });
+    }
+
+    const out = compressPanelMessages(msgs);
+    expect(JSON.stringify(out).length).toBeLessThan(JSON.stringify(msgs).length / 10);
+    for (const m of out) {
+      const calls = (m as Record<string, unknown>)?.tool_calls;
+      if (!Array.isArray(calls)) continue;
+      for (const tc of calls as Array<Record<string, unknown>>) {
+        const args = (tc.function as Record<string, unknown>).arguments as string;
+        const parsed = JSON.parse(args) as { edits: Array<{ path: string; content: string }> };
+        expect(parsed.edits[0]?.path).toMatch(/^src\/f\d+\.ts$/);
+        expect(parsed.edits[0]?.content.length).toBeLessThan(40_000);
+      }
+    }
+  });
+
+  it("counts and caps arguments that arrived as an object, keeping them an object", () => {
+    // Not the OpenAI wire shape, but what a client or bridge that deserialises
+    // before forwarding hands over. Ignoring it left the same blind spot one level down.
+    const msgs: unknown[] = [{ role: "user", content: "Write the files." }];
+    for (let k = 0; k < 60; k++) {
+      msgs.push({
+        role: "assistant",
+        content: "writing",
+        tool_calls: [
+          {
+            id: `o${k}`,
+            type: "function",
+            function: { name: "write_file", arguments: { path: `src/f${k}.ts`, content: "Q".repeat(40_000) } },
+          },
+        ],
+      });
+      msgs.push({ role: "tool", tool_call_id: `o${k}`, content: "ok" });
+    }
+
+    const out = compressPanelMessages(msgs);
+    expect(JSON.stringify(out).length).toBeLessThan(JSON.stringify(msgs).length / 10);
+    for (const m of out) {
+      const calls = (m as Record<string, unknown>)?.tool_calls;
+      if (!Array.isArray(calls)) continue;
+      for (const tc of calls as Array<Record<string, unknown>>) {
+        const args = (tc.function as Record<string, unknown>).arguments as { path: string; content: string };
+        expect(typeof args).toBe("object"); // shape preserved, not re-serialised to a string
+        expect(args.path).toMatch(/^src\/f\d+\.ts$/);
+        expect(args.content.length).toBeLessThan(40_000);
+      }
+    }
+  });
+
+  it("bounds arguments that are not valid JSON at all", () => {
+    const junk = "{not json at all " + "!".repeat(60_000);
+    const msgs: unknown[] = [{ role: "user", content: "go" }];
+    for (let k = 0; k < 60; k++) {
+      msgs.push({
+        role: "assistant",
+        content: "x",
+        tool_calls: [{ id: `j${k}`, type: "function", function: { name: "f", arguments: junk } }],
+      });
+      msgs.push({ role: "tool", tool_call_id: `j${k}`, content: "ok" });
+    }
+    const out = compressPanelMessages(msgs);
+    for (const m of out) {
+      const calls = (m as Record<string, unknown>)?.tool_calls;
+      if (!Array.isArray(calls)) continue;
+      for (const tc of calls as Array<Record<string, unknown>>) {
+        const args = (tc.function as Record<string, unknown>).arguments as string;
+        expect(args.length).toBeLessThan(junk.length / 4);
+      }
+    }
+  });
+
   it("leaves a small tool-call payload untouched", () => {
     const msgs = writeHeavyLoop(1, 100);
     const out = compressPanelMessages(msgs);

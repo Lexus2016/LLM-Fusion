@@ -904,15 +904,33 @@ const PANEL_MSG_HEAD = 6000;
 const PANEL_MSG_TAIL = 2000;
 
 /**
- * The `arguments` JSON of one tool call, or null when the entry is not a tool call
- * with a string `arguments` (the OpenAI shape; `arguments` is a string, not an object).
+ * The `arguments` payload of one tool call, in whichever shape it arrived.
+ *
+ * The OpenAI wire shape is a JSON *string*, but clients and bridges that
+ * deserialise before forwarding (and the Anthropic `tool_use.input` conversion)
+ * hand over an *object*. Accepting only the string shape would leave the object
+ * one uncounted and uncapped — the same blind spot one level down.
  */
-function toolCallArguments(tc: unknown): string | null {
+function toolCallArguments(tc: unknown): string | Record<string, unknown> | unknown[] | null {
   if (typeof tc !== "object" || tc === null) return null;
   const fn = (tc as Record<string, unknown>).function;
   if (typeof fn !== "object" || fn === null) return null;
   const args = (fn as Record<string, unknown>).arguments;
-  return typeof args === "string" ? args : null;
+  if (typeof args === "string") return args;
+  if (Array.isArray(args)) return args;
+  if (typeof args === "object" && args !== null) return args as Record<string, unknown>;
+  return null;
+}
+
+/** Characters one tool call's arguments occupy, in either shape. */
+function argumentsChars(args: string | Record<string, unknown> | unknown[] | null): number {
+  if (args === null) return 0;
+  if (typeof args === "string") return args.length;
+  try {
+    return JSON.stringify(args).length;
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -929,7 +947,7 @@ function toolCallArguments(tc: unknown): string | null {
 function toolCallArgsChars(toolCalls: unknown): number {
   if (!Array.isArray(toolCalls)) return 0;
   let total = 0;
-  for (const tc of toolCalls) total += toolCallArguments(tc)?.length ?? 0;
+  for (const tc of toolCalls) total += argumentsChars(toolCallArguments(tc));
   return total;
 }
 
@@ -1049,18 +1067,62 @@ function capPanelMessageContent(content: unknown): unknown {
 const TOOL_ARG_FIELD_MIN_CHARS = 400;
 
 /**
- * Cap the `arguments` JSON of one tool call.
+ * Every string leaf under a parsed JSON value. (JSON cannot be cyclic, so the walk
+ * always terminates.)
+ */
+function countStringLeaves(value: unknown): number {
+  if (typeof value === "string") return 1;
+  if (Array.isArray(value)) return value.reduce<number>((n, v) => n + countStringLeaves(v), 0);
+  if (typeof value === "object" && value !== null) {
+    return Object.values(value).reduce<number>((n, v) => n + countStringLeaves(v), 0);
+  }
+  return 0;
+}
+
+/** `value` with every string leaf longer than `budget` excerpted head+tail. */
+function excerptStringLeaves(value: unknown, budget: number): unknown {
+  if (typeof value === "string") {
+    return value.length <= budget ? value : excerptMiddle(value, budget, (n) => `\n…[${n} chars omitted]…\n`);
+  }
+  if (Array.isArray(value)) return value.map((v) => excerptStringLeaves(v, budget));
+  if (typeof value === "object" && value !== null) {
+    const out: Record<string, unknown> = {};
+    for (const [key, v] of Object.entries(value)) out[key] = excerptStringLeaves(v, budget);
+    return out;
+  }
+  return value;
+}
+
+/**
+ * A tool call's parsed arguments with the payload excerpted out of them.
+ *
+ * The walk is RECURSIVE, and that is the whole point: capping only the top-level
+ * string fields left `{"edits":[{"path":"…","content":"<50KB>"}]}` — the shape a
+ * batch-edit or a structured write tool produces — completely untouched, so the
+ * defense engaged for the flat shape and silently missed the nested one.
+ *
+ * The budget is split across the string leaves so a call carrying several large
+ * values stays bounded in TOTAL rather than per leaf.
+ */
+function excerptJsonPayload(value: unknown): unknown {
+  const leaves = countStringLeaves(value);
+  if (leaves === 0) return value;
+  const budget = Math.max(TOOL_ARG_FIELD_MIN_CHARS, Math.floor((PANEL_MSG_HEAD + PANEL_MSG_TAIL) / leaves));
+  return excerptStringLeaves(value, budget);
+}
+
+/**
+ * Cap the `arguments` JSON string of one tool call.
  *
  * Not the head+tail slice used for prose: `arguments` is a JSON document, and cutting
  * its middle yields a string that no longer parses — the panel would read a truncated
- * object, and a client that re-parses the history would read a broken one. The long
- * string VALUES are excerpted instead and the object re-serialised, so the call keeps
- * the shape that makes it comprehensible (tool name, path, flags) and loses only the
+ * object, and a client that re-parses the history would read a broken one. The string
+ * leaves are excerpted instead and the document re-serialised, so the call keeps the
+ * shape that makes it comprehensible (tool name, path, flags) and loses only the
  * payload that made it large. For a `write_file`, that payload is the whole file.
  *
- * A document that is not a JSON object, or that does not parse, has no field to
- * excerpt — that one falls back to the prose slice, because an over-long argument
- * blob is worse than an unparseable one.
+ * The prose slice remains only for arguments that do not parse at all — a malformed
+ * call has no structure to preserve, and an over-long blob is worse than a cut one.
  */
 function capToolCallArguments(args: string): string {
   const max = PANEL_MSG_HEAD + PANEL_MSG_TAIL;
@@ -1068,31 +1130,13 @@ function capToolCallArguments(args: string): string {
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(args);
+    parsed = JSON.parse(args) as unknown;
   } catch {
-    parsed = undefined;
+    const head = sliceHeadSafe(args, PANEL_MSG_HEAD);
+    const tail = sliceTailSafe(args, PANEL_MSG_TAIL);
+    return `${head}\n…[${args.length - head.length - tail.length} chars omitted]…\n${tail}`;
   }
-  if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-    const fields = Object.entries(parsed as Record<string, unknown>);
-    const stringFields = fields.filter(([, v]) => typeof v === "string").length;
-    if (stringFields > 0) {
-      // Split the budget across the string fields, so a call carrying several large
-      // values stays bounded in TOTAL rather than per field.
-      const perField = Math.max(TOOL_ARG_FIELD_MIN_CHARS, Math.floor(max / stringFields));
-      const capped: Record<string, unknown> = {};
-      for (const [key, value] of fields) {
-        capped[key] =
-          typeof value === "string" && value.length > perField
-            ? excerptMiddle(value, perField, (n) => `\n…[${n} chars omitted]…\n`)
-            : value;
-      }
-      return JSON.stringify(capped);
-    }
-  }
-
-  const head = sliceHeadSafe(args, PANEL_MSG_HEAD);
-  const tail = sliceTailSafe(args, PANEL_MSG_TAIL);
-  return `${head}\n…[${args.length - head.length - tail.length} chars omitted]…\n${tail}`;
+  return JSON.stringify(excerptJsonPayload(parsed));
 }
 
 /**
@@ -1109,7 +1153,15 @@ function capPanelMessage(msg: unknown): unknown {
     out.tool_calls = rec.tool_calls.map((tc: unknown) => {
       const args = toolCallArguments(tc);
       if (args === null) return tc;
-      const capped = capToolCallArguments(args);
+      // Each shape is capped IN ITS OWN SHAPE: re-serialising an object payload into a
+      // string (or the reverse) would hand the upstream a different call than the
+      // client sent, which is not this function's business.
+      const capped =
+        typeof args === "string"
+          ? capToolCallArguments(args)
+          : argumentsChars(args) > PANEL_MSG_HEAD + PANEL_MSG_TAIL
+            ? excerptJsonPayload(args)
+            : args;
       if (capped === args) return tc;
       const tcRec = tc as Record<string, unknown>;
       return { ...tcRec, function: { ...(tcRec.function as Record<string, unknown>), arguments: capped } };

@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.49] - 2026-09-17
+
+Follow-up to 0.1.48, from an independent review of that diff (`consult agy`):
+the new tool-call accounting had two holes of its own, both found before the
+release reached the live proxy.
+
+### Fixed
+- **Nested tool-call payloads were not capped.** The cap walked only the
+  TOP-LEVEL string fields of a call's arguments, so
+  `{"edits":[{"path":"…","content":"<50KB>"}]}` — what a batch-edit or a
+  structured write tool produces — passed through whole. The defense engaged
+  for the flat shape and silently missed the nested one. The walk is now
+  recursive over every string leaf, with the budget split across the leaves so
+  a call carrying several large values stays bounded in total.
+- **`arguments` delivered as an object were neither counted nor capped.** The
+  OpenAI wire shape is a JSON string, but clients and bridges that deserialise
+  before forwarding hand over an object — the same blind spot one level down.
+  Both shapes are now measured and capped, each in its own shape: an object
+  payload stays an object, because re-serialising it would hand the upstream a
+  different call than the client sent.
+- **A parseable payload now always comes back parseable.** The head+tail slice
+  is reserved for arguments that do not parse at all, where there is no
+  structure left to preserve.
+
+### Reviewed and kept as-is
+- The judge's per-message cap still fires on the same total as the panel's
+  compression, tool-call arguments included. The judge adjudicates answers the
+  panel produced from capped text; letting it read more than the panel saw
+  would have it grade members for context they never received.
+
 ## [0.1.48] - 2026-09-17
 
 Context release. A user report — "the agent loses context in a low-code
