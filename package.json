@@ -3,7 +3,7 @@
   "version": "0.1.49",
   "private": true,
   "type": "module",
-  "description": "Lightweight OpenAI-compatible LLM proxy (Fusion Proxy) for Ollama Cloud.",
+  "description": "Self-hosted fusion proxy for any OpenAI-compatible provider: a panel of models deliberates, a judge scores, one synthesizer answers. Speaks the OpenAI and Anthropic APIs.",
   "license": "MIT",
   "engines": {
     "node": ">=24"
