@@ -2833,6 +2833,17 @@ function judgeContentText(content: unknown[]): string {
  *    to start capping the panel's own messages. Gating on the same total over the
  *    same array is the point: below the threshold the panel members answer against
  *    verbatim text, so the judge must adjudicate against verbatim text too.
+ *
+ *    That total counts text this render never emits — the JSON arguments of every
+ *    tool call — and that looks wrong until you ask what the PANEL saw. A review of
+ *    the tool-call accounting proposed decoupling the two, measuring prose only
+ *    here. It would invert the invariant: in a write-heavy loop the payloads push
+ *    the conversation over the threshold, `compressPanelMessages` excerpts a long
+ *    user spec down to 8 KB for every member, and a prose-only gate would then hand
+ *    the judge that spec IN FULL — so it would grade the panel against requirements
+ *    the panel was never shown. The trigger belongs to the conversation, not to the
+ *    render. Pinned by "caps the judge's view of a message exactly when the panel's
+ *    view of it is capped" in test/fusion.test.ts.
  * 2. Over the whole render, UNCONDITIONALLY. This one is not gated on the panel's
  *    threshold, and deliberately so: `approxTotalChars` sums CONTENT, while the
  *    render also pays a `role: ` prefix and a newline per message (plus an

@@ -2858,6 +2858,119 @@ describe("fusion strategy — panel compression sizes tool-call arguments", () =
     // ...and a budget below it compresses, on the same input.
     expect(compressPanelMessages(input, 100_000).length).toBeLessThan(input.length);
   });
+  it("a fusion model's panel_max_chars raises the threshold for its own panel", async () => {
+    // ~250k chars — over the 200k default, under a panel whose smallest member is
+    // big enough to say so. The knob is the whole point: the default is sized for an
+    // unknown (small) panel, and a 262k-token member should not be fed one fifth of
+    // the history it can actually hold.
+    const big = "x".repeat(5000);
+    const messages: Array<Record<string, unknown>> = [
+      { role: "system", content: "You are a coding assistant." },
+      { role: "user", content: "Implement the feature." },
+    ];
+    for (let i = 0; i < 50; i++) {
+      messages.push({ role: "assistant", content: `step ${i}` });
+      messages.push({ role: "tool", content: `${big} result-${i}` });
+    }
+
+    const wide = parseConfig({
+      upstream: { base_url: "https://mock.test", api_key_env: "X", max_concurrency: 4 },
+      models: {
+        "fusion-wide": {
+          strategy: "fusion",
+          panel: ["m1", "m2", "m3"],
+          judge: "j",
+          synth: "s",
+          panel_max_chars: 1_000_000,
+        },
+      },
+    });
+    const entry = wide.models["fusion-wide"];
+    if (!entry) throw new Error("test config missing 'fusion-wide'");
+
+    const up = makeUpstream(defaultChat());
+    const request: ChatCompletionRequest = {
+      model: "fusion-wide",
+      messages: messages as ChatCompletionRequest["messages"],
+    };
+    const capabilities = new CapabilityService({
+      client: up.client,
+      getOverrides: () => wide.overrides,
+      logger,
+    });
+    const res = await fusionStrategy.execute({
+      request,
+      config: wide,
+      client: up.client,
+      capabilities,
+      logger,
+      modelConfig: entry,
+    });
+    expect(res.status).toBe(200);
+
+    const panelBodies = up.recorded.filter((b) => ["m1", "m2", "m3"].includes(String(b.model)));
+    expect(panelBodies.length).toBeGreaterThanOrEqual(1);
+    for (const pb of panelBodies) {
+      // Verbatim history (plus the injected panel directives), not a compressed copy.
+      expect(pb.messages.length).toBeGreaterThanOrEqual(messages.length);
+      expect(systemContents(pb).some((c) => c.includes("earlier message"))).toBe(false);
+    }
+  });
+
+  it("caps the judge's view of a message exactly when the panel's view of it is capped", async () => {
+    // The invariant behind passing panel_max_chars into renderRequestForJudge, and the
+    // reason its trigger counts text the judge never renders.
+    //
+    // Prose here is ~50k chars — under the 200k default on its own. What pushes the
+    // conversation over is the tool-call payloads, which the judge's render never
+    // contains. Decoupling the two triggers (measuring prose only for the judge) would
+    // hand the judge the user's spec IN FULL while the panel answered from an 8KB
+    // excerpt of it — and the judge would then mark the panel down for requirements
+    // the panel was never shown.
+    const spec = "SPEC-BODY ".repeat(5000); // 50k chars, one user message
+    const messages: Array<Record<string, unknown>> = [
+      { role: "system", content: "You are a coding assistant." },
+      { role: "user", content: `Implement this: ${spec}` },
+    ];
+    for (let i = 0; i < 40; i++) {
+      messages.push({
+        role: "assistant",
+        content: "writing",
+        tool_calls: [
+          {
+            id: `w${i}`,
+            type: "function",
+            function: { name: "write_file", arguments: JSON.stringify({ path: `src/f${i}.ts`, content: "W".repeat(20_000) }) },
+          },
+        ],
+      });
+      messages.push({ role: "tool", tool_call_id: `w${i}`, content: "ok" });
+    }
+    messages.push({ role: "user", content: "Does the result match the spec?" });
+
+    const up = makeUpstream(defaultChat());
+    const request: ChatCompletionRequest = {
+      model: "fusion-1",
+      messages: messages as ChatCompletionRequest["messages"],
+    };
+    expect((await fusionStrategy.execute(ctx(up.client, request, "fusion-1"))).status).toBe(200);
+
+    const judgeBody = up.recorded.find((b) => b.model === "j");
+    expect(judgeBody).toBeDefined();
+    const judgeInput = userContents(judgeBody!).join("\n");
+    // The judge got the spec EXCERPTED, not whole...
+    expect(judgeInput).toContain("chars omitted");
+    expect(judgeInput.length).toBeLessThan(spec.length);
+
+    // ...and so did the panel. Same excerpt rule, same trigger: neither stage reads
+    // more of that message than the other.
+    const panelBody = up.recorded.find((b) => ["m1", "m2", "m3"].includes(String(b.model)));
+    expect(panelBody).toBeDefined();
+    const panelText = JSON.stringify(panelBody!.messages);
+    expect(panelText).toContain("chars omitted");
+    expect(panelText).not.toContain(spec); // never the full 50k body
+  });
+
 });
 
 describe("fusion strategy — web grounding (gated on TAVILY_API_KEY + web_search.enabled)", () => {
@@ -3060,65 +3173,6 @@ describe("fusion strategy — web grounding (gated on TAVILY_API_KEY + web_searc
       expect(sysMsgs.some((s) => s.includes("earlier message"))).toBe(true);
     }
   });
-  it("a fusion model's panel_max_chars raises the threshold for its own panel", async () => {
-    // ~250k chars — over the 200k default, under a panel whose smallest member is
-    // big enough to say so. The knob is the whole point: the default is sized for an
-    // unknown (small) panel, and a 262k-token member should not be fed one fifth of
-    // the history it can actually hold.
-    const big = "x".repeat(5000);
-    const messages: Array<Record<string, unknown>> = [
-      { role: "system", content: "You are a coding assistant." },
-      { role: "user", content: "Implement the feature." },
-    ];
-    for (let i = 0; i < 50; i++) {
-      messages.push({ role: "assistant", content: `step ${i}` });
-      messages.push({ role: "tool", content: `${big} result-${i}` });
-    }
-
-    const wide = parseConfig({
-      upstream: { base_url: "https://mock.test", api_key_env: "X", max_concurrency: 4 },
-      models: {
-        "fusion-wide": {
-          strategy: "fusion",
-          panel: ["m1", "m2", "m3"],
-          judge: "j",
-          synth: "s",
-          panel_max_chars: 1_000_000,
-        },
-      },
-    });
-    const entry = wide.models["fusion-wide"];
-    if (!entry) throw new Error("test config missing 'fusion-wide'");
-
-    const up = makeUpstream(defaultChat());
-    const request: ChatCompletionRequest = {
-      model: "fusion-wide",
-      messages: messages as ChatCompletionRequest["messages"],
-    };
-    const capabilities = new CapabilityService({
-      client: up.client,
-      getOverrides: () => wide.overrides,
-      logger,
-    });
-    const res = await fusionStrategy.execute({
-      request,
-      config: wide,
-      client: up.client,
-      capabilities,
-      logger,
-      modelConfig: entry,
-    });
-    expect(res.status).toBe(200);
-
-    const panelBodies = up.recorded.filter((b) => ["m1", "m2", "m3"].includes(String(b.model)));
-    expect(panelBodies.length).toBeGreaterThanOrEqual(1);
-    for (const pb of panelBodies) {
-      // Verbatim history (plus the injected panel directives), not a compressed copy.
-      expect(pb.messages.length).toBeGreaterThanOrEqual(messages.length);
-      expect(systemContents(pb).some((c) => c.includes("earlier message"))).toBe(false);
-    }
-  });
-
   it("compresses array-based multimodal messages in the panel context", async () => {
     const bigContent = "x".repeat(15000); // Exceeds PANEL_MSG_HEAD + PANEL_MSG_TAIL
     const request: ChatCompletionRequest = {
