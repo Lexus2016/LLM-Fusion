@@ -2,6 +2,51 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.48] - 2026-09-17
+
+Context release. A user report — "the agent loses context in a low-code
+client" — turned out to be two defects in the panel's context compression,
+one of which disabled it entirely for the traffic shape that needs it most.
+
+### Fixed
+- **Panel compression was blind to `tool_calls[].function.arguments`.** A
+  coding agent's context is dominated by the calls it MADE, not by what it
+  read back: a `write_file` turn carries the whole file in the call's
+  arguments while its tool result is `ok`. `approxTotalChars` summed
+  `content` only, so a 690k-token write-heavy loop measured as ~1.5k chars,
+  `compressPanelMessages` short-circuited, and the verbatim history went to
+  every panel member — including `kimi-k2.7-code` at 262k tokens. The exact
+  overflow compression exists to prevent, reached by the one path that never
+  enters `content`. Measured on the real function: 60 turns x 40KB of file
+  bodies retained 100%; 200 turns (2.3M tokens) also 100%. The Anthropic
+  endpoint is on the same path (`tool_use` blocks become `tool_calls`), so
+  `/v1/messages` clients hit it too.
+
+  Those arguments are now counted and capped. The cap is not the head+tail
+  slice used for prose — `arguments` is a JSON document and cutting its
+  middle leaves a string that no longer parses. The long string VALUES are
+  excerpted and the object re-serialised, so the call keeps the shape that
+  makes it comprehensible (tool name, path, flags) and loses only the
+  payload. The same loop now compresses to 2.6%.
+
+### Changed
+- **`panel_max_chars`, per fusion model.** The compression threshold was a
+  hardcoded 200000 chars (~57k tokens) regardless of the panel behind it,
+  while the binding constraint is the SMALLEST member's window — 262k tokens
+  on the shipped panels. It therefore threw away four fifths of the context
+  the members could hold, on 12.5% of live traffic (375 of 3012 requests
+  measured past it). The default stays 200000, because an unknown panel is
+  assumed small; `fusion-coder` and `fusion-researcher` now set 500000,
+  which holds even at a worst-case 2 chars/token (Cyrillic prose, minified
+  JSON). A 140k-token session now reaches the panel verbatim instead of cut
+  to 35k; a 690k-token one is still compressed, well under kimi's window.
+
+### Not changed
+- **The synth still receives the uncompressed history.** It writes the answer
+  the client actually sees, so compressing it would trade a rare overflow for
+  a constant fidelity loss. It is safe while the synth seat is a 1M-token
+  model, which every shipped config uses.
+
 ## [0.1.47] - 2026-09-16
 
 ### Changed
