@@ -286,11 +286,9 @@ describe("anthropic translation", () => {
       choices: [{ message: { role: "assistant", content: "hello" }, finish_reason: "stop" }],
     };
     const anthropic = openAiToAnthropicResponse(openAi, "anthropic-fast", {
-      upstreamCalls: 1,
       promptTokens: 3,
       completionTokens: 2,
       totalTokens: 5,
-      costUsd: null,
     });
     expect(anthropic).toMatchObject({
       id: "r-1",
@@ -323,11 +321,9 @@ describe("anthropic translation", () => {
       ],
     };
     const anthropic = openAiToAnthropicResponse(openAi, "anthropic-fast", {
-      upstreamCalls: 1,
       promptTokens: 4,
       completionTokens: 5,
       totalTokens: 9,
-      costUsd: null,
     });
     expect(anthropic).toMatchObject({
       type: "message",
@@ -361,11 +357,9 @@ describe("anthropic translation", () => {
       ],
     };
     const anthropic = openAiToAnthropicResponse(openAi, "anthropic-fast", {
-      upstreamCalls: 1,
       promptTokens: 4,
       completionTokens: 5,
       totalTokens: 9,
-      costUsd: null,
     });
     expect(anthropic).toMatchObject({ stop_reason: "max_tokens" });
   });
@@ -388,11 +382,9 @@ describe("anthropic translation", () => {
       ],
     };
     const anthropic = openAiToAnthropicResponse(openAi, "anthropic-fast", {
-      upstreamCalls: 1,
       promptTokens: 4,
       completionTokens: 5,
       totalTokens: 9,
-      costUsd: null,
     });
     expect(anthropic).toMatchObject({
       stop_reason: "max_tokens", // NOT "tool_use"
@@ -423,11 +415,9 @@ describe("anthropic translation", () => {
       ],
     };
     const anthropic = openAiToAnthropicResponse(openAi, "anthropic-fast", {
-      upstreamCalls: 1,
       promptTokens: 4,
       completionTokens: 5,
       totalTokens: 9,
-      costUsd: null,
     });
     expect(anthropic).toMatchObject({ stop_reason: "tool_use" });
   });
@@ -451,11 +441,9 @@ describe("anthropic translation", () => {
       ],
     };
     const anthropic = openAiToAnthropicResponse(openAi, "anthropic-fast", {
-      upstreamCalls: 1,
       promptTokens: 4,
       completionTokens: 5,
       totalTokens: 9,
-      costUsd: null,
     });
     expect(anthropic).toMatchObject({
       stop_reason: "tool_use",
@@ -481,11 +469,9 @@ describe("anthropic translation", () => {
       ],
     };
     const anthropic = openAiToAnthropicResponse(openAi, "anthropic-fast", {
-      upstreamCalls: 1,
       promptTokens: 4,
       completionTokens: 5,
       totalTokens: 9,
-      costUsd: null,
     });
     expect(anthropic).toMatchObject({
       type: "message",

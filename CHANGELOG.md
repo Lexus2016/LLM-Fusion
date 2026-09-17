@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.50] - 2026-09-17
+
+A user report on a low-code client: "compression doesn't work, it reaches 100 %,
+it runs compaction on every message and it doesn't help." All three symptoms come
+from one defect, and it is not in the compression — it is in what the proxy tells
+the client about its own context.
+
+### Fixed
+- **The client-facing `usage` was the sum over every internal call.** A fusion
+  turn makes 4-7 upstream calls over the same conversation, and the proxy set the
+  response body's `usage` (and `input_tokens` on `/v1/messages`) to their total.
+  Measured on the live proxy, one identical 43 604-char conversation: `fast-glm`
+  (1 call) reported 7 507 prompt tokens, `fusion-coder` (4 calls) reported
+  30 513 — **4.06x** for the same input.
+
+  An agent client reads that number as "how full is my context". At 4x it hits its
+  ceiling early, runs compaction — and the compaction request is itself large and
+  composite, so the router sends it to fusion, and its answer comes back
+  multiplied too. The client writes that down as the new context size, is still at
+  the ceiling, and compacts again on the next message. That is the loop the user
+  described, and no amount of compaction escapes it.
+
+  The body now carries the **answering** call's usage: the single/failover target,
+  or the fusion synth — the call whose prompt IS the client's conversation. A
+  recovery retry supersedes the attempt it replaced. The `smart` router's own call
+  no longer inflates the cheap path (2 calls reported for 1 real prompt on 1 175 of
+  2 744 live turns).
+
+### Changed
+- **`usage` in the body and the aggregate are now two different numbers**, and
+  this is a deliberate semantic change to a public field. Cost accounting keeps
+  the sum, where it already was: the `x-fusion-usage` header
+  (`{"calls":4,"total":32404}`), the `request usage` log line, and the panel's
+  analytics — none of which changed. Anything that billed from the response body
+  should read the header instead. Documented in all three READMEs (section 8) and
+  in `AGENTS.md`.
+
 ## [0.1.49] - 2026-09-17
 
 Follow-up to 0.1.48, from an independent review of that diff (`consult agy`):

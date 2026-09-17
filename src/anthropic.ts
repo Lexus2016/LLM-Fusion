@@ -416,7 +416,11 @@ function anthropicToolChoiceToOpenAi(
 export function openAiToAnthropicResponse(
   openAiData: unknown,
   model: string,
-  usage: RequestUsage,
+  // The ANSWERING call's usage, not the request aggregate: `input_tokens` is what
+  // an agent client reads as "how full is my context", and a fusion turn's sum
+  // over 4-7 internal calls reported ~4x the conversation the client actually
+  // holds. The aggregate stays on `x-fusion-usage` and in the log line.
+  usage: Usage,
 ): unknown {
   const parsed = z
     .object({
@@ -874,6 +878,9 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
       }
       stopActiveBlock(controller);
       const finalUsage = await opts.usage.finalize(opts.pricing);
+      // Same split as the non-stream path: the client-visible usage is the
+      // answering call's, the log below keeps the aggregate.
+      const answering = (await opts.usage.clientUsage()) ?? finalUsage;
       // Pass the tool-block presence (not []): the stream emits tool_use blocks as it
       // converts tool_calls deltas, so the final stop_reason must reflect them even when
       // the upstream finish_reason is "stop"/null — otherwise Claude Code sees tool_use
@@ -890,8 +897,8 @@ export function anthropicStreamTransform(opts: AnthropicStreamOpts): TransformSt
         type: "message_delta",
         delta: { stop_reason: stopReason, stop_sequence: null },
         usage: {
-          input_tokens: finalUsage.promptTokens,
-          output_tokens: finalUsage.completionTokens,
+          input_tokens: answering.promptTokens,
+          output_tokens: answering.completionTokens,
         },
       });
       emit(controller, "message_stop", { type: "message_stop" });
@@ -1048,7 +1055,8 @@ export function createAnthropicApp(deps: AnthropicDeps): Hono {
 
       const openAiData = await res.json();
       const finalUsage = await usage.finalize(config.pricing);
-      const anthropicBody = openAiToAnthropicResponse(openAiData, model, finalUsage);
+      const answering = (await usage.clientUsage()) ?? finalUsage;
+      const anthropicBody = openAiToAnthropicResponse(openAiData, model, answering);
       // The body is re-serialized below — drop upstream length/encoding headers.
       stripHopByHopHeaders(headers);
       headers.set("content-type", "application/json");

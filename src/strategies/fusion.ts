@@ -1555,7 +1555,7 @@ async function runSynth(
     });
     throw err;
   }
-  ctx.usage?.record(synth, result);
+  ctx.usage?.record(synth, result, { primary: true });
   if (result.status < 400) resilience.breaker.recordSuccess(synth);
   // 4xx (non-429) passes through to the client without tripping the breaker.
   else if (isAvailabilityFailureStatus(result.status)) {
@@ -1832,7 +1832,7 @@ async function retrySynthForCompletion(
       );
       return null;
     }
-    ctx.usage?.record(model, result);
+    ctx.usage?.record(model, result, { primary: true });
     if (result.kind !== "json" || result.status >= 400) {
       ctx.logger.warn({ stage: "synth", model }, "fusion: synth completion retry not usable");
       return null;

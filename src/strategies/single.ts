@@ -85,7 +85,7 @@ export const singleStrategy: Strategy = {
       });
       throw err;
     }
-    ctx.usage?.record(target, result);
+    ctx.usage?.record(target, result, { primary: true });
 
     if (resilience) {
       if (result.status < 400) resilience.breaker.recordSuccess(target);

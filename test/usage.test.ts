@@ -225,14 +225,18 @@ describe("usage accounting", () => {
     expect(log?.cost_usd).toBeNull();
   });
 
-  it("fusion non-stream: aggregate == panel+judge+synth; calls == panel_size+2; header + body usage", async () => {
+  it("fusion non-stream: body usage = the SYNTH's (the answering call); header + log keep the aggregate", async () => {
     const { app, logLines } = makeApp(buildConfig());
     const res = await post(app, { model: "fusion-m", messages: [{ role: "user", content: "hard" }] });
     expect(res.status).toBe(200);
     const body = z.object({ usage: UsageObjSchema }).parse(JSON.parse(await res.text()));
-    // panel 2x{7,3,10} + judge {4,2,6} + synth {20,8,28}
-    expect(body.usage).toEqual({ prompt_tokens: 38, completion_tokens: 16, total_tokens: 54 });
+    // The client reads `usage` as "how much context am I holding", so it must be
+    // the call whose prompt IS the conversation — the synth {20,8,28} — not the sum
+    // over panel 2x{7,3,10} + judge {4,2,6} + synth, which is ~2.7x larger here and
+    // 4-7x larger on a real panel.
+    expect(body.usage).toEqual({ prompt_tokens: 20, completion_tokens: 8, total_tokens: 28 });
 
+    // Cost still needs the sum, and still has it: header and log are unchanged.
     const header = parseHeaderUsage(res);
     expect(header).toEqual({ calls: 4, total: 54 });
 
@@ -241,7 +245,7 @@ describe("usage accounting", () => {
     expect(log?.strategy).toBe("fusion");
   });
 
-  it("fusion stream: emits a final aggregate usage chunk; reasoning never leaks into content", async () => {
+  it("fusion stream: the final usage chunk carries the synth's usage; reasoning never leaks into content", async () => {
     const { app, recorded } = makeApp(buildConfig());
     const res = await post(app, { model: "fusion-m", stream: true, messages: [{ role: "user", content: "hard" }] });
     expect(res.headers.get("content-type")).toContain("text/event-stream");
@@ -261,11 +265,12 @@ describe("usage accounting", () => {
     expect(contents).not.toContain("think "); // reasoning was NOT promoted
     expect(contents).toContain("answer");
 
-    // Exactly one usage chunk, carrying the full aggregate.
+    // Exactly one usage chunk, carrying the answering call's usage (same contract
+    // as the non-stream body — a streamed answer must not report a different size).
     const usageChunks = chunks.filter((c) => "usage" in c);
     expect(usageChunks).toHaveLength(1);
     const usage = UsageObjSchema.parse(usageChunks[0]!.usage);
-    expect(usage).toEqual({ prompt_tokens: 38, completion_tokens: 16, total_tokens: 54 });
+    expect(usage).toEqual({ prompt_tokens: 20, completion_tokens: 8, total_tokens: 28 });
 
     // include_usage was set on the streamed (synth) request.
     const synth = recorded.find((r) => r.model === "synth");
@@ -273,24 +278,45 @@ describe("usage accounting", () => {
     expect(synth?.includeUsage).toBe(true);
   });
 
-  it("smart -> simple: usage = router + single (no double counting)", async () => {
+  it("smart -> simple: body usage excludes the router; header still counts it", async () => {
     const { app, recorded } = makeApp(buildConfig());
     const res = await post(app, { model: "smart-m", messages: [{ role: "user", content: "trivial lookup" }] });
     const body = z.object({ usage: UsageObjSchema }).parse(JSON.parse(await res.text()));
-    // router {3,1,4} + single-target {10,5,15}
-    expect(body.usage).toEqual({ prompt_tokens: 13, completion_tokens: 6, total_tokens: 19 });
+    // The router is proxy overhead, not the client's conversation: body = the
+    // single target {10,5,15}, not router {3,1,4} + target.
+    expect(body.usage).toEqual({ prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 });
     expect(parseHeaderUsage(res)).toEqual({ calls: 2, total: 19 });
     expect(recorded.map((r) => r.model).sort()).toEqual(["router", "single-target"]);
   });
 
-  it("smart -> fusion: usage = router + panel+judge+synth (no double counting)", async () => {
+  it("smart -> fusion: body usage = the synth's; header = router + panel + judge + synth", async () => {
     const { app, recorded } = makeApp(buildConfig());
     const res = await post(app, { model: "smart-m", messages: [{ role: "user", content: "please FUSION this" }] });
     const body = z.object({ usage: UsageObjSchema }).parse(JSON.parse(await res.text()));
-    // router {3,1,4} + panel 2x{7,3,10} + judge {4,2,6} + synth {20,8,28}
-    expect(body.usage).toEqual({ prompt_tokens: 41, completion_tokens: 17, total_tokens: 58 });
+    // Worst case for the old behaviour: 5 calls over one conversation reported
+    // 41 prompt tokens for a 20-token prompt.
+    expect(body.usage).toEqual({ prompt_tokens: 20, completion_tokens: 8, total_tokens: 28 });
     expect(parseHeaderUsage(res)).toEqual({ calls: 5, total: 58 });
     expect(recorded.map((r) => r.model).sort()).toEqual(["judge", "p1", "p2", "router", "synth"]);
+  });
+
+  it("falls back to the aggregate when no call claimed the answer", async () => {
+    // Defensive: a strategy that never marks a primary call must not report zero.
+    // `record()` without the flag is exactly that case.
+    const acc = new UsageAccumulator();
+    acc.record("m", { kind: "json", status: 200, data: {}, usage: { promptTokens: 9, completionTokens: 4, totalTokens: 13 } });
+    expect(await acc.clientUsage()).toBeNull();
+    expect((await acc.finalize()).promptTokens).toBe(9);
+  });
+
+  it("the answering call wins over an earlier attempt it replaced", async () => {
+    // A recovery retry re-sends the same conversation; the client sees ITS answer.
+    const acc = new UsageAccumulator();
+    acc.record("m", { kind: "json", status: 200, data: {}, usage: { promptTokens: 9, completionTokens: 4, totalTokens: 13 } }, { primary: true });
+    acc.record("m", { kind: "json", status: 200, data: {}, usage: { promptTokens: 11, completionTokens: 6, totalTokens: 17 } }, { primary: true });
+    expect(await acc.clientUsage()).toEqual({ promptTokens: 11, completionTokens: 6, totalTokens: 17 });
+    // Both attempts still cost money, so both stay in the aggregate.
+    expect((await acc.finalize()).promptTokens).toBe(20);
   });
 
   it("cost: computed from a pricing map; null when no pricing", async () => {

@@ -632,6 +632,21 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 A JSON completion back means you are fully configured. Detailed Claude Code wiring lives in [`docs/claude-code.md`](./docs/claude-code.md); every config key is documented in [`fusion.example.yaml`](./fusion.example.yaml).
 
+### 8. What `usage` reports
+
+A fusion turn makes 4-7 upstream calls over the same conversation. Two different
+numbers come out of that, and they are deliberately kept apart:
+
+| Where | What it is |
+|---|---|
+| `usage` in the response body (and the final stream chunk); `input_tokens` / `output_tokens` on `/v1/messages` | The **answering** call only — the single target, or the fusion synth. Its prompt IS your conversation, so this is the number to size your context against. |
+| `x-fusion-usage` response header, the `request usage` log line, the panel's analytics | The **sum over every upstream call** (`{"calls":4,"total":32404}`) — panel members, judge, router, image describer included. This is the cost number. |
+
+If you are an agent tracking how full your context is, read the body. Reading the
+aggregate instead multiplies your context estimate by the number of internal calls,
+which pins the gauge at 100 % and makes compaction look useless — it shrinks the
+conversation, the multiplier stays, and the number barely moves.
+
 ## License
 
 Released under the [MIT License](./LICENSE). Copyright (c) 2026 Lexus2016.

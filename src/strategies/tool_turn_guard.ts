@@ -253,7 +253,7 @@ export async function retryToolTurn(
     );
     return null;
   }
-  ctx.usage?.record(target, result);
+  ctx.usage?.record(target, result, { primary: true });
   if (result.kind !== "json" || result.status >= 400) {
     ctx.logger.warn({ stage: "single", model: target }, "single: tool-turn recovery retry not usable");
     return null;
@@ -308,7 +308,7 @@ async function streamRetryToolTurn(
     );
     return false;
   }
-  ctx.usage?.record(target, result);
+  ctx.usage?.record(target, result, { primary: true });
   if (result.kind !== "stream" || result.status >= 400 || result.body === null) {
     ctx.logger.warn({ stage: "single", model: target, status: result.status }, "single: streaming recovery retry not usable");
     return false;

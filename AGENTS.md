@@ -36,6 +36,11 @@ OpenCode shortcut: `./bin/fusion-opencode fusion-coder` (starts the proxy + wire
 - **No build step / no `dist`.** Edit `src/*.ts`; `tsx` runs them directly. Do not add a compile step.
 - **Avoid typecasting.** No `as` casts in new TypeScript — fix the types at the source where practical (some legacy casts remain, e.g. in `src/strategies/fusion.ts`; don't add more).
 - **Config is hot-reloaded** from `fusion.yaml`; an invalid edit is rejected and the previous config kept. Model/routing changes apply live, and `providers:` changes rebuild the provider router in place (no restart — see the `manager.onReload` handler in `src/index.ts`). The process-level `upstream:` connection knobs (`max_concurrency`, `per_model_concurrency`, `per_model_concurrency_default`, `request_timeout_s`, `connector_cooldown_s`, `connector_down_recheck_s`) are read once at startup and still need a restart — the resilience bundle is built one time in `createApp`. Full annotated reference: [`fusion.example.yaml`](./fusion.example.yaml).
+- **`usage` semantics:** the response body's `usage` (and `input_tokens` on
+  `/v1/messages`) is the ANSWERING call's alone — the single target or the fusion
+  synth — so it equals the context you are holding. The sum over all 4-7 internal
+  calls is the cost number and lives in the `x-fusion-usage` header and the logs.
+  Do not size your context against the header.
 - **Secrets:** provider keys live in `.env` / the env vars each account's `api_key_env` names (`OLLAMA_API_KEY`, `LG_API_KEY`, …) only. Never inline it in code, config, logs, or commits.
 
 ## Layout

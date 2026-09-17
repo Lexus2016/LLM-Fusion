@@ -382,6 +382,11 @@ async function decorateUsage(res: Response, usage: UsageAccumulator, meta: Usage
   }
 
   const aggregate = await usage.finalize(meta.pricing);
+  // Two different questions, two different numbers: the HEADER and the log carry
+  // the sum over every upstream call (cost), the BODY carries the answering call's
+  // own usage (how much context the client is holding). See
+  // `UsageAccumulator.primary`.
+  const answering = (await usage.clientUsage()) ?? aggregate;
   const headers = new Headers(res.headers);
   headers.set("x-fusion-usage", usageHeaderValue(aggregate));
   logUsage(meta, aggregate);
@@ -392,13 +397,13 @@ async function decorateUsage(res: Response, usage: UsageAccumulator, meta: Usage
   if (contentType.includes("application/json") && res.status < 400) {
     stripHopByHopHeaders(headers);
     const text = await res.text();
-    return new Response(injectUsageIntoJson(text, aggregate), { status: res.status, headers });
+    return new Response(injectUsageIntoJson(text, answering), { status: res.status, headers });
   }
   return new Response(res.body, { status: res.status, headers });
 }
 
 /** Set the top-level `usage` field on a JSON object body; pass through otherwise. */
-function injectUsageIntoJson(text: string, aggregate: RequestUsage): string {
+function injectUsageIntoJson(text: string, reported: { promptTokens: number; completionTokens: number; totalTokens: number }): string {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -411,9 +416,9 @@ function injectUsageIntoJson(text: string, aggregate: RequestUsage): string {
   return JSON.stringify({
     ...obj.data,
     usage: toOpenAiUsage({
-      promptTokens: aggregate.promptTokens,
-      completionTokens: aggregate.completionTokens,
-      totalTokens: aggregate.totalTokens,
+      promptTokens: reported.promptTokens,
+      completionTokens: reported.completionTokens,
+      totalTokens: reported.totalTokens,
     }),
   });
 }

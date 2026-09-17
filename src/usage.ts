@@ -111,9 +111,30 @@ export class UsageAccumulator {
   private callCount = 0;
   private readonly records: CallRecord[] = [];
   private readonly pendingStreams: Array<{ model: string; usage: Promise<Usage> }> = [];
+  /**
+   * The ANSWERING call — the one whose prompt is the client's own conversation
+   * and whose completion is the text the client receives. Last write wins, so a
+   * recovery retry supersedes the attempt it replaces.
+   *
+   * This exists because the aggregate answers a different question than the
+   * `usage` field is asked. A fusion turn makes 4-7 upstream calls over the same
+   * conversation, so summing their prompts reported ~4x the context the client
+   * actually holds — and an agent client reads that number as "how full am I",
+   * hits its ceiling, compacts, gets the next answer multiplied by 4 again, and
+   * compacts forever without ever getting free. Cost still needs the sum, which
+   * is what `x-fusion-usage` and the `request usage` log line carry.
+   */
+  private primary: { usage: Usage | Promise<Usage> } | null = null;
 
-  /** Record one completed upstream call (its model + result). */
-  record(model: string, result: ChatCompletionResult): void {
+  /**
+   * Record one completed upstream call (its model + result).
+   *
+   * `primary: true` marks it as the answering call (see `primary`): the single /
+   * failover target, the fusion synth, a recovery retry. Panel members, the judge,
+   * the `smart` router, bineval and image_describe are internal work and never
+   * claim it.
+   */
+  record(model: string, result: ChatCompletionResult, opts?: { primary?: boolean }): void {
     this.callCount += 1;
     if (result.kind === "json") {
       this.records.push({ model, usage: result.usage });
@@ -123,6 +144,19 @@ export class UsageAccumulator {
       // is kept (never overwritten) and all are folded in at finalize().
       this.pendingStreams.push({ model, usage: result.usage });
     }
+    // Holds the promise as-is for a stream; `clientUsage()` awaits either shape.
+    if (opts?.primary === true) this.primary = { usage: result.usage };
+  }
+
+  /**
+   * Usage of the answering call, or null when nothing claimed it — callers fall
+   * back to the aggregate, which is what this proxy reported before the
+   * distinction existed. A streamed answer resolves once its body drains, so call
+   * this after `finalize()` (or at a flush, which is the same moment).
+   */
+  async clientUsage(): Promise<Usage | null> {
+    if (this.primary === null) return null;
+    return await this.primary.usage;
   }
 
   /** Record a call that threw before producing a result (network/timeout). */
@@ -304,7 +338,12 @@ export function makeUsageInjectionTransform(
     async flush(controller) {
       buffer += decoder.decode();
       if (buffer.length > 0) handleLine(buffer, controller);
-      const usage = await accumulator.finalize(pricing);
+      // The aggregate still drains every pending stream (and feeds the log +
+      // header); the CHUNK the client reads carries the answering call's usage —
+      // see `UsageAccumulator.primary` for why the two differ.
+      const aggregate = await accumulator.finalize(pricing);
+      const answering = await accumulator.clientUsage();
+      const usage = answering ?? aggregate;
       const chunk = {
         id: `fusion-usage-${meta.reqId}`,
         object: "chat.completion.chunk",

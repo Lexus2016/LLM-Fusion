@@ -144,7 +144,7 @@ async function attemptJsonMember(
       }
       return { kind: "advance", error: toFusionError(err, member) };
     }
-    ctx.usage?.record(member, result);
+    ctx.usage?.record(member, result, { primary: true });
 
     const status = result.status;
     if (status < 400) {
@@ -237,7 +237,7 @@ async function attemptStreamMember(
       }
       return { kind: "advance", error: toFusionError(err, member) };
     }
-    ctx.usage?.record(member, result);
+    ctx.usage?.record(member, result, { primary: true });
 
     // Error before the first byte: the client surfaces a JSON body (upstream not ok).
     if (result.kind === "json") {
