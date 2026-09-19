@@ -72,7 +72,37 @@ export type NoulOutcome =
   | { ok: true; nouls: Record<string, number>; usage: TypeSafeUsage }
   | { ok: false; failure: TypeSafeFailure };
 
+/** One option set to pick from. `null` where the option name says enough on its own. */
+export interface ChoiceQuestion<T extends string> {
+  instructions: string;
+  criteria: Record<T, string | null>;
+}
+
+export interface ChoiceAnswer<T extends string> {
+  choice: T;
+  /** Every option's probability. */
+  probabilities: Record<string, number>;
+  /**
+   * How concentrated that distribution is — NOT a probability that the answer is
+   * correct, and not permission to act. It is the second axis: the answer says
+   * what, this says whether to act on it. Threshold it against the cost of being
+   * wrong on THIS decision, not against a number copied from a cookbook.
+   */
+  confidence: number;
+}
+
+export type ChoiceWithNoulsOutcome<T extends string> =
+  | { ok: true; choice: ChoiceAnswer<T>; nouls: Record<string, number>; usage: TypeSafeUsage }
+  | { ok: false; failure: TypeSafeFailure };
+
 const NoulAnswerSchema = z.object({ noul: z.number() }).passthrough();
+const ChoiceAnswerSchema = z
+  .object({
+    choice: z.string(),
+    probabilities: z.record(z.number()),
+    confidence: z.number(),
+  })
+  .passthrough();
 const ResponseSchema = z
   .object({
     answers: z.record(z.unknown()),
@@ -105,20 +135,99 @@ export async function askNouls(
   cfg: TypeSafeConfig,
   signal?: AbortSignal,
 ): Promise<NoulOutcome> {
-  const fetchFn = cfg.fetch ?? (globalThis.fetch as FetchFn);
+  const raw = await post(state, noulPayload(questions), cfg, signal);
+  if (!raw.ok) return raw;
+  const nouls = readNouls(raw.answers, Object.keys(questions));
+  if (nouls === null) return { ok: false, failure: { reason: "bad_body" } };
+  return { ok: true, nouls, usage: raw.usage };
+}
+
+/**
+ * One Choice plus any number of yes/no questions, in ONE request.
+ *
+ * This is the shape most routing decisions actually have: pick a branch, and at
+ * the same time answer the side questions that would otherwise each cost a round
+ * trip (is the caller stuck, is this urgent, …). The questions cannot see one
+ * another's answers — that is what makes them parallel — so each must stand alone,
+ * and code combines them afterwards.
+ */
+export async function askChoiceWithNouls<T extends string>(
+  state: unknown,
+  choiceId: string,
+  choice: ChoiceQuestion<T>,
+  nouls: Record<string, NoulQuestion>,
+  cfg: TypeSafeConfig,
+  signal?: AbortSignal,
+): Promise<ChoiceWithNoulsOutcome<T>> {
+  const questions: Record<string, unknown> = {
+    ...noulPayload(nouls),
+    [choiceId]: { type: "choice", instructions: choice.instructions, criteria: choice.criteria },
+  };
+  const raw = await post(state, questions, cfg, signal);
+  if (!raw.ok) return raw;
+
+  const answered = ChoiceAnswerSchema.safeParse(raw.answers[choiceId]);
+  // An option outside the set we defined is not a usable answer: the caller
+  // switches on it, so accepting an unknown string would hand it a branch that
+  // does not exist. A predicate rather than a cast, so the narrowing is checked.
+  if (!answered.success || !isDefinedOption(answered.data.choice, choice.criteria)) {
+    return { ok: false, failure: { reason: "bad_body" } };
+  }
+  const read = readNouls(raw.answers, Object.keys(nouls));
+  if (read === null) return { ok: false, failure: { reason: "bad_body" } };
+
+  return {
+    ok: true,
+    choice: {
+      choice: answered.data.choice,
+      probabilities: answered.data.probabilities,
+      confidence: answered.data.confidence,
+    },
+    nouls: read,
+    usage: raw.usage,
+  };
+}
+
+/** Narrows a returned option string to one of the options we actually defined. */
+function isDefinedOption<T extends string>(value: string, criteria: Record<T, string | null>): value is T {
+  return Object.prototype.hasOwnProperty.call(criteria, value);
+}
+
+function noulPayload(questions: Record<string, NoulQuestion>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(questions).map(([id, q]) => [
+      id,
+      { type: "noul", instructions: q.instructions, ...(q.criteria ? { criteria: q.criteria } : {}) },
+    ]),
+  );
+}
+
+/** Read the noul answers we asked for, or null when any one of them is missing. */
+function readNouls(answers: Record<string, unknown>, ids: string[]): Record<string, number> | null {
+  const out: Record<string, number> = {};
+  for (const id of ids) {
+    const answer = NoulAnswerSchema.safeParse(answers[id]);
+    if (!answer.success || !Number.isFinite(answer.data.noul)) return null;
+    out[id] = answer.data.noul;
+  }
+  return out;
+}
+
+type PostOutcome =
+  | { ok: true; answers: Record<string, unknown>; usage: TypeSafeUsage }
+  | { ok: false; failure: TypeSafeFailure };
+
+async function post(
+  state: unknown,
+  questions: Record<string, unknown>,
+  cfg: TypeSafeConfig,
+  signal?: AbortSignal,
+): Promise<PostOutcome> {
+  const fetchFn = cfg.fetch ?? globalThis.fetch;
   const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs);
   const combined = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 
-  const body = {
-    state,
-    model: cfg.model,
-    questions: Object.fromEntries(
-      Object.entries(questions).map(([id, q]) => [
-        id,
-        { type: "noul", instructions: q.instructions, ...(q.criteria ? { criteria: q.criteria } : {}) },
-      ]),
-    ),
-  };
+  const body = { state, model: cfg.model, questions };
 
   let res: Response;
   try {
@@ -151,18 +260,9 @@ export async function askNouls(
   const parsed = ResponseSchema.safeParse(data);
   if (!parsed.success) return { ok: false, failure: { reason: "bad_body" } };
 
-  const nouls: Record<string, number> = {};
-  for (const id of Object.keys(questions)) {
-    const answer = NoulAnswerSchema.safeParse(parsed.data.answers[id]);
-    if (!answer.success || !Number.isFinite(answer.data.noul)) {
-      return { ok: false, failure: { reason: "bad_body" } };
-    }
-    nouls[id] = answer.data.noul;
-  }
-
   return {
     ok: true,
-    nouls,
+    answers: parsed.data.answers,
     usage: {
       input_tokens: parsed.data.usage?.input_tokens ?? 0,
       output_tokens: parsed.data.usage?.output_tokens ?? 0,

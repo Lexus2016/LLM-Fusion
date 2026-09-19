@@ -77,5 +77,5 @@ verbatim. Check `gh release list` before assuming a convention — this repo has
 - `src/usage.ts`, `src/attribution.ts` — upstream usage/cost accounting + per-call error attribution.
 - `src/capabilities.ts` — `/api/show` capability discovery (vision/tools/context).
 - `src/web.ts` — Tavily transport for panel grounding; `src/web_gate.ts` — optional TypeSafe screening of those results.
-- `src/typesafe.ts` — the TypeSafe (System One / Jev) seam: a batch of yes/no questions over one state, thresholds applied by the caller. Use it where the alternative is a regex list or a second prompt-and-parse round trip. Raw `fetch`, no SDK dependency.
+- `src/typesafe.ts` — the TypeSafe (System One / Jev) seam: one Choice and/or a batch of yes/no questions over one state, thresholds applied by the caller. Use it where the alternative is a regex list or a second prompt-and-parse round trip. Raw `fetch`, no SDK dependency. Wired in three places, all off by default: `web_search.gate` (per model), `typesafe.tool_turn_guard` and `typesafe.router` (top-level `typesafe:` block).
 - `test/` — vitest suite (mock upstream) + `live.smoke.test.ts` (key-gated).

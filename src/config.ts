@@ -408,6 +408,60 @@ const DefaultsSchema = z
   })
   .strict();
 
+/**
+ * Cross-cutting TypeSafe (System One / Jev) features — the ones that are not tied
+ * to a single model's pipeline. One place for the connection, one flag per feature.
+ *
+ * Every one of them needs TYPESAFE_API_KEY in the environment as well; config alone
+ * never causes a third-party call. Each degrades to the previous behaviour when the
+ * key is missing or the service is unreachable, so turning a flag on can cost
+ * latency but can never break a route.
+ *
+ * (The per-model `web_search.gate` keeps its own connection settings: it belongs to
+ * a model's grounding config, is enabled per model, and shipped before this block.)
+ */
+const TypeSafeSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    model: z.string().min(1).default("jev-latest"),
+    timeout_s: z.number().int().positive().lt(60).default(10),
+    /**
+     * Semantic backstop for the tool-turn guard. The guard's phrase list is
+     * EN/UA/RU and literal; this asks the same question in any language and for
+     * any phrasing. Consulted ONLY when the cheap checks found nothing, so a turn
+     * the phrase list already caught costs no call.
+     */
+    tool_turn_guard: z
+      .object({
+        enabled: z.boolean().default(false),
+        // Above this probability the turn is treated as narrate-and-stop. Higher
+        // than the gate's thresholds on purpose: a false positive re-runs a
+        // finished turn and can push an agent into an unwanted extra action.
+        threshold: z.number().min(0).max(1).default(0.75),
+      })
+      .strict()
+      .default({}),
+    /**
+     * Routing for `smart` models as a typed Choice instead of a prose prompt and a
+     * JSON parse. Replaces the router upstream call entirely when it answers; on
+     * any failure the LLM router runs exactly as before.
+     */
+    router: z
+      .object({
+        enabled: z.boolean().default(false),
+        // Below this confidence the decision is not acted on and the model's
+        // configured `default` route is used — "unsure" and "unparseable" stop
+        // being the same branch.
+        confidence_min: z.number().min(0).max(1).default(0.5),
+        // A failing latest tool result is asked about in the SAME request, so
+        // escalation costs no extra round trip. Above this it escalates to fusion.
+        stuck_threshold: z.number().min(0).max(1).default(0.7),
+      })
+      .strict()
+      .default({}),
+  })
+  .strict();
+
 export const ConfigSchema = z
   .object({
     upstream: UpstreamSchema,
@@ -422,6 +476,8 @@ export const ConfigSchema = z
     // (same models). When absent, a single `default` provider is synthesised from
     // the legacy `upstream.base_url` + `upstream.api_key_env` (backward compatible).
     providers: z.record(z.string().min(1), ProviderSchema).optional(),
+    // Optional TypeSafe features (see TypeSafeSchema). Absent -> all off.
+    typesafe: TypeSafeSchema.default({}),
   })
   .strict()
   .superRefine((cfg, ctx) => {

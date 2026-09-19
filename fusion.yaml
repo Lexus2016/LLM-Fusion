@@ -116,6 +116,54 @@ defaults:
   judge_timeout_s: 120 # judge stage (default: 60)
   min_panel_success: 2 # min successful panel answers, else 502 (default: 1)
 
+# =============================================================================
+# typesafe — typed judgments (TypeSafe System One / Jev) in the hot path
+# =============================================================================
+# Two conditions for every feature here: the flag AND TYPESAFE_API_KEY in .env.
+# Neither alone makes a call. Each one degrades to the behaviour it replaced, so
+# an outage or a dead key costs latency, never a route.
+# Measured live against jev-latest on 2026-09-19, before enabling any of this:
+#   - narrate-and-stop question: 16/16 correct at threshold 0.75 across EN, UA,
+#     RU, JA, DE, PL — positives 0.90-0.97, negatives 0.02-0.11, nothing within
+#     0.6 of the threshold. The "Jev is English-first so UA/RU will suffer"
+#     worry did not survive contact with the data.
+#   - router: 8/8 as expected. The stuck-loop case is the one worth knowing:
+#     the Choice came back simple at confidence 0.27 (the next STEP really is
+#     mechanical) while stuck scored 0.98 — two questions in one request get
+#     right what either alone gets wrong.
+#   - web gate on a live Tavily search + one planted injection: 4 real results
+#     kept, the injection caught at 0.98 — while ALSO scoring relevant 0.90 and
+#     evidence 0.94, which is exactly why injection is tested first.
+#   - latency, median of 5: 297ms for the guard question, 246ms for the router.
+#     The router REPLACES a 1-3s LLM round trip, so it is a latency win; the
+#     guard costs ~300ms once per completed agent turn.
+typesafe:
+  enabled: true
+  model: jev-latest
+  timeout_s: 10
+
+  # The tool-turn guard detects a turn that ANNOUNCED its next action instead of
+  # performing it ("Пишу повний посібник у файл…" and then stop) and re-asks. Its
+  # detector is 33 literal phrases in EN/UA/RU, so any other language and any
+  # unlisted phrasing walks straight through and the agent loop stalls until you
+  # type "continue". This asks the same question of a model instead — but ONLY
+  # when the phrase list found nothing and the turn could still be one
+  # (finish_reason: stop, no tool call, non-empty answer). A step that emits a
+  # tool call never reaches it, so the real cost is about one question per
+  # COMPLETED turn, not per step.
+  tool_turn_guard:
+    enabled: true
+    threshold: 0.75 # a false positive re-runs a FINISHED turn, so this sits high
+
+  # Routing for the smart models below. One request answers both questions the
+  # LLM router needs two mechanisms for: which route, and whether the loop is
+  # stuck repeating a failed step (today 11 regexes that bypass the router when
+  # one matches). Below confidence_min the model's own `default` route is used.
+  router:
+    enabled: true
+    confidence_min: 0.50
+    stuck_threshold: 0.70
+
 models:
   # single — 1:1 passthrough to one fast model.
   fast-js-code:

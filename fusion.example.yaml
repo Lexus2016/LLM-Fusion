@@ -160,6 +160,52 @@ defaults:
     # empty; set false to drop it. Overridable per model.
 
 # =============================================================================
+# typesafe — optional typed judgments (TypeSafe System One / Jev)
+# =============================================================================
+# For the places that need a JUDGMENT rather than a fact, and where the
+# alternative is a table of phrases or a second prompt-and-parse round trip.
+# The model answers named yes/no and either/or questions with probabilities;
+# the thresholds live here, in config, instead of inside an English sentence
+# addressed to a model.
+#
+# TWO conditions, always: the flag below AND TYPESAFE_API_KEY in .env. Neither
+# alone causes a call, so a default install reaches no third party and spends
+# nothing. Every feature degrades to the behaviour it replaced — an unreachable
+# service or a dead key costs latency, never a route.
+#
+# (The per-model `web_search.gate` block is the third TypeSafe feature; it lives
+# under the model's grounding config because it is enabled per model.)
+typesafe:
+  enabled: false # master switch (default: false)
+  model: jev-latest # pin a version, e.g. jev-1.13.0, if you tune the thresholds
+  timeout_s: 10 # per-call timeout, < 60 (default: 10)
+
+  # Semantic backstop for the tool-turn guard. The guard detects a turn that
+  # NARRATED its next action instead of performing it ("Let me write the file…"
+  # and then stop) using a list of 33 literal phrases in EN/UA/RU. This asks the
+  # same question in any language and for any phrasing — but ONLY when the phrase
+  # list found nothing and the turn could still be one: `finish_reason: stop`, no
+  # tool call, non-empty answer. In an agent loop that is at most one question per
+  # completed turn, not per step.
+  tool_turn_guard:
+    enabled: false # (default: false)
+    threshold: 0.75 # above this -> treat as narrate-and-stop and re-ask (default: 0.75)
+      # Deliberately higher than the web gate's thresholds: a false positive here
+      # re-runs a FINISHED turn and can push an agent into an extra action.
+
+  # Routing for `smart` models as a typed choice. One request answers both
+  # questions the LLM router needs two mechanisms for: which route, and whether
+  # the loop is stuck repeating a failed step (today a list of regexes that
+  # bypasses the router entirely when one matches).
+  router:
+    enabled: false # (default: false)
+    confidence_min: 0.50 # below this the model's `default` route is used (default: 0.50)
+      # "Genuinely torn between two branches" and "answered with garbage" both end
+      # up on the default route, but they are now distinct log lines.
+    stuck_threshold: 0.70 # above this -> escalate to fusion, if the model has
+      # escalate_on_tool_error set (default: 0.70)
+
+# =============================================================================
 # models — the virtual models clients ask for by name
 # =============================================================================
 models:

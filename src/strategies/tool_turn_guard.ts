@@ -4,6 +4,7 @@ import type { ChatCompletionResult, StrategyContext } from "../types";
 import type { Resilience } from "../concurrency";
 import { extractAnswer, stripThinkingTags } from "../reasoning";
 import { isJsonObjectString } from "../json";
+import { askNouls, typesafeEnabled, type NoulQuestion } from "../typesafe";
 
 /**
  * Completeness guard for the SINGLE (passthrough) route — the mirror of the
@@ -72,6 +73,129 @@ const TOOL_TURN_INTENT_MARKERS = [
   "сейчас создам",
   "пишу полностью",
 ] as const;
+
+/**
+ * Semantic backstop for the phrase list above — the same question, asked of a
+ * model instead of a substring table.
+ *
+ * WHY: `TOOL_TURN_INTENT_MARKERS` is 33 literals in three languages. It cannot
+ * catch "Okay, writing that out now.", it cannot catch a fourth language, and
+ * every phrase added to it is a guess about how a model will word its next
+ * sentence. The judgment underneath is not lexical: did this turn ANNOUNCE work,
+ * or REPORT it? That is what gets asked here.
+ *
+ * WHEN: only after the cheap checks found nothing. A turn the phrase list already
+ * caught, a turn carrying a tool call, an empty turn, a turn under a finish_reason
+ * other than "stop" — none of them reach this, so none of them costs a call. In
+ * practice that means at most one question per completed agent turn, not per step:
+ * a step that emits a tool call returns long before this point.
+ *
+ * PRECISION STILL WINS: the threshold defaults higher than the web gate's, because
+ * a false positive here re-runs a finished turn and can push an agent into an extra
+ * action the user did not ask for. A false negative just leaves today's behaviour.
+ */
+const NARRATE_AND_STOP_QUESTION: NoulQuestion = {
+  instructions:
+    "This is the end of an assistant's turn in a tool-using agent loop. Does it announce or promise an " +
+    "action the assistant has NOT yet performed — writing a file, running a command, making an edit — " +
+    "instead of reporting work it has already completed or giving a finished answer?",
+  criteria: {
+    true:
+      "It says what it is about to do next ('let me write the file', 'now I'll create the config') and " +
+      "then stops, leaving the announced action unperformed.",
+    false:
+      "It reports completed work, delivers the answer or artifact itself, asks the user a question, or " +
+      "otherwise ends on something that needs no further action from the assistant.",
+  },
+};
+
+/** How much of the tail to judge. The announcement, if any, is at the end. */
+const JUDGE_TAIL_CHARS = 1500;
+
+/**
+ * Ask whether a turn the cheap checks passed is actually a narrate-and-stop.
+ * Returns `"intent_tail"` to match the phrase list's verdict, or null — for "the
+ * turn is fine", for "the feature is off", and for every failure. Never throws:
+ * an unreachable judge leaves the guard exactly as strong as it was before.
+ */
+async function judgeNarrateAndStop(
+  ctx: StrategyContext,
+  answer: string,
+  signal?: AbortSignal,
+): Promise<"intent_tail" | null> {
+  const cfg = ctx.config.typesafe;
+  if (!cfg?.enabled || !cfg.tool_turn_guard.enabled) return null;
+  if (signal?.aborted) return null;
+  const apiKey = process.env.TYPESAFE_API_KEY;
+  if (!typesafeEnabled(apiKey)) {
+    ctx.logger.warn(
+      { stage: "single" },
+      "single: typesafe.tool_turn_guard enabled in config but TYPESAFE_API_KEY is unset — semantic check disabled",
+    );
+    return null;
+  }
+
+  const outcome = await askNouls(
+    { assistant_turn_ending: answer.slice(-JUDGE_TAIL_CHARS), tools_were_available: true },
+    { narrates_next_action: NARRATE_AND_STOP_QUESTION },
+    { apiKey, model: cfg.model, timeoutMs: cfg.timeout_s * 1000 },
+    signal,
+  );
+  if (!outcome.ok) {
+    ctx.logger.warn(
+      {
+        stage: "single",
+        reason: outcome.failure.reason,
+        ...(outcome.failure.reason === "http_status" ? { status: outcome.failure.status } : {}),
+        ...(outcome.failure.reason === "network" ? { detail: outcome.failure.detail } : {}),
+      },
+      "single: tool-turn semantic check FAILED; falling back to the phrase list alone",
+    );
+    return null;
+  }
+
+  const probability = outcome.nouls.narrates_next_action ?? 0;
+  const narrated = probability > cfg.tool_turn_guard.threshold;
+  ctx.logger.info(
+    { stage: "single", probability, threshold: cfg.tool_turn_guard.threshold, narrated },
+    "single: tool-turn semantic check",
+  );
+  return narrated ? "intent_tail" : null;
+}
+
+/**
+ * The full completeness verdict: the cheap deterministic checks first, then — only
+ * if they found nothing and the turn is the shape that can hide a narrate-and-stop
+ * — the semantic one. Callers should prefer this over `detectIncompleteToolTurn`
+ * wherever they can await.
+ */
+export async function detectIncompleteToolTurnJudged(
+  ctx: StrategyContext,
+  data: unknown,
+  signal?: AbortSignal,
+): Promise<"empty" | "intent_tail" | "broken_tool_call" | null> {
+  const cheap = detectIncompleteToolTurn(data);
+  if (cheap !== null) return cheap;
+  if (!isSemanticCandidate(data)) return null;
+  const answer = stripThinkingTags(extractAnswer(data) ?? "").trim();
+  if (answer.length === 0) return null; // already "empty" above if it mattered
+  return judgeNarrateAndStop(ctx, answer, signal);
+}
+
+/**
+ * Is this turn even capable of being a narrate-and-stop? A turn that emitted a
+ * tool call acted; a turn cut off by `length` is an honest truncation, not a
+ * promise; anything other than a clean `stop` is someone else's failure mode.
+ * Everything filtered out here is a call not made.
+ */
+function isSemanticCandidate(data: unknown): boolean {
+  const parsed = TurnCompletionSchema.safeParse(data);
+  if (!parsed.success) return false;
+  const choice = parsed.data.choices?.[0];
+  if (!choice || choice.finish_reason !== "stop") return false;
+  const toolCalls = choice.message?.tool_calls;
+  return !(Array.isArray(toolCalls) && toolCalls.length > 0);
+}
 
 const TurnCompletionSchema = z
   .object({
@@ -901,7 +1025,7 @@ export function makeToolTurnGuardStream(
       ],
     };
     const incomplete =
-      detectIncompleteToolTurn(reconstructed) ??
+      (await detectIncompleteToolTurnJudged(ctx, reconstructed, ctx.signal)) ??
       // Belt-and-braces. `detectIncompleteToolTurn` now judges runnability under every
       // finish_reason (it used to only do so for "length"), so this arm is not known to
       // be reachable — the two checks differ only in that `assembledCallsEmittable`

@@ -20,6 +20,7 @@ import { singleStrategy } from "./single";
 import { fusionStrategy } from "./fusion";
 import { assertSingleVisionCapable, requestHasImages } from "../vision";
 import { extractJsonObject } from "../json";
+import { askChoiceWithNouls, typesafeEnabled } from "../typesafe";
 import { withTimeout, realTimer } from "../timeout";
 import { createHash } from "node:crypto";
 
@@ -182,6 +183,22 @@ export const smartStrategy: Strategy = {
     // by the time we were dispatched would slip past it and buy a panel nobody
     // reads. Cheapest possible exit: nothing has been reserved or spent yet.
     ctx.signal?.throwIfAborted();
+
+    // TypeSafe routing, when it is switched on and answers. ONE request settles
+    // both questions the LLM router needed two mechanisms for: which route, and
+    // whether the loop is recovering from a failed tool result. The regex list
+    // below currently answers the second by SKIPPING the router entirely, so a
+    // pattern that misses costs a deliberation the loop needed; asked as a
+    // question in the same call, it costs nothing extra to get right.
+    //
+    // Returns null whenever the feature is off, the key is missing, the service
+    // fails, or the answer is not confident enough — and every one of those falls
+    // through to the untouched logic below.
+    const typed = await classifyWithTypeSafe(ctx, cfg);
+    if (typed !== null) {
+      ctx.signal?.throwIfAborted();
+      return typed === "simple" ? executeSimple(ctx, cfg) : executeFusionWithFallback(ctx, cfg);
+    }
 
     // Agent-loop escalation (see SmartModelSchema.escalate_on_tool_error): when
     // the latest tool result looks like a failure the model is recovering from an
@@ -493,6 +510,124 @@ async function classifyUncached(
   );
   setRouterCache(key, decision.route);
   return decision.route;
+}
+
+/**
+ * Route with one typed TypeSafe call instead of a prose prompt and a JSON parse.
+ *
+ * What this replaces, when it answers:
+ *  - ROUTER_SYSTEM_PROMPT and its JSON-only plea, plus the fence/prose tolerance
+ *    and the "thinking model put the decision in `reasoning`" workarounds;
+ *  - `claimsImage`, whose eight regexes exist only because a prose `reason` field
+ *    gives a model somewhere to hallucinate a screenshot into. A Choice has no
+ *    prose to hallucinate in, so the failure mode is gone rather than guarded;
+ *  - TOOL_ERROR_PATTERNS, asked here as a question instead of matched as regexes.
+ *
+ * What it does NOT replace: the `default` route. Confidence below `confidence_min`
+ * means the model is genuinely torn between two branches, which is different from
+ * a malformed answer, and both still land on the configured default — but now they
+ * are distinguishable in the log.
+ *
+ * Returns null for "not used": feature off, key absent, service unreachable, or
+ * an answer too weak to act on. Every null falls through to the existing router.
+ */
+async function classifyWithTypeSafe(
+  ctx: StrategyContext,
+  cfg: SmartModelConfig,
+): Promise<"simple" | "fusion" | null> {
+  const tcfg = ctx.config.typesafe;
+  if (!tcfg?.enabled || !tcfg.router.enabled) return null;
+  const apiKey = process.env.TYPESAFE_API_KEY;
+  if (!typesafeEnabled(apiKey)) {
+    ctx.logger.warn(
+      { model: ctx.request.model },
+      "smart: typesafe.router enabled in config but TYPESAFE_API_KEY is unset — using the LLM router",
+    );
+    return null;
+  }
+
+  const outcome = await askChoiceWithNouls(
+    { conversation: renderRequestForRouter(ctx.request) },
+    "route",
+    {
+      instructions:
+        "This is an agent's conversation so far. Does answering the latest turn need several models to " +
+        "deliberate, or will one capable model do?",
+      criteria: {
+        fusion:
+          "Complex or multi-step design, ambiguous requirements where assumptions must be debated, " +
+          "high-stakes work where a mistake costs data or security, debugging a root cause nobody has " +
+          "identified yet, or weighing conflicting trade-offs.",
+        simple:
+          "Routine coding, edits, tests, boilerplate, documentation, factual lookup, or a mechanical " +
+          "next step — anything whose result a compiler or a test run would immediately check.",
+      },
+    },
+    {
+      stuck: {
+        instructions:
+          "Do the most recent tool results show the agent failing at the SAME step repeatedly — errors, " +
+          "failing tests, or re-editing one file after a failure — rather than making progress?",
+        criteria: {
+          true: "The recent steps repeat a failure or undo each other; the agent is not converging.",
+          false: "The recent steps succeeded, or there are no tool results yet.",
+        },
+      },
+    },
+    { apiKey, model: tcfg.model, timeoutMs: tcfg.timeout_s * 1000 },
+    ctx.signal,
+  );
+
+  if (!outcome.ok) {
+    ctx.logger.warn(
+      {
+        model: ctx.request.model,
+        reason: outcome.failure.reason,
+        ...(outcome.failure.reason === "http_status" ? { status: outcome.failure.status } : {}),
+        ...(outcome.failure.reason === "network" ? { detail: outcome.failure.detail } : {}),
+      },
+      "smart: typesafe routing FAILED; falling back to the LLM router",
+    );
+    return null;
+  }
+
+  const stuck = outcome.nouls.stuck ?? 0;
+  // Escalation outranks the route: a loop repeating one failure is exactly the
+  // step deliberation is for, whichever way the Choice leaned. Same precedence
+  // the regex escalation has today, minus the regexes.
+  if (cfg.escalate_on_tool_error && stuck > tcfg.router.stuck_threshold) {
+    ctx.logger.info(
+      { model: ctx.request.model, route: "fusion", reason: "stuck_escalation", stuck },
+      "smart: typesafe says the loop is repeating a failure; escalating to fusion",
+    );
+    return "fusion";
+  }
+
+  if (outcome.choice.confidence < tcfg.router.confidence_min) {
+    ctx.logger.info(
+      {
+        model: ctx.request.model,
+        route: cfg.default,
+        reason: "low_confidence",
+        confidence: outcome.choice.confidence,
+        probabilities: outcome.choice.probabilities,
+      },
+      "smart: typesafe route below the confidence floor; using the default route",
+    );
+    return cfg.default;
+  }
+
+  ctx.logger.info(
+    {
+      model: ctx.request.model,
+      route: outcome.choice.choice,
+      confidence: outcome.choice.confidence,
+      probabilities: outcome.choice.probabilities,
+      stuck,
+    },
+    "smart: typesafe route decision",
+  );
+  return outcome.choice.choice;
 }
 
 /** Resolve the `simple` slot to a concrete single-model config. */

@@ -42,6 +42,15 @@ function makeCtx(
       },
       models: {},
       overrides: {},
+      // Every optional TypeSafe feature off — the shipped default, and what these
+      // tests assume: no third-party call is made from any of these paths.
+      typesafe: {
+        enabled: false,
+        model: "jev-latest",
+        timeout_s: 10,
+        tool_turn_guard: { enabled: false, threshold: 0.75 },
+        router: { enabled: false, confidence_min: 0.5, stuck_threshold: 0.7 },
+      },
     },
     client,
     capabilities: {

@@ -8,7 +8,7 @@ import {
 } from "../attribution";
 import { promoteReasoningNonStream, makeReasoningPromotionTransform } from "../reasoning";
 import {
-  detectIncompleteToolTurn,
+  detectIncompleteToolTurnJudged,
   makeToolTurnGuardStream,
   retryToolTurn,
   toolTurnRetryBlocked,
@@ -138,7 +138,12 @@ export const singleStrategy: Strategy = {
     // Non-stream tool-turn guard: same recovery for a narrate-and-stop turn.
     let responseData = result.data;
     if (hasTools && result.status < 400) {
-      const incomplete = detectIncompleteToolTurn(responseData);
+      // Cheap deterministic checks first; the TypeSafe question only when they
+      // found nothing AND the turn is the shape that can hide a narrate-and-stop
+      // (see detectIncompleteToolTurnJudged). Off by default — identical to the
+      // previous `detectIncompleteToolTurn` call until typesafe.tool_turn_guard
+      // is enabled and a key is present.
+      const incomplete = await detectIncompleteToolTurnJudged(ctx, responseData, ctx.signal);
       if (incomplete !== null) {
         // The STREAM path logs its detection before retrying (streamRetryToolTurn);
         // this non-stream twin fired silently, so the one number that says whether
