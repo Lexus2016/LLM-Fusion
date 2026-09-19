@@ -1320,7 +1320,13 @@ function buildPanelBody(
     // not as `system`: some panel members (kimi-k2.7-code) ignore live facts
     // placed in a system role and refuse on a stale training cutoff, while the
     // same facts in a user turn make them answer. (glm/gpt-oss use either.)
-    insertBeforeLastUser(msgs, { role: "user", content: opts.webContext });
+    // Fenced exactly as the synth fences the same string (see buildSynthBody).
+    // formatWebContext prepends a mandate — "treat it as the source of truth",
+    // "you MUST base your answer on this context" — and the block it introduces is
+    // attacker-controlled text off the open web. Handing the panel that mandate with
+    // no untrusted-data delimiter is the one injection path in the pipeline that had
+    // no marker at all; the synth was fenced and the panel was not.
+    insertBeforeLastUser(msgs, { role: "user", content: fenceUntrusted(opts.webContext, "web") });
   }
   // Compact-answer mandate, first of the injected directives so every later mode
   // contract (adversarial, deliberation) overrides it on output format. Without
