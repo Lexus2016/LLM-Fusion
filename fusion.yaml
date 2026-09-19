@@ -435,7 +435,7 @@ models:
     # request_overrides mechanism exists yet to throttle it (only single/smart.simple
     # support request_overrides — see src/config.ts).
     judge: misha/glm-5.3 # most reliable structured-JSON of the glm line -> fewer judge-parse failures
-    synth: xai/grok-4.6-high
+    synth: misha/glm-5.3-flash
       # Strongest model in the pipeline sits on synth, not on the panel: the panel
       # supplies material, the synth decides the answer the caller sees.
       # cc/claude-opus-5-low held this seat until 2026-09-16 and was DEAD upstream
@@ -601,7 +601,7 @@ models:
     # A failed search degrades silently to an ungrounded panel. Respects
     # fusion_planning_turn_only (no web search on mid-loop tool-result turns).
     web_search:
-      enabled: true
+      enabled: false
       max_results: 10 # Tavily results to fetch (1-10)
       timeout_s: 30 # per-search timeout (< 60)
       max_context_chars: 8000 # cap on the injected context block
