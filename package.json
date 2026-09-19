@@ -1,6 +1,6 @@
 {
   "name": "llm-fusion",
-  "version": "0.1.50",
+  "version": "0.1.51",
   "private": true,
   "type": "module",
   "description": "Self-hosted fusion proxy for any OpenAI-compatible provider: a panel of models deliberates, a judge scores, one synthesizer answers. Speaks the OpenAI and Anthropic APIs.",

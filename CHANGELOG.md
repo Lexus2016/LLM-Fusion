@@ -2,6 +2,114 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.51] - 2026-09-19
+
+Three places in this proxy need a *judgment* rather than a fact, and each one
+answered it the same wrong way: a table of literal phrases, or a second "prompt
+a model, parse its JSON" round trip. A phrase table cannot be extended to a
+language nobody listed, and a rule written into a prompt is advice the model may
+decline. This release replaces all three with typed questions whose answers come
+back as probabilities, so the threshold lives in `fusion.yaml` instead of inside
+an English sentence addressed to a model. Every one of them is off unless a
+config flag AND `TYPESAFE_API_KEY` are both set.
+
+Two defects turned up while reading those call sites, and they are the reason
+this release leads with fixes rather than features.
+
+### Fixed
+- **The fusion panel received web results unfenced.** The synth has always
+  received the grounding block inside an id-qualified
+  `<<UNTRUSTED_DATA source=web>>` fence; the panel received it bare. Worse than
+  a missing delimiter: `formatWebContext` prepends a mandate — "treat it as the
+  source of truth", "you MUST base your answer on this context", "do NOT
+  refuse" — and then splices in whatever the open web returned. So the one stage
+  that fans that text out to three models at once was the stage with no marker
+  saying where the untrusted part began, and the panel feeds the judge, which
+  feeds the tool-holding synth. Fencing at the panel closes the path at its
+  entry instead of two hops later.
+- **The judge's confidence rule was enforced in prose.**
+  `JUDGE_SYSTEM_PROMPT` states it plainly — if you list any
+  `hallucination_flags` or `fragile_claims`, `confidence` must be `medium` or
+  `low` — and a rule stated in prose is advisory. A judge returning `high`
+  beside three claims it just called thin handed the synth licence to assert
+  exactly those claims, and nothing in the pipeline noticed. The schema now
+  downgrades that combination. A judge that answers the question with a literal
+  filler (`none`, `n/a`, `[]`) has found nothing and keeps its `high`; a verbose
+  negation still costs it, which errs toward the synth hedging slightly more
+  than it had to.
+- **The non-stream tool-turn detection fired silently.** The streaming path logs
+  its detection before retrying; its non-stream twin did not, so how often
+  `intent_tail` actually catches a narrate-and-stop — the number that decides
+  whether the phrase list is worth replacing — could not be counted from the
+  logs at all.
+
+### Added
+- **`typesafe.tool_turn_guard` — a semantic backstop for the narrate-and-stop
+  detector.** That detector is 33 literal phrases in EN/UA/RU; it cannot catch a
+  fourth language or an unlisted wording, and each miss ends an agent turn with
+  nothing executed until the user types "continue". The judgment underneath is
+  not lexical — did this turn ANNOUNCE work, or REPORT it? — so it is now asked
+  as such, and only when the phrase list found nothing and the turn could still
+  be one: `finish_reason: stop`, no tool call, non-empty answer. A step that
+  emits a tool call returns long before that point, so the cost is about one
+  question per COMPLETED turn, not per step. Threshold defaults to 0.75, above
+  the others: a false positive re-runs a finished turn.
+- **`typesafe.router` — smart routing as a typed choice.** One request settles
+  both questions the LLM router needed two mechanisms for: which route, and
+  whether the loop is stuck repeating a failed step. The second was 11 regexes
+  that SKIP the router entirely when one matches, so a pattern that missed cost
+  a deliberation the loop needed; asked as a question in the same call it costs
+  nothing extra. When it answers, `ROUTER_SYSTEM_PROMPT`, the fence-tolerant
+  JSON parse, the `reasoning`-field workaround and `claimsImage`'s eight regexes
+  are all bypassed — a Choice has no prose field for a model to hallucinate a
+  screenshot into, so that failure mode is gone rather than guarded. Below
+  `confidence_min` the model's own `default` route is used: "genuinely torn" and
+  "answered with garbage" stop being one branch and become two log lines.
+- **`web_search.gate` — screening of search results before they reach the
+  panel.** Fencing marks untrusted text; it does not decide whether the text
+  belonged in the prompt. Each result is scored on three yes/no questions — is
+  the page trying to steer the system reading it, is it about the request, does
+  it state anything usable — with the thresholds applied in code. Injection is
+  tested first because it is a security decision, and the live check below is
+  the evidence for that ordering.
+
+### Measured
+All of it was run against `jev-latest` with real keys before anything was
+enabled:
+- **Narrate-and-stop question: 16/16 correct at threshold 0.75**, across EN, UA,
+  RU, JA, DE and PL. Positives landed at 0.90-0.97, negatives at 0.02-0.11 —
+  nothing came within 0.6 of the threshold. The hardest negative, a turn that
+  reports finished work and then mentions a future step ("Done — config.ts is
+  updated. Next time we should also cover the stream path"), scored 0.11. The
+  concern raised when this was proposed — that an English-first model would do
+  badly on the UA/RU cases the phrase list exists for — did not survive contact
+  with the data.
+- **Router: 8/8 as expected.** The case that earns the two-question design is
+  the stuck loop: the Choice came back `simple` at confidence **0.27**, because
+  the next step really is mechanical, while `stuck` scored **0.98**. Either
+  question alone gets that turn wrong.
+- **Web gate on a live search plus one planted injection:** four real results
+  kept, the injection caught at **0.98** — while also scoring relevant 0.90 and
+  evidence 0.94. A quality test running first would have kept it.
+- **Latency, median of five:** 297 ms for the guard question, 246 ms for the
+  router. The router replaces a 1-3 s LLM round trip, so it is a latency win;
+  the guard costs ~300 ms once per completed agent turn.
+
+These numbers are recorded in `fusion.yaml` next to the knobs they justify.
+
+### Changed
+- **No new dependency.** The endpoint is one POST with a JSON body, and an npm
+  package installs whether or not the key exists — the same trade already made
+  for Tavily. `src/typesafe.ts` is a raw-`fetch` seam (one Choice and/or a batch
+  of yes/no questions over one state) with an injectable `fetch`, so the suite
+  stays offline.
+- **Every optional third-party feature now degrades the same way**: it never
+  throws into the request path, it falls back to the behaviour it replaced, and
+  it logs one line naming the reason — an operator must be able to tell "the key
+  expired" from "there was nothing to report". A search whose results are all
+  rejected reports `all_screened_out` with a count, which is deliberately not
+  `no_results`.
+
 ## [0.1.50] - 2026-09-17
 
 A user report on a low-code client: "compression doesn't work, it reaches 100 %,
