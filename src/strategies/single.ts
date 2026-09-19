@@ -139,6 +139,17 @@ export const singleStrategy: Strategy = {
     let responseData = result.data;
     if (hasTools && result.status < 400) {
       const incomplete = detectIncompleteToolTurn(responseData);
+      if (incomplete !== null) {
+        // The STREAM path logs its detection before retrying (streamRetryToolTurn);
+        // this non-stream twin fired silently, so the one number that says whether
+        // the hardcoded EN/UA/RU marker list in tool_turn_guard is worth replacing —
+        // how often `intent_tail` actually fires, and on what share of turns — could
+        // not be counted from the logs at all.
+        ctx.logger.info(
+          { stage: "single", model: target, reason: incomplete },
+          "single: tool turn detected as incomplete",
+        );
+      }
       // `toolTurnRetryBlocked`: a `content_filter` turn was REFUSED, not malformed by
       // accident — re-prompting it with "Emit the tool call NOW" just re-runs the
       // refusal. Leave the upstream response exactly as it came.

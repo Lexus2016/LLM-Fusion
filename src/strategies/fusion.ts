@@ -78,6 +78,26 @@ function isModelAccessError(status: number): boolean {
   return status === 403 || status === 404 || status === 410;
 }
 
+/**
+ * Literal ways a judge writes "this field is empty". Without them, a judge that
+ * dutifully answers `"hallucination_flags": "none"` alongside `"confidence": "high"`
+ * would be downgraded for having found nothing.
+ *
+ * The list is deliberately short and literal: a verbose negation ("no hallucinations
+ * detected") still reads as content and still costs the judge its "high". That error
+ * points the safe way — the synth hedges a little more than it had to — whereas the
+ * error this whole transform exists to prevent is the synth asserting a disputed
+ * claim as established fact.
+ */
+const JUDGE_EMPTY_FIELD_FILLERS = new Set(["", "none", "none.", "n/a", "na", "-", "\u2014", "[]", "null"]);
+
+/** True when a judge field carries something other than a "nothing here" filler. */
+function judgeFieldHasContent(value: string | string[] | undefined): boolean {
+  if (value === undefined) return false;
+  const parts = typeof value === "string" ? [value] : value;
+  return parts.some((part) => !JUDGE_EMPTY_FIELD_FILLERS.has(part.trim().toLowerCase()));
+}
+
 const JudgeAnalysisSchema = z
   .object({
     consensus: z.union([z.string(), z.array(z.string())]).optional(),
@@ -107,7 +127,21 @@ const JudgeAnalysisSchema = z
   // sourced from untrusted web/expert content — straight into the tool-holding
   // synth. Dropping unknown keys removes that laundering vector at zero cost
   // (nothing downstream reads a non-schema key).
-  .strip();
+  .strip()
+  // Consistency rule, enforced in CODE instead of in the prompt. JUDGE_SYSTEM_PROMPT
+  // states it in prose ("if you list ANY hallucination_flags or fragile_claims, then
+  // confidence MUST be medium or low"), and a constraint stated in prose is advisory:
+  // a judge that reports "high" next to three fragile claims hands the synth licence
+  // to assert exactly the claims the judge just called thin. As a transform it cannot
+  // be talked out of. The prompt keeps the rule too — asking for the right answer is
+  // cheaper than correcting the wrong one.
+  .transform((analysis) => {
+    if (analysis.confidence !== "high") return analysis;
+    if (judgeFieldHasContent(analysis.hallucination_flags) || judgeFieldHasContent(analysis.fragile_claims)) {
+      return { ...analysis, confidence: "medium" as const };
+    }
+    return analysis;
+  });
 
 export type JudgeAnalysis = z.infer<typeof JudgeAnalysisSchema>;
 

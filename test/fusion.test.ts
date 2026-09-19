@@ -357,6 +357,66 @@ describe("fusion strategy — panel/judge/synth", () => {
     }
   });
 
+  it("downgrades a judge that claims high confidence while listing fragile claims", async () => {
+    // JUDGE_SYSTEM_PROMPT asks for this rule in prose; a prose rule is advisory. The
+    // schema transform makes it binding, so the synth never receives "high" next to
+    // the claims the judge itself called thin.
+    const up = makeUpstream((body) => {
+      if (body.model === "j") {
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  consensus: "they agree",
+                  confidence: "high",
+                  fragile_claims: "only m2 mentions the retry_after header",
+                }),
+              },
+            },
+          ],
+        });
+      }
+      if (body.model === "s") return jsonResponse({ choices: [{ message: { content: "final" } }] });
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ tools: TOOLS })));
+    expect(res.status).toBe(200);
+    const synthCtx = systemContents(up.recorded.find((b) => b.model === "s")!).join("\n");
+    expect(synthCtx).toContain('"confidence":"medium"');
+    expect(synthCtx).not.toContain('"confidence":"high"');
+    expect(synthCtx).toContain("retry_after"); // the fragile claim still reaches the synth
+  });
+
+  it("keeps high confidence when the judge fills the fragile fields with 'none'", async () => {
+    // The mirror case: a judge that answers the question with a filler has found
+    // nothing, and must not be downgraded for being thorough.
+    const up = makeUpstream((body) => {
+      if (body.model === "j") {
+        return jsonResponse({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  consensus: "they agree",
+                  confidence: "high",
+                  hallucination_flags: "none",
+                  fragile_claims: [],
+                }),
+              },
+            },
+          ],
+        });
+      }
+      if (body.model === "s") return jsonResponse({ choices: [{ message: { content: "final" } }] });
+      return jsonResponse({ choices: [{ message: { content: `ans-${body.model}` } }] });
+    });
+    const res = await fusionStrategy.execute(ctx(up.client, req({ tools: TOOLS })));
+    expect(res.status).toBe(200);
+    const synthCtx = systemContents(up.recorded.find((b) => b.model === "s")!).join("\n");
+    expect(synthCtx).toContain('"confidence":"high"');
+  });
+
   it("strips unknown judge keys so an injected key never reaches the synth context", async () => {
     // The judge output is untrusted (a prompt-injected web result can steer it).
     // JudgeAnalysisSchema.strip() must drop non-schema keys before the analysis
