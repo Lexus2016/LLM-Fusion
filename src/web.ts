@@ -91,7 +91,14 @@ export type WebSearchFailure =
   /** 2xx whose body is not JSON, or JSON without a `results` array. */
   | { reason: "bad_body" }
   /** A successful search that matched nothing. Benign — not an error. */
-  | { reason: "no_results" };
+  | { reason: "no_results" }
+  /**
+   * The search DID match, and the optional screening gate rejected every result.
+   * Deliberately distinct from `no_results`: "the web has nothing on this" and
+   * "everything the web returned was off-topic or trying to steer the panel" call
+   * for opposite reactions from whoever reads the log.
+   */
+  | { reason: "all_screened_out"; screened: number };
 
 export type WebSearchOutcome =
   | { ok: true; results: WebSearchResult[] }
@@ -230,10 +237,21 @@ export async function buildWebContext(
   query: string,
   cfg: WebGroundingConfig,
   signal?: AbortSignal,
+  /**
+   * Optional screening step between the search and the prompt. Kept as a callback
+   * so this module stays a Tavily transport and knows nothing about what screens
+   * its results or why — see `src/web_gate.ts` for the TypeSafe implementation.
+   * Returns the subset that may be formatted; must preserve order.
+   */
+  gate?: (results: WebSearchResult[]) => Promise<WebSearchResult[]>,
 ): Promise<WebContextOutcome> {
   const outcome = await tavilySearch(query, cfg, signal);
   if (!outcome.ok) return outcome;
-  const context = formatWebContext(outcome.results, cfg.maxContextChars);
+  const results = gate ? await gate(outcome.results) : outcome.results;
+  if (results.length === 0) {
+    return { ok: false, failure: { reason: "all_screened_out", screened: outcome.results.length } };
+  }
+  const context = formatWebContext(results, cfg.maxContextChars);
   // Defensive only, and deliberately not described as a live case: `tavilySearch`
   // already reports an empty result set as `no_results`, and `formatWebContext`
   // always admits its FIRST block regardless of the char budget (the budget check

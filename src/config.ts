@@ -84,6 +84,23 @@ const BinevalSchema = z
  * web grounding does not depend on whether `smart` references a fusion model by
  * string or defines an inline block.
  */
+const WebGateSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    model: z.string().min(1).default("jev-latest"),
+    timeout_s: z.number().int().positive().lt(60).default(15),
+    // Above this, the result is attempting to steer whatever reads it -> dropped
+    // before it is ever formatted into a prompt. This is a security test, so it
+    // runs first and it is the one threshold worth being strict about.
+    injection_max: z.number().min(0).max(1).default(0.7),
+    // Below this, the result is not about the request at all -> dropped. Keeps the
+    // panel's added context on topic instead of merely under the char budget.
+    relevant_min: z.number().min(0).max(1).default(0.45),
+    // Above this, the result states something an answer could actually use.
+    evidence_min: z.number().min(0).max(1).default(0.55),
+  })
+  .strict();
+
 const WebSearchSchema = z
   .object({
     enabled: z.boolean().default(false),
@@ -94,6 +111,12 @@ const WebSearchSchema = z
     // chars/token), so the added context can't overflow a smaller-context panel
     // member mid-loop. Short planning turns still ground.
     max_prompt_chars: z.number().int().positive().default(80000),
+    // Optional TypeSafe screening of each search result before it reaches the
+    // panel. Requires TYPESAFE_API_KEY in the environment; without it the gate
+    // stays OFF even when enabled here (same contract as TAVILY_API_KEY above).
+    // Fails OPEN: a TypeSafe outage degrades to today's behaviour (fenced but
+    // unscreened results) rather than costing the panel its grounding.
+    gate: WebGateSchema.optional(),
   })
   .optional();
 

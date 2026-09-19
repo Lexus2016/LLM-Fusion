@@ -41,7 +41,8 @@ OpenCode shortcut: `./bin/fusion-opencode fusion-coder` (starts the proxy + wire
   synth — so it equals the context you are holding. The sum over all 4-7 internal
   calls is the cost number and lives in the `x-fusion-usage` header and the logs.
   Do not size your context against the header.
-- **Secrets:** provider keys live in `.env` / the env vars each account's `api_key_env` names (`OLLAMA_API_KEY`, `LG_API_KEY`, …) only. Never inline it in code, config, logs, or commits.
+- **Secrets:** provider keys live in `.env` / the env vars each account's `api_key_env` names (`OLLAMA_API_KEY`, `LG_API_KEY`, …) only. Third-party feature keys (`TAVILY_API_KEY`, `TYPESAFE_API_KEY`) live there too. Never inline one in code, config, logs, or commits.
+- **Optional third-party features are gated by TWO things**, always: an env key AND an opt-in in `fusion.yaml`. Neither alone may cause a call, so a default install makes no third-party request and incurs no cost. They also degrade rather than fail: the pipeline still answers without them, and every degradation logs one line naming the reason — an operator must be able to tell "the key expired" from "there was nothing to report".
 
 ## Ship it (what "a release" means here)
 
@@ -75,4 +76,6 @@ verbatim. Check `gh release list` before assuming a convention — this repo has
 - `src/strategies/` — `single`, `failover`, `fusion`, `smart`.
 - `src/usage.ts`, `src/attribution.ts` — upstream usage/cost accounting + per-call error attribution.
 - `src/capabilities.ts` — `/api/show` capability discovery (vision/tools/context).
+- `src/web.ts` — Tavily transport for panel grounding; `src/web_gate.ts` — optional TypeSafe screening of those results.
+- `src/typesafe.ts` — the TypeSafe (System One / Jev) seam: a batch of yes/no questions over one state, thresholds applied by the caller. Use it where the alternative is a regex list or a second prompt-and-parse round trip. Raw `fetch`, no SDK dependency.
 - `test/` — vitest suite (mock upstream) + `live.smoke.test.ts` (key-gated).

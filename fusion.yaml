@@ -349,6 +349,19 @@ models:
         # fusion-researcher keeps grounding ON (freshness matters there).
       max_results: 5 # Tavily results to fetch (1-10)
       timeout_s: 10 # per-search timeout (< 60)
+      # TypeSafe screening of each result BEFORE it is formatted into the panel
+      # prompt. Two keys, same contract as the search itself: this flag AND
+      # TYPESAFE_API_KEY in .env — neither alone does anything, and with
+      # web_search.enabled false above, nothing here runs at all.
+      #
+      # Three yes/no judgments per result, thresholded in code rather than asked
+      # for in a prompt: is the page trying to steer the system reading it
+      # (checked FIRST — a poisoned page is usually relevant and useful-looking
+      # too), is it about the request, does it state anything an answer can use.
+      # Fails OPEN: if TypeSafe is unreachable the results pass through
+      # unscreened (still fenced as untrusted data) with one WARN in the log.
+      gate:
+        enabled: true
       max_context_chars: 4000 # cap on the injected context block
 
   fusion-coder-x:
@@ -458,6 +471,19 @@ models:
         # fusion-researcher keeps grounding ON (freshness matters there).
       max_results: 5 # Tavily results to fetch (1-10)
       timeout_s: 10 # per-search timeout (< 60)
+      # TypeSafe screening of each result BEFORE it is formatted into the panel
+      # prompt. Two keys, same contract as the search itself: this flag AND
+      # TYPESAFE_API_KEY in .env — neither alone does anything, and with
+      # web_search.enabled false above, nothing here runs at all.
+      #
+      # Three yes/no judgments per result, thresholded in code rather than asked
+      # for in a prompt: is the page trying to steer the system reading it
+      # (checked FIRST — a poisoned page is usually relevant and useful-looking
+      # too), is it about the request, does it state anything an answer can use.
+      # Fails OPEN: if TypeSafe is unreachable the results pass through
+      # unscreened (still fenced as untrusted data) with one WARN in the log.
+      gate:
+        enabled: true
       max_context_chars: 4000 # cap on the injected context block
 
   # fusion-researcher — research, analysis, reports. Fusion for breadth.
@@ -531,6 +557,19 @@ models:
       max_results: 10 # Tavily results to fetch (1-10)
       timeout_s: 30 # per-search timeout (< 60)
       max_context_chars: 8000 # cap on the injected context block
+      # TypeSafe screening of each result BEFORE it is formatted into the panel
+      # prompt. Two keys, same contract as the search itself: this flag AND
+      # TYPESAFE_API_KEY in .env — neither alone does anything, and with
+      # web_search.enabled false above, nothing here runs at all.
+      #
+      # Three yes/no judgments per result, thresholded in code rather than asked
+      # for in a prompt: is the page trying to steer the system reading it
+      # (checked FIRST — a poisoned page is usually relevant and useful-looking
+      # too), is it about the request, does it state anything an answer can use.
+      # Fails OPEN: if TypeSafe is unreachable the results pass through
+      # unscreened (still fenced as untrusted data) with one WARN in the log.
+      gate:
+        enabled: true
   # fusion-agents — autonomous agent loops. Smart routing: keep the cheap 80%
   #   cheap, escalate the hard 20%. P3 tool-calling was reliable on ALL models
   #   (<2s, correct first action) -> agent choice = planning quality + cost,

@@ -326,6 +326,26 @@ models:
                               # overflow a smaller-context panel member mid-loop.
                               # Short planning turns still ground. (default: 80000)
 
+      # OPTIONAL screening of each search result before it reaches the panel.
+      # Needs TYPESAFE_API_KEY in the environment — without it the gate stays
+      # off however this is set, exactly as web_search itself needs TAVILY_API_KEY.
+      #
+      # Three yes/no judgments per result, thresholded here rather than inside a
+      # prompt: is the page trying to steer the system reading it (dropped first —
+      # it is a security test, and a poisoned page is usually relevant too), is it
+      # about the request at all, and does it state anything an answer could use.
+      #
+      # Fails OPEN: if the screener is unreachable, results pass through unscreened
+      # (still fenced as untrusted data) and a WARN says so. Grounding is not lost
+      # to a screener outage.
+      gate:
+        enabled: false # (default: false)
+        model: jev-latest # pin a version, e.g. jev-1.13.0, if you tune the numbers below
+        timeout_s: 15 # per-result screening timeout, < 60 (default: 15)
+        injection_max: 0.70 # above this -> dropped as an attempt to steer (default: 0.70)
+        relevant_min: 0.45 # below this -> dropped as off-topic (default: 0.45)
+        evidence_min: 0.55 # above this -> kept as usable evidence (default: 0.55)
+
   # ---------------------------------------------------------------------------
   # smart — a cheap router decides per request: one call, or the whole panel.
   # ---------------------------------------------------------------------------

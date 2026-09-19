@@ -23,7 +23,9 @@ import { openAiBodyToNativeChat, requestHasImages } from "../vision";
 import { describeRequestImages } from "../image_describe";
 import { extractJsonObject, isJsonObjectString } from "../json";
 import { runBineval, DEFAULT_DIMENSIONS, type BinaryEvaluationResult } from "../bineval";
-import { buildWebContext, webGroundingEnabled, type WebGroundingConfig } from "../web";
+import { buildWebContext, webGroundingEnabled, type WebGroundingConfig, type WebSearchResult } from "../web";
+import { typesafeEnabled, type TypeSafeConfig } from "../typesafe";
+import { gateWebResults } from "../web_gate";
 import {
   failureKindForError,
   failureKindForStatus,
@@ -3097,6 +3099,63 @@ function webQuery(request: ChatCompletionRequest): string {
  * ungrounded panel, but never silently: every gate-off and every failure emits
  * exactly one log line naming the reason.
  */
+/**
+ * Build the optional TypeSafe screening step for web results, or `undefined` when
+ * the gate is off. Off is the default and the common case: it requires BOTH
+ * `gate.enabled` in the model's config AND `TYPESAFE_API_KEY` in the environment,
+ * the same two-key contract web grounding itself uses for Tavily.
+ *
+ * Config-on-but-key-missing warns once per request rather than failing: an operator
+ * who wrote the config and forgot the key should not have to guess why nothing is
+ * being screened.
+ */
+function buildWebGate(
+  ctx: StrategyContext,
+  gate: NonNullable<FusionModelConfig["web_search"]>["gate"],
+  query: string,
+): ((results: WebSearchResult[]) => Promise<WebSearchResult[]>) | undefined {
+  if (!gate?.enabled) return undefined;
+  const apiKey = process.env.TYPESAFE_API_KEY;
+  if (!typesafeEnabled(apiKey)) {
+    ctx.logger.warn(
+      { model: ctx.request.model },
+      "fusion: web_search.gate enabled in config but TYPESAFE_API_KEY is unset — screening disabled",
+    );
+    return undefined;
+  }
+  const cfg: TypeSafeConfig = { apiKey, model: gate.model, timeoutMs: gate.timeout_s * 1000 };
+  const thresholds = {
+    injectionMax: gate.injection_max,
+    relevantMin: gate.relevant_min,
+    evidenceMin: gate.evidence_min,
+  };
+  return async (results) => {
+    const outcome = await gateWebResults(query, results, cfg, thresholds, ctx.signal);
+    if (outcome.failure) {
+      // Fail open, and say so: an unscreened result is what the panel would have
+      // received before the gate existed, but an operator must be able to tell
+      // "screened and clean" from "the screener never answered".
+      ctx.logger.warn(
+        {
+          model: ctx.request.model,
+          reason: outcome.failure.reason,
+          ...(outcome.failure.reason === "http_status" ? { status: outcome.failure.status } : {}),
+          ...(outcome.failure.reason === "network" ? { detail: outcome.failure.detail } : {}),
+        },
+        "fusion: web result screening FAILED; results pass through unscreened",
+      );
+    }
+    for (const d of outcome.decisions) {
+      if (d.verdict === "kept" || d.verdict === "unscreened") continue;
+      ctx.logger.info(
+        { model: ctx.request.model, url: d.result.url, verdict: d.verdict, nouls: d.nouls },
+        "fusion: web result dropped by the screening gate",
+      );
+    }
+    return outcome.kept;
+  };
+}
+
 async function buildPanelWebContext(
   ctx: StrategyContext,
   cfg: FusionModelConfig,
@@ -3141,7 +3200,7 @@ async function buildPanelWebContext(
     maxContextChars: ws.max_context_chars,
   };
   try {
-    const outcome = await buildWebContext(query, gcfg, ctx.signal);
+    const outcome = await buildWebContext(query, gcfg, ctx.signal, buildWebGate(ctx, ws.gate, query));
     if (!outcome.ok) {
       // Degrade to an ungrounded panel either way, but say WHY. A dead/expired
       // key (401) or a plan limit (429) is otherwise indistinguishable in the
@@ -3161,6 +3220,11 @@ async function buildPanelWebContext(
         ctx.logger.info(
           { model: ctx.request.model },
           "fusion: web grounding found nothing; proceeding ungrounded",
+        );
+      } else if (f.reason === "all_screened_out") {
+        ctx.logger.warn(
+          { model: ctx.request.model, screened: f.screened },
+          "fusion: every web result was screened out; proceeding ungrounded",
         );
       } else {
         ctx.logger.warn(
