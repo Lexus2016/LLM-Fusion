@@ -1215,13 +1215,111 @@ function roleOfNonSystem(entries: Array<{ idx: number; msg: unknown }>, i: numbe
 }
 
 /**
+ * Bounds of the tool-call digest an omission marker carries. 150 lines at ~160
+ * chars is ~24k chars per gap — small next to the window the gap freed, and enough
+ * for the whole middle of any loop the panel has seen in practice.
+ */
+const DIGEST_MAX_LINES = 150;
+const DIGEST_ARGS_CHARS = 120;
+const DIGEST_VALUE_CHARS = 60;
+
+const oneLine = (s: string): string => s.replace(/\s+/g, " ").trim();
+
+function headWithEllipsis(s: string, n: number): string {
+  return s.length <= n ? s : `${sliceHeadSafe(s, n - 1)}…`;
+}
+
+/** `function.name` of one tool call, or "?" when the call is malformed. */
+function toolCallName(tc: unknown): string {
+  if (typeof tc !== "object" || tc === null || !("function" in tc)) return "?";
+  const fn = tc.function;
+  if (typeof fn !== "object" || fn === null || !("name" in fn)) return "?";
+  return typeof fn.name === "string" ? fn.name : "?";
+}
+
+/**
+ * A call's arguments as one short line: `path=src/a.ts content=import x…`. Every
+ * value is cut to its opening, so a `write_file` shows WHICH file, not the file.
+ */
+function digestArguments(args: string | Record<string, unknown> | unknown[] | null): string {
+  if (args === null) return "";
+  let value: unknown = args;
+  if (typeof args === "string") {
+    try {
+      value = JSON.parse(args);
+    } catch {
+      return headWithEllipsis(oneLine(args), DIGEST_ARGS_CHARS);
+    }
+  }
+  const render = (v: unknown): string =>
+    headWithEllipsis(oneLine(typeof v === "string" ? v : (JSON.stringify(v) ?? "")), DIGEST_VALUE_CHARS);
+  const text =
+    typeof value === "object" && value !== null && !Array.isArray(value)
+      ? Object.entries(value)
+          .map(([key, v]) => `${key}=${render(v)}`)
+          .join(" ")
+      : render(value);
+  return headWithEllipsis(text, DIGEST_ARGS_CHARS);
+}
+
+/** Output size of every tool result in the history, by `tool_call_id`. */
+function toolResultChars(entries: Array<{ idx: number; msg: unknown }>): Map<string, number> {
+  const sizes = new Map<string, number>();
+  for (const { msg } of entries) {
+    if (typeof msg !== "object" || msg === null || !("role" in msg) || msg.role !== "tool") continue;
+    if (!("tool_call_id" in msg) || typeof msg.tool_call_id !== "string") continue;
+    sizes.set(msg.tool_call_id, approxTotalChars([msg]));
+  }
+  return sizes;
+}
+
+/**
+ * The marker standing in for non-system entries `from`..`to` (inclusive), with one
+ * line per tool call those entries made.
+ *
+ * A bare "N messages omitted" left the panel blind to the agent's own trajectory:
+ * which files it already read, which it already wrote. Advice from a panel that
+ * cannot see that repeats finished steps or contradicts them. The digest restores
+ * the trajectory without the payloads (borrowed from fast-jev-compaction's one-line
+ * call form), and names the remedy for a missing output — re-run the tool — so the
+ * panel does not reason as if the information were gone for good.
+ */
+function omissionMarker(
+  entries: Array<{ idx: number; msg: unknown }>,
+  from: number,
+  to: number,
+  resultChars: Map<string, number>,
+): string {
+  const gap = to - from + 1;
+  const lines: string[] = [];
+  for (let i = from; i <= to; i++) {
+    const m = entries[i]?.msg;
+    if (typeof m !== "object" || m === null || !("tool_calls" in m) || !Array.isArray(m.tool_calls)) continue;
+    for (const tc of m.tool_calls) {
+      const id = typeof tc === "object" && tc !== null && "id" in tc && typeof tc.id === "string" ? tc.id : "";
+      const size = resultChars.get(id);
+      const args = digestArguments(toolCallArguments(tc));
+      lines.push(
+        `- ${toolCallName(tc)}${args ? ` ${args}` : ""} → ${size === undefined ? "no result" : `${size} chars of output`}`,
+      );
+    }
+  }
+  const header = `…[${gap} earlier message${gap === 1 ? "" : "s"} omitted for context window management]…`;
+  if (lines.length === 0) return header;
+  const dropped = lines.length - DIGEST_MAX_LINES;
+  const listed = dropped > 0 ? [`- (${dropped} older calls not listed)`, ...lines.slice(dropped)] : lines;
+  return `${header}\nTool calls made in them, oldest first (outputs not shown; if one still matters, the next step should re-run that tool):\n${listed.join("\n")}`;
+}
+
+/**
  * Compress the panel message array when its total text exceeds `maxChars`
  * (message content plus the JSON arguments of every tool call — both, because an
  * agent loop's bulk lands in whichever one its task uses).
  * Strategy: keep system messages intact, keep the first non-system message
  * (original task), keep the most recent user instruction that predates the
  * recent window, and keep the last PANEL_RECENT_WINDOW non-system messages.
- * The middle is replaced with an omission marker. Each kept message is also
+ * The middle is replaced with an omission marker that lists, one line each, the
+ * tool calls the dropped messages made (`omissionMarker`). Each kept message is also
  * content-capped — and tool-call-argument-capped — to prevent a single huge
  * tool result or file write from dominating.
  *
@@ -1286,14 +1384,11 @@ export function compressPanelMessages(msgs: unknown[], maxChars: number = PANEL_
     result.push(capPanelMessage(s.msg));
   }
 
+  const resultChars = toolResultChars(nonSystems);
   let prev = -1;
   for (const i of [...keep].sort((a, b) => a - b)) {
-    const gap = i - prev - 1;
-    if (prev >= 0 && gap > 0) {
-      result.push({
-        role: "system",
-        content: `…[${gap} earlier message${gap === 1 ? "" : "s"} omitted for context window management]…`,
-      });
+    if (prev >= 0 && i - prev - 1 > 0) {
+      result.push({ role: "system", content: omissionMarker(nonSystems, prev + 1, i - 1, resultChars) });
     }
     const m = nonSystems[i]?.msg;
     if (m && typeof m === "object") {

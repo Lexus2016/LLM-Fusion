@@ -2951,6 +2951,69 @@ describe("fusion strategy — panel compression tool-pairing", () => {
   });
 });
 
+describe("fusion strategy — panel compression keeps the dropped trajectory", () => {
+  function readLoop(reads: number): unknown[] {
+    const body = "z".repeat(8000);
+    const msgs: unknown[] = [{ role: "user", content: "Refactor the auth module." }];
+    for (let k = 0; k < reads; k++) {
+      msgs.push({
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          { id: `r${k}`, type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: `src/auth/f${k}.ts` }) } },
+        ],
+      });
+      msgs.push({ role: "tool", tool_call_id: `r${k}`, content: body });
+    }
+    return msgs;
+  }
+
+  const markers = (out: unknown[]): string[] =>
+    out.flatMap((m) =>
+      typeof m === "object" && m !== null && "role" in m && m.role === "system" && "content" in m && typeof m.content === "string"
+        ? [m.content]
+        : [],
+    );
+
+  it("lists every call the omitted messages made, with its path and output size", () => {
+    const out = compressPanelMessages(readLoop(60));
+    const marker = markers(out).find((c) => c.includes("earlier messages omitted"));
+    expect(marker).toBeDefined();
+    // r0 is dropped (only the first user turn and the last 30 entries survive).
+    expect(marker).toContain("- read_file path=src/auth/f0.ts → 8000 chars of output");
+    expect(marker).toContain("re-run that tool");
+    // A call kept verbatim in the recent window is not listed twice.
+    expect(marker).not.toContain("f59.ts");
+  });
+
+  it("shows the target of a write, never its payload", () => {
+    const file = "Q".repeat(40_000);
+    const msgs: unknown[] = [{ role: "user", content: "Build it." }];
+    for (let k = 0; k < 40; k++) {
+      msgs.push({
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: `w${k}`, type: "function", function: { name: "write_file", arguments: { path: `p${k}.ts`, content: file } } }],
+      });
+      msgs.push({ role: "tool", tool_call_id: `w${k}`, content: "ok" });
+    }
+    const marker = markers(compressPanelMessages(msgs)).find((c) => c.includes("earlier messages omitted")) ?? "";
+    expect(marker).toContain("- write_file path=p0.ts content=QQQ");
+    for (const line of marker.split("\n").filter((l) => l.startsWith("- write_file"))) {
+      expect(line.length).toBeLessThan(200);
+    }
+  });
+
+  it("caps the digest of a very long loop and says how many calls it left out", () => {
+    const out = compressPanelMessages(readLoop(400));
+    const marker = markers(out).find((c) => c.includes("earlier messages omitted")) ?? "";
+    const lines = marker.split("\n").filter((l) => l.startsWith("- "));
+    expect(lines.length).toBe(151); // 150 newest calls + the "not listed" line
+    expect(lines[0]).toMatch(/^- \(\d+ older calls not listed\)$/);
+    expect(marker.length).toBeLessThan(30_000);
+  });
+});
+
 describe("fusion strategy — panel compression sizes tool-call arguments", () => {
   /**
    * A WRITE-heavy agent loop: the payload lives in `tool_calls[].function.arguments`
