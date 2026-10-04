@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { z } from "zod";
+import pino from "pino";
 import { createFusionStrategy, fusionStrategy, compressPanelMessages } from "../src/strategies/fusion";
 import type { TimerFactory } from "../src/strategies/fusion";
 import { OllamaClient } from "../src/upstream/ollama";
@@ -3011,6 +3012,28 @@ describe("fusion strategy — panel compression keeps the dropped trajectory", (
     expect(lines.length).toBe(151); // 150 newest calls + the "not listed" line
     expect(lines[0]).toMatch(/^- \(\d+ older calls not listed\)$/);
     expect(marker.length).toBeLessThan(30_000);
+  });
+});
+
+describe("fusion strategy — logs whether the panel saw a compressed history", () => {
+  async function panelCompleteLine(content: string): Promise<Record<string, unknown>> {
+    const lines: Record<string, unknown>[] = [];
+    const capture = pino({ level: "info" }, { write: (s: string) => lines.push(z.record(z.string(), z.unknown()).parse(JSON.parse(s))) });
+    const up = makeUpstream(defaultChat());
+    await fusionStrategy.execute({ ...ctx(up.client, req({ messages: [{ role: "user", content }] })), logger: capture });
+    const line = lines.find((l) => l.msg === "fusion: panel complete");
+    if (!line) throw new Error("no 'fusion: panel complete' line");
+    return line;
+  }
+
+  it("reports history size and the compression verdict on the one per-request panel line", async () => {
+    const small = await panelCompleteLine("hello");
+    expect(small.history_chars).toBe(5);
+    expect(small.panel_compressed).toBe(false);
+
+    const big = await panelCompleteLine("x".repeat(250_000)); // over the 200k default
+    expect(big.history_chars).toBe(250_000);
+    expect(big.panel_compressed).toBe(true);
   });
 });
 

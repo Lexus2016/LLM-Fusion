@@ -272,6 +272,8 @@ async function runFusion(
     adversarialModel: cfg.adversarial ?? null,
     maxChars: cfg.panel_max_chars,
   });
+  // The same measure, over the same array, that `compressPanelMessages` gates on.
+  const historyChars = approxTotalChars(Array.isArray(ctx.request.messages) ? ctx.request.messages : []);
   // A member gated by subscription (403) / not-found (404) / retired (410) will
   // never answer, so don't fail the whole fusion waiting for min_panel_success from
   // it: relax the threshold by the number of permanently-unavailable members (but
@@ -293,6 +295,10 @@ async function runFusion(
       permanently_unavailable: permanentlyUnavailable,
       judge: cfg.judge,
       synth: cfg.synth,
+      // How often the panel deliberates on a compressed history is the number that
+      // decides whether smarter selection of the omitted middle is worth building.
+      history_chars: historyChars,
+      panel_compressed: historyChars > cfg.panel_max_chars,
     },
     "fusion: panel complete",
   );

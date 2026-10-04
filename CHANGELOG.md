@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.52] - 2026-10-04
+
+When a long agent loop pushes the conversation past `panel_max_chars`, the
+panel's copy keeps the first task, the latest instruction and the last 30
+messages, and replaces everything between with one line: "N earlier messages
+omitted". That line told the panel how much it was missing and nothing about
+what. The middle of an agent loop is the agent's own trajectory — which files it
+already read, which it already wrote — and a panel that cannot see it advises
+re-reading what was read and re-writing what was written, or contradicts a step
+the agent already took. This release puts the trajectory back without the
+payloads, and adds the one number needed to decide whether to go further.
+
+### Changed
+- **The omission marker lists the tool calls it stands in for.** One line per
+  dropped call, oldest first: the tool name, its arguments cut to their opening,
+  and the size of what it returned —
+  `- read_file path=src/auth/f0.ts → 8000 chars of output`. Every argument value
+  is cut to 60 characters and the whole line to 120, so a `write_file` shows
+  which file, never the file. The marker names the remedy for a missing output
+  (re-run the tool), so the panel does not reason as if the information were gone
+  for good. Bounded at 150 lines per gap — the newest are kept and a
+  `(K older calls not listed)` line counts the rest — so a 400-call loop adds
+  under 30k characters to a history compressed from millions. The one-line call
+  form is borrowed from
+  [fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction).
+
+### Added
+- **`fusion: panel complete` now carries `history_chars` and
+  `panel_compressed`.** Same measure, same array and same threshold
+  `compressPanelMessages` gates on, logged once per request rather than once per
+  member. Nothing in the logs recorded compression before, so how often the
+  panel deliberates on a cut history could not be counted.
+
+### Not done, and why
+- **Choosing which old tool results to keep by asking Jev**, as
+  fast-jev-compaction does for a client's own context. The proxy is stateless:
+  every fusion step over the threshold would pay a 25-30k-token TypeSafe call on
+  the critical path, on a history that has to be shrunk again to fit Jev's 32k
+  request limit, for a quality gain nobody has measured. `panel_compressed` is
+  the count that would justify it; until it says compression is common on real
+  traffic, positional selection plus the digest stays.
+
 ## [0.1.51] - 2026-09-19
 
 Three places in this proxy need a *judgment* rather than a fact, and each one
